@@ -120,22 +120,64 @@
                 android:text="Scan New Tag"
                 android:visibility="gone" />
 
+            <!-- Protocol mode toggle -->
+            <RadioGroup
+                android:id="@+id/protocolModeGroup"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_below="@id/bleadvertisingStatus"
+                android:layout_centerHorizontal="true"
+                android:layout_marginTop="12dp"
+                android:orientation="horizontal">
+
+                <RadioButton
+                    android:id="@+id/modePkoc"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginEnd="4dp"
+                    android:text="PKOC"
+                    android:textColor="@color/colorPrimaryDark"
+                    android:textSize="14sp"
+                    android:buttonTint="@color/colorPrimary" />
+
+                <RadioButton
+                    android:id="@+id/modeAliro"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="4dp"
+                    android:layout_marginEnd="4dp"
+                    android:text="Aliro"
+                    android:textColor="@color/colorPrimaryDark"
+                    android:textSize="14sp"
+                    android:buttonTint="@color/colorPrimary" />
+
+                <RadioButton
+                    android:id="@+id/modeAuto"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="4dp"
+                    android:text="Auto"
+                    android:textColor="@color/colorPrimaryDark"
+                    android:textSize="14sp"
+                    android:buttonTint="@color/colorPrimary" />
+
+            </RadioGroup>
+
             <Button
                 android:id="@+id/rdrButton"
                 style="@android:style/Widget.Material.Button.Inset"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:layout_below="@id/bleadvertisingStatus"
+                android:layout_below="@id/protocolModeGroup"
                 android:layout_centerHorizontal="true"
-                android:layout_marginTop="16dp"
+                android:layout_marginTop="8dp"
                 android:text="Show Reader Details"
                 android:visibility="visible" />
 
         </RelativeLayout>
     </ScrollView>
 
-    <!-- Guidelines as % of the full screen — but now the image also fills
-         the full screen so these track correctly -->
+    <!-- Guidelines as % of the full screen -->
     <androidx.constraintlayout.widget.Guideline
         android:id="@+id/guidelineKeypadTop"
         android:layout_width="wrap_content"
@@ -164,7 +206,7 @@
         android:orientation="vertical"
         app:layout_constraintGuide_percent="0.92" />
 
-    <!-- Keypad constrained to guidelines within the full-screen image -->
+    <!-- Keypad: hidden/shown together with readerImageView via Java -->
     <LinearLayout
         android:id="@+id/keypadLayout"
         android:layout_width="0dp"
@@ -177,13 +219,14 @@
         app:layout_constraintLeft_toRightOf="@id/guidelineLeft"
         app:layout_constraintRight_toLeftOf="@id/guidelineRight">
 
+        <!-- PIN display -->
         <TextView
             android:id="@+id/pinDisplay"
             android:layout_width="match_parent"
             android:layout_height="0dp"
             android:layout_weight="1"
             android:gravity="center"
-            android:hint=""
+            android:hint="· · · ·"
             android:textColor="#AAAAAA"
             android:textColorHint="#CCCCCC"
             android:fontFamily="sans-serif-light"
@@ -193,71 +236,87 @@
             android:backgroundTint="@null" />
 
         <!-- Row 1: 1 2 3 -->
-        <LinearLayout android:layout_width="match_parent" android:layout_height="0dp"
-            android:layout_weight="1" android:orientation="horizontal">
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:orientation="horizontal"
+            android:background="@null">
             <Button android:id="@+id/key1" style="@style/KeypadButton"
                 android:layout_width="0dp" android:layout_height="match_parent"
-                android:layout_weight="1" android:text="1" android:background="@null"
-                android:backgroundTint="@null" />
+                android:layout_weight="1" android:text="1"
+                android:background="@null" android:backgroundTint="@null" />
             <Button android:id="@+id/key2" style="@style/KeypadButton"
                 android:layout_width="0dp" android:layout_height="match_parent"
-                android:layout_weight="1" android:text="2"  android:background="@null"
-                android:backgroundTint="@null" />
+                android:layout_weight="1" android:text="2"
+                android:background="@null" android:backgroundTint="@null" />
             <Button android:id="@+id/key3" style="@style/KeypadButton"
                 android:layout_width="0dp" android:layout_height="match_parent"
-                android:layout_weight="1" android:text="3"  android:background="@null"
-                android:backgroundTint="@null" />
+                android:layout_weight="1" android:text="3"
+                android:background="@null" android:backgroundTint="@null" />
         </LinearLayout>
 
         <!-- Row 2: 4 5 6 -->
-        <LinearLayout android:layout_width="match_parent" android:layout_height="0dp"
-            android:layout_weight="1" android:orientation="horizontal">
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:orientation="horizontal"
+            android:background="@null">
             <Button android:id="@+id/key4" style="@style/KeypadButton"
                 android:layout_width="0dp" android:layout_height="match_parent"
-                android:layout_weight="1" android:text="4"  android:background="@null"
-                android:backgroundTint="@null" />
+                android:layout_weight="1" android:text="4"
+                android:background="@null" android:backgroundTint="@null" />
             <Button android:id="@+id/key5" style="@style/KeypadButton"
                 android:layout_width="0dp" android:layout_height="match_parent"
-                android:layout_weight="1" android:text="5"  android:background="@null"
-                android:backgroundTint="@null" />
+                android:layout_weight="1" android:text="5"
+                android:background="@null" android:backgroundTint="@null" />
             <Button android:id="@+id/key6" style="@style/KeypadButton"
                 android:layout_width="0dp" android:layout_height="match_parent"
-                android:layout_weight="1" android:text="6"  android:background="@null"
-                android:backgroundTint="@null" />
+                android:layout_weight="1" android:text="6"
+                android:background="@null" android:backgroundTint="@null" />
         </LinearLayout>
 
         <!-- Row 3: 7 8 9 -->
-        <LinearLayout android:layout_width="match_parent" android:layout_height="0dp"
-            android:layout_weight="1" android:orientation="horizontal">
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:orientation="horizontal"
+            android:background="@null">
             <Button android:id="@+id/key7" style="@style/KeypadButton"
                 android:layout_width="0dp" android:layout_height="match_parent"
-                android:layout_weight="1" android:text="7"  android:background="@null"
-                android:backgroundTint="@null" />
+                android:layout_weight="1" android:text="7"
+                android:background="@null" android:backgroundTint="@null" />
             <Button android:id="@+id/key8" style="@style/KeypadButton"
                 android:layout_width="0dp" android:layout_height="match_parent"
-                android:layout_weight="1" android:text="8" android:background="@null"
-                android:backgroundTint="@null" />
+                android:layout_weight="1" android:text="8"
+                android:background="@null" android:backgroundTint="@null" />
             <Button android:id="@+id/key9" style="@style/KeypadButton"
                 android:layout_width="0dp" android:layout_height="match_parent"
-                android:layout_weight="1" android:text="9" android:background="@null"
-                android:backgroundTint="@null" />
+                android:layout_weight="1" android:text="9"
+                android:background="@null" android:backgroundTint="@null" />
         </LinearLayout>
 
         <!-- Row 4: * 0 # -->
-        <LinearLayout android:layout_width="match_parent" android:layout_height="0dp"
-            android:layout_weight="1" android:orientation="horizontal">
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:orientation="horizontal"
+            android:background="@null">
             <Button android:id="@+id/keyStar" style="@style/KeypadButton"
                 android:layout_width="0dp" android:layout_height="match_parent"
-                android:layout_weight="1" android:text="*" android:background="@null"
-                android:backgroundTint="@null" />
+                android:layout_weight="1" android:text="*"
+                android:background="@null" android:backgroundTint="@null" />
             <Button android:id="@+id/key0" style="@style/KeypadButton"
                 android:layout_width="0dp" android:layout_height="match_parent"
-                android:layout_weight="1" android:text="0" android:background="@null"
-                android:backgroundTint="@null" />
+                android:layout_weight="1" android:text="0"
+                android:background="@null" android:backgroundTint="@null" />
             <Button android:id="@+id/keyHash" style="@style/KeypadButton"
                 android:layout_width="0dp" android:layout_height="match_parent"
-                android:layout_weight="1" android:text="#" android:background="@null"
-                android:backgroundTint="@null" />
+                android:layout_weight="1" android:text="#"
+                android:background="@null" android:backgroundTint="@null" />
         </LinearLayout>
 
     </LinearLayout>

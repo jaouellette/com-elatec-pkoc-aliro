@@ -101,6 +101,14 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
 {
 
     private static final String TAG = "HomeFragment";
+
+    // Reader protocol mode
+    public static final String PREF_READER_MODE  = "reader_protocol_mode";
+    public static final int    MODE_PKOC = 0;
+    public static final int    MODE_ALIRO = 1;
+    public static final int    MODE_AUTO  = 2; // tries Aliro SELECT first, falls back to PKOC
+
+    private int readerMode = MODE_AUTO; // default: auto-detect
     private Button rdrButton;
     private TextView textView;
     private TextView readerLocationUUIDView;
@@ -154,8 +162,32 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
         requireActivity().invalidateOptionsMenu();
         // Set up the reader details button
         rdrButton = view.findViewById(R.id.rdrButton);
-        rdrButton.setVisibility(View.VISIBLE); // Make the button visible
+        rdrButton.setVisibility(View.VISIBLE);
         rdrButton.setOnClickListener(v -> showRdrDetails());
+
+        // Protocol mode toggle
+        android.widget.RadioGroup modeGroup = view.findViewById(R.id.protocolModeGroup);
+        readerMode = requireActivity().getPreferences(Context.MODE_PRIVATE)
+                .getInt(PREF_READER_MODE, MODE_AUTO);
+        switch (readerMode)
+        {
+            case MODE_PKOC:  modeGroup.check(R.id.modePkoc);  break;
+            case MODE_ALIRO: modeGroup.check(R.id.modeAliro); break;
+            default:         modeGroup.check(R.id.modeAuto);  break;
+        }
+        updateModeLabel();
+        updateRdrButtonVisibility();
+        modeGroup.setOnCheckedChangeListener((group, checkedId) ->
+        {
+            if      (checkedId == R.id.modePkoc)  readerMode = MODE_PKOC;
+            else if (checkedId == R.id.modeAliro) readerMode = MODE_ALIRO;
+            else                                  readerMode = MODE_AUTO;
+            requireActivity().getPreferences(Context.MODE_PRIVATE)
+                    .edit().putInt(PREF_READER_MODE, readerMode).apply();
+            updateModeLabel();
+            updateRdrButtonVisibility();
+            Log.d(TAG, "Reader mode set to: " + readerMode);
+        });
 
         textView = view.findViewById(R.id.textView);
         readerLocationUUIDView = view.findViewById(R.id.readerLocationUUID);
@@ -451,77 +483,56 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
             isoDep.connect();
             isoDep.setTimeout(5000); // 5 second timeout for crypto-heavy Aliro flow
 
-            // ---------------------------------------------------------------
-            // Try Aliro SELECT first — AID A0000009 09ACCE5501
-            // If the card responds with SW=9000 and an FCI containing the
-            // Aliro AID, route to the Aliro flow. Otherwise fall through to
-            // the existing PKOC flow.
-            // ---------------------------------------------------------------
-            byte[] aliroSelect = new byte[]{
-                0x00, (byte)0xA4, 0x04, 0x00, 0x09,
-                (byte)0xA0, 0x00, 0x00, 0x09, 0x09,
-                (byte)0xAC, (byte)0xCE, 0x55, 0x01,
-                0x00
-            };
+            Log.d("NFC", "Tag discovered, reader mode: " + readerMode);
 
-            Log.d("NFC", "Sending Aliro SELECT: " + Hex.toHexString(aliroSelect));
-            byte[] selectResponse = isoDep.transceive(aliroSelect);
-            Log.d("NFC", "SELECT response: " + Hex.toHexString(selectResponse));
-
-            boolean isAliro = selectResponse != null
-                    && selectResponse.length >= 2
-                    && selectResponse[selectResponse.length - 2] == (byte) 0x90
-                    && selectResponse[selectResponse.length - 1] == 0x00;
-
-            if (isAliro)
+            if (readerMode == MODE_PKOC)
             {
-                Log.d("NFC", "Aliro AID selected — running Aliro flow");
-                performAliroNfcTransaction(isoDep, selectResponse);
+                // ---------------------------------------------------------------
+                // PKOC-only mode — go straight to PKOC, skip Aliro SELECT
+                // ---------------------------------------------------------------
+                Log.d("NFC", "PKOC mode — running PKOC flow directly");
+                runPkocNfcFlow(isoDep);
             }
-            else
+            else if (readerMode == MODE_ALIRO)
             {
-                Log.d("NFC", "Not Aliro (SW=" +
-                        Hex.toHexString(new byte[]{
-                                selectResponse[selectResponse.length - 2],
-                                selectResponse[selectResponse.length - 1]}) +
-                        ") — falling back to PKOC flow");
+                // ---------------------------------------------------------------
+                // Aliro-only mode — send Aliro SELECT, fail if not supported
+                // ---------------------------------------------------------------
+                byte[] aliroSelect = buildAliroSelectCommand();
+                Log.d("NFC", "Aliro mode — sending SELECT: " + Hex.toHexString(aliroSelect));
+                byte[] selectResponse = isoDep.transceive(aliroSelect);
+                Log.d("NFC", "SELECT response: " + Hex.toHexString(selectResponse));
 
-                // PKOC flow — same as before
-                var transaction = new NfcNormalFlowTransaction(false);
-                byte[] commandToSend = transaction.getCommandToWrite();
-                while (commandToSend != null)
+                if (isSW9000(selectResponse))
                 {
-                    Log.d("NFC", "Command to send: " + Hex.toHexString(commandToSend));
-                    byte[] response = isoDep.transceive(commandToSend);
-                    Log.d("NFC", "Response: " + Hex.toHexString(response));
-                    transaction.processReaderResponse(response);
-                    commandToSend = transaction.getCommandToWrite();
-                }
-
-                if (transaction.isTransactionSuccessful())
-                {
-                    byte[] publicKey = transaction.getPublicKey();
-                    if (publicKey != null)
-                    {
-                        requireActivity().runOnUiThread(() ->
-                        {
-                            readerImageView.setVisibility(View.GONE);
-                            keypadLayout.setVisibility(View.GONE);
-                            String pk = Hex.toHexString(publicKey);
-                            Log.d("NFC", "PKOC Public Key: \n" + pk);
-                            displayPublicKeyInfo(pk, "Connection Type: Normal Flow");
-                        });
-                    }
-                    else
-                    {
-                        Log.e(TAG, "PKOC public key was null");
-                        showInvalidKeyDialog();
-                    }
+                    performAliroNfcTransaction(isoDep, selectResponse);
                 }
                 else
                 {
-                    Log.e(TAG, "PKOC transaction was not successful");
-                    showInvalidKeyDialog();
+                    Log.e("NFC", "Aliro mode: credential does not support Aliro AID");
+                    sendControlFlow(isoDep);
+                    showAliroError("This credential does not support Aliro.");
+                }
+            }
+            else
+            {
+                // ---------------------------------------------------------------
+                // Auto mode — try Aliro SELECT first, fall back to PKOC
+                // ---------------------------------------------------------------
+                byte[] aliroSelect = buildAliroSelectCommand();
+                Log.d("NFC", "Auto mode — trying Aliro SELECT: " + Hex.toHexString(aliroSelect));
+                byte[] selectResponse = isoDep.transceive(aliroSelect);
+                Log.d("NFC", "SELECT response: " + Hex.toHexString(selectResponse));
+
+                if (isSW9000(selectResponse))
+                {
+                    Log.d("NFC", "Aliro AID selected — running Aliro flow");
+                    performAliroNfcTransaction(isoDep, selectResponse);
+                }
+                else
+                {
+                    Log.d("NFC", "Not Aliro (SW=" + swHex(selectResponse) + ") — falling back to PKOC");
+                    runPkocNfcFlow(isoDep);
                 }
             }
 
@@ -530,6 +541,31 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
         catch (IOException e)
         {
             Log.e("NFC", "Error communicating with NFC tag", e);
+        }
+    }
+
+    /** Show 'Show Reader Details' only in PKOC or Auto mode — not relevant for Aliro-only. */
+    private void updateRdrButtonVisibility()
+    {
+        if (rdrButton == null) return;
+        rdrButton.setVisibility(readerMode == MODE_ALIRO ? View.GONE : View.VISIBLE);
+    }
+
+    /** Update the main title text to reflect the current reader mode. */
+    private void updateModeLabel()
+    {
+        if (textView == null) return;
+        switch (readerMode)
+        {
+            case MODE_PKOC:
+                textView.setText("Scan a PKOC NFC or BLE Credential");
+                break;
+            case MODE_ALIRO:
+                textView.setText("Scan an Aliro NFC Credential");
+                break;
+            default:
+                textView.setText("Scan a PKOC or Aliro Credential");
+                break;
         }
     }
 
@@ -580,9 +616,12 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
             Button scanButton = requireView().findViewById(R.id.scanButton);
             scanButton.setVisibility(View.GONE);
 
-            // Show the reader button
+            // Show the reader button and mode toggle
             Button rdrButton = requireView().findViewById(R.id.rdrButton);
             rdrButton.setVisibility(View.VISIBLE);
+            requireView().findViewById(R.id.protocolModeGroup).setVisibility(View.VISIBLE);
+            updateModeLabel();
+            updateRdrButtonVisibility();
 
             // Check if the button text is "Show Reader Details"
             if (rdrButton.getText().toString().equals("Show Reader Details"))
@@ -1564,18 +1603,19 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
             // Update the screen with the public key read data
             // Set the formatted text to the TextView
             textView.setText(formattedText);
-            // Hide reader detail button
+            // Hide reader detail button and mode toggle
             Button rdrButton = requireView().findViewById(R.id.rdrButton);
             rdrButton.setVisibility(View.GONE);
+            requireView().findViewById(R.id.protocolModeGroup).setVisibility(View.GONE);
 
             // Set up the email button
             Button emailButton = requireView().findViewById(R.id.emailButton);
-            emailButton.setVisibility(View.VISIBLE); // Make the button visible
+            emailButton.setVisibility(View.VISIBLE);
             emailButton.setOnClickListener(v -> sendEmail());
 
             // Set up the scan button
             Button scanButton = requireView().findViewById(R.id.scanButton);
-            scanButton.setVisibility(View.VISIBLE); // Make the button visible
+            scanButton.setVisibility(View.VISIBLE);
             scanButton.setOnClickListener(v -> resetToScanScreen());
 
             // Hide other fields
@@ -1658,6 +1698,68 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                 })
                 .setIcon(android.R.drawable.ic_dialog_alert)
                 .show());
+    }
+
+    // =========================================================================
+    // PKOC NFC Reader Flow
+    // =========================================================================
+
+    private void runPkocNfcFlow(IsoDep isoDep)
+    {
+        try
+        {
+            var transaction = new NfcNormalFlowTransaction(false);
+            byte[] commandToSend = transaction.getCommandToWrite();
+            while (commandToSend != null)
+            {
+                Log.d("NFC", "PKOC command: " + Hex.toHexString(commandToSend));
+                byte[] response = isoDep.transceive(commandToSend);
+                Log.d("NFC", "PKOC response: " + Hex.toHexString(response));
+                transaction.processReaderResponse(response);
+                commandToSend = transaction.getCommandToWrite();
+            }
+
+            if (transaction.isTransactionSuccessful())
+            {
+                byte[] publicKey = transaction.getPublicKey();
+                if (publicKey != null)
+                {
+                    requireActivity().runOnUiThread(() ->
+                    {
+                        readerImageView.setVisibility(View.GONE);
+                        keypadLayout.setVisibility(View.GONE);
+                        String pk = Hex.toHexString(publicKey);
+                        Log.d("NFC", "PKOC Public Key: " + pk);
+                        displayPublicKeyInfo(pk, "Connection Type: Normal Flow (PKOC)");
+                    });
+                }
+                else
+                {
+                    Log.e(TAG, "PKOC public key was null");
+                    showInvalidKeyDialog();
+                }
+            }
+            else
+            {
+                Log.e(TAG, "PKOC transaction was not successful");
+                showInvalidKeyDialog();
+            }
+        }
+        catch (java.io.IOException e)
+        {
+            Log.e(TAG, "PKOC NFC IO error", e);
+        }
+    }
+
+    /** Build the Aliro expedited-phase SELECT APDU (Table 10-1, AID from Table 10-3). */
+    private byte[] buildAliroSelectCommand()
+    {
+        return new byte[]{
+            0x00, (byte)0xA4, 0x04, 0x00, 0x09,
+            (byte)0xA0, 0x00, 0x00, 0x09, 0x09,
+            (byte)0xAC, (byte)0xCE, 0x55, 0x01,
+            0x00  // Le
+        };
     }
 
     // =========================================================================
