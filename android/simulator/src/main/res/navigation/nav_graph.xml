@@ -8,7 +8,7 @@
     <fragment
         android:id="@+id/homeFragment"
         android:name="com.pkoc.readersimulator.HomeFragment"
-        android:label="Home"
+        android:label="ELATEC PKOC/Aliro Simulator"
         tools:layout="@layout/fragment_home" >
         <action
             android:id="@+id/action_homeFragment_to_displayPublicKeyFragment"

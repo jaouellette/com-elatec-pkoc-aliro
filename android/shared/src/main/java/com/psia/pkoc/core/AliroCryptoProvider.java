@@ -762,4 +762,148 @@ public class AliroCryptoProvider
         }
         return out;
     }
+
+    // =========================================================================
+    // BLE L2CAP: AES-GCM with AAD and per-message counter (§11.8)
+    // =========================================================================
+
+    /**
+     * AES-128-GCM encrypt with Additional Authenticated Data for BLE notification messages.
+     * IV = 0x00000000 00000000 || counter (4 bytes big-endian)
+     *
+     * @param key       32-byte AES key (BleSKReader or BleSKDevice)
+     * @param plaintext Data to encrypt
+     * @param aad       Additional authenticated data (Protocol_Header || MsgID || Length_of_plain BE)
+     * @param counter   Message counter (starts at 1, increments per message)
+     * @return ciphertext || 16-byte GCM tag, or null on failure
+     */
+    public static byte[] encryptBleGcm(byte[] key, byte[] plaintext, byte[] aad, long counter)
+    {
+        byte[] iv = new byte[12];
+        iv[8]  = (byte) (counter >> 24);
+        iv[9]  = (byte) (counter >> 16);
+        iv[10] = (byte) (counter >> 8);
+        iv[11] = (byte) (counter);
+        return gcmWithAad(true, key, iv, plaintext, aad);
+    }
+
+    /**
+     * AES-128-GCM decrypt with Additional Authenticated Data for BLE notification messages.
+     *
+     * @param key           32-byte AES key (BleSKReader or BleSKDevice)
+     * @param ciphertextTag Ciphertext concatenated with 16-byte GCM tag
+     * @param aad           Additional authenticated data
+     * @param counter       Message counter used during encryption
+     * @return Decrypted plaintext, or null on failure (tag mismatch)
+     */
+    public static byte[] decryptBleGcm(byte[] key, byte[] ciphertextTag, byte[] aad, long counter)
+    {
+        byte[] iv = new byte[12];
+        iv[8]  = (byte) (counter >> 24);
+        iv[9]  = (byte) (counter >> 16);
+        iv[10] = (byte) (counter >> 8);
+        iv[11] = (byte) (counter);
+        return gcmWithAad(false, key, iv, ciphertextTag, aad);
+    }
+
+    /**
+     * Build the AAD for BLE notification messages per §11.8.
+     * AAD = Protocol_Header (1 byte) || Message_ID (1 byte) || plaintext_length (2 bytes BE)
+     */
+    public static byte[] buildBleAad(int protocolHeader, int messageId, int plaintextLength)
+    {
+        return new byte[] {
+            (byte) protocolHeader,
+            (byte) messageId,
+            (byte) ((plaintextLength >> 8) & 0xFF),
+            (byte) (plaintextLength & 0xFF)
+        };
+    }
+
+    /**
+     * AES-GCM core with AAD support using Bouncy Castle.
+     */
+    private static byte[] gcmWithAad(boolean encrypt, byte[] key, byte[] iv, byte[] input, byte[] aad)
+    {
+        try
+        {
+            GCMBlockCipher gcm = new GCMBlockCipher(new AESEngine());
+            AEADParameters params = new AEADParameters(
+                    new KeyParameter(key), GCM_TAG_LENGTH * 8, iv, aad);
+            gcm.init(encrypt, params);
+
+            byte[] output = new byte[gcm.getOutputSize(input.length)];
+            int len = gcm.processBytes(input, 0, input.length, output, 0);
+            gcm.doFinal(output, len);
+            return output;
+        }
+        catch (InvalidCipherTextException e)
+        {
+            Log.e(TAG, "GCM-AAD auth tag mismatch", e);
+            return null;
+        }
+        catch (Exception e)
+        {
+            Log.e(TAG, "gcmWithAad operation failed", e);
+            return null;
+        }
+    }
+
+    // =========================================================================
+    // HKDF for BleSK derivation (§11.8.1)
+    // =========================================================================
+
+    /**
+     * HKDF-Extract then Expand to derive BLE session keys from BleSK.
+     *
+     * BleSKReader = hkdfDeriveKey(bleSK, "BleSKReader", salt)
+     * BleSKDevice = hkdfDeriveKey(bleSK, "BleSKDevice", salt)
+     * where salt = reader_supported_versions || user_device_selected_version
+     *
+     * @param ikm   Input keying material (BleSK, 32 bytes)
+     * @param info  Info string ("BleSKReader" or "BleSKDevice")
+     * @param salt  Salt bytes (versions concatenated)
+     * @param length Output key length in bytes (32)
+     * @return Derived key, or null on failure
+     */
+    public static byte[] hkdfDeriveKey(byte[] ikm, String info, byte[] salt, int length)
+    {
+        try
+        {
+            // HKDF-Extract: PRK = HMAC-SHA256(salt, ikm)
+            byte[] prk = hmacSha256(salt, ikm);
+            if (prk == null) return null;
+
+            // HKDF-Expand: T(1) = HMAC-SHA256(PRK, info || 0x01)
+            byte[] infoBytes = info.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            byte[] output = new byte[length];
+            byte[] prev = new byte[0];
+            int idx = 0;
+            byte n = 1;
+            while (idx < length)
+            {
+                byte[] hmacInput = new byte[prev.length + infoBytes.length + 1];
+                int pos = 0;
+                arraycopy(prev, 0, hmacInput, pos, prev.length);
+                pos += prev.length;
+                arraycopy(infoBytes, 0, hmacInput, pos, infoBytes.length);
+                pos += infoBytes.length;
+                hmacInput[pos] = n;
+
+                prev = hmacSha256(prk, hmacInput);
+                if (prev == null) return null;
+
+                int toCopy = Math.min(32, length - idx);
+                arraycopy(prev, 0, output, idx, toCopy);
+                idx += 32;
+                n++;
+            }
+            return output;
+        }
+        catch (Exception e)
+        {
+            Log.e(TAG, "hkdfDeriveKey failed", e);
+            return null;
+        }
+    }
 }

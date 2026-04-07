@@ -79,6 +79,12 @@ import com.psia.pkoc.core.AliroCryptoProvider;
 import java.security.KeyPair;
 import java.security.interfaces.ECPublicKey;
 
+import android.content.BroadcastReceiver;
+import android.content.ComponentName;
+import android.content.IntentFilter;
+import android.content.ServiceConnection;
+import android.os.IBinder;
+
 import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -146,6 +152,69 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
     private java.security.PrivateKey cachedAliroReaderPrivKey = null;
     private String cachedAliroPrivKeyHex = null;
 
+    // --- Aliro BLE L2CAP service ---
+    private AliroBleReaderService aliroBleService;
+    private boolean aliroBleServiceBound = false;
+
+    private final ServiceConnection aliroBleConnection = new ServiceConnection()
+    {
+        @Override
+        public void onServiceConnected(ComponentName name, IBinder service)
+        {
+            aliroBleService = ((AliroBleReaderService.LocalBinder) service).getService();
+            aliroBleServiceBound = true;
+            Log.d(TAG, "AliroBleReaderService bound — auto-starting BLE");
+            // Auto-start immediately — no button needed
+            if (!aliroBleService.isRunning())
+                aliroBleService.startAliroBle();
+        }
+        @Override
+        public void onServiceDisconnected(ComponentName name)
+        {
+            aliroBleService = null;
+            aliroBleServiceBound = false;
+        }
+    };
+
+    private final BroadcastReceiver aliroBleReceiver = new BroadcastReceiver()
+    {
+        @Override
+        public void onReceive(android.content.Context context, Intent intent)
+        {
+            boolean granted = intent.getBooleanExtra(AliroBleReaderService.EXTRA_ACCESS_GRANTED, false);
+            boolean sigValid = intent.getBooleanExtra(AliroBleReaderService.EXTRA_SIG_VALID, false);
+            String credPubKeyHex = intent.getStringExtra(AliroBleReaderService.EXTRA_CREDENTIAL_PUB_KEY);
+            Log.d(TAG, "Aliro BLE result: granted=" + granted + " sigValid=" + sigValid);
+            requireActivity().runOnUiThread(() ->
+            {
+                if (!isAdded()) return;
+                if (granted && credPubKeyHex != null)
+                {
+                    // Stop accepting new connections while result is displayed
+                    if (aliroBleService != null) aliroBleService.stopAliroBle();
+
+                    // Show the credential result screen — same as Aliro NFC
+                    readerImageView.setVisibility(View.GONE);
+                    keypadLayout.setVisibility(View.GONE);
+                    String connectionType = sigValid
+                            ? "Aliro BLE — Signature Valid"
+                            : "Aliro BLE — Signature INVALID";
+                    displayPublicKeyInfo(credPubKeyHex, connectionType);
+
+                    ToneGenerator toneGen = new ToneGenerator(AudioManager.STREAM_RING, 100);
+                    toneGen.startTone(sigValid
+                            ? ToneGenerator.TONE_SUP_DIAL
+                            : ToneGenerator.TONE_CDMA_ABBR_ALERT, 150);
+                }
+                else if (!granted)
+                {
+                    Toast.makeText(requireContext(),
+                            "Aliro BLE: " + intent.getStringExtra(AliroBleReaderService.EXTRA_STATUS_MESSAGE),
+                            Toast.LENGTH_LONG).show();
+                }
+            });
+        }
+    };
 
     @Nullable
     @Override
@@ -188,6 +257,7 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
             updateRdrButtonVisibility();
             Log.d(TAG, "Reader mode set to: " + readerMode);
         });
+
 
         textView = view.findViewById(R.id.textView);
         readerLocationUUIDView = view.findViewById(R.id.readerLocationUUID);
@@ -319,6 +389,21 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
             }
         }).start();
 
+        // Bind Aliro BLE service and register receiver
+        Intent bleServiceIntent = new Intent(requireContext(), AliroBleReaderService.class);
+        requireContext().bindService(bleServiceIntent, aliroBleConnection, Context.BIND_AUTO_CREATE);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
+        {
+            requireContext().registerReceiver(aliroBleReceiver,
+                    new IntentFilter(AliroBleReaderService.ACTION_BLE_RESULT),
+                    Context.RECEIVER_NOT_EXPORTED);
+        }
+        else
+        {
+            requireContext().registerReceiver(aliroBleReceiver,
+                    new IntentFilter(AliroBleReaderService.ACTION_BLE_RESULT));
+        }
+
         // Check for Bluetooth and location permissions
         if (ContextCompat.checkSelfPermission(requireContext(), Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED
                 || ContextCompat.checkSelfPermission(requireContext(), Manifest.permission.BLUETOOTH_ADMIN) != PackageManager.PERMISSION_GRANTED)
@@ -361,6 +446,15 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
             nfcAdapter.disableReaderMode(requireActivity());
         }
         teardownBluetooth();
+
+        // Unregister Aliro BLE receiver and unbind service
+        try { requireContext().unregisterReceiver(aliroBleReceiver); }
+        catch (Exception ignored) {}
+        if (aliroBleServiceBound)
+        {
+            requireContext().unbindService(aliroBleConnection);
+            aliroBleServiceBound = false;
+        }
     }
 
     private void initializeReaderAndSiteUUID()
@@ -622,6 +716,10 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
             requireView().findViewById(R.id.protocolModeGroup).setVisibility(View.VISIBLE);
             updateModeLabel();
             updateRdrButtonVisibility();
+
+            // Restart Aliro BLE in background — ready for the next tap
+            if (aliroBleService != null && !aliroBleService.isRunning())
+                aliroBleService.startAliroBle();
 
             // Check if the button text is "Show Reader Details"
             if (rdrButton.getText().toString().equals("Show Reader Details"))
@@ -1224,7 +1322,7 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                         }
                         else if (deviceModel.connectionType == PKOC_ConnectionType.Uncompressed)
                         {
-                            connectionTypeText = "Connection Type: Normal Flow";
+                            connectionTypeText = "Connection Type: Normal Flow (PKOC)";
                         }
                         displayPublicKeyInfo(publicKeyHex, connectionTypeText);
                     });

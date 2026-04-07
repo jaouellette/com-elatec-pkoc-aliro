@@ -96,6 +96,37 @@ public class SendCredentialFragment extends Fragment
      * indicating that the emulated smart card has successfully generated
      * an authentication command to be sent to a connected reader
      */
+    // Broadcast receiver for Aliro BLE result from AliroBleCredentialService
+    private final BroadcastReceiver aliroBleReceiver = new BroadcastReceiver()
+    {
+        @Override
+        public void onReceive(Context context, Intent intent)
+        {
+            if (!isAdded()) return;
+            boolean granted = intent.getBooleanExtra(AliroBleCredentialService.EXTRA_ACCESS_GRANTED, false);
+            new Handler(getMainLooper()).post(() ->
+            {
+                if (!isAdded()) return;
+                binding.readerIcon.setImageResource(granted
+                        ? R.drawable.ic_reader_success
+                        : R.drawable.ic_reader_error);
+                binding.statusText.setText(granted ? "Aliro BLE: Credential Sent" : "Aliro BLE: Send Failed");
+                binding.statusText.setVisibility(View.VISIBLE);
+                binding.readerIcon.postDelayed(() ->
+                {
+                    if (!isAdded()) return;
+                    binding.readerIcon.setImageResource(R.drawable.ic_reader_idle);
+                    binding.statusText.setVisibility(View.INVISIBLE);
+                    binding.readerContainer.setVisibility(View.GONE);
+                    binding.discover.setVisibility(View.VISIBLE);
+                    binding.devicesListView.setVisibility(View.VISIBLE);
+                    if (binding.btnAliroBle != null) binding.btnAliroBle.setVisibility(View.VISIBLE);
+                }, 3000);
+            });
+        }
+    };
+    private boolean aliroBleReceiverRegistered = false;
+
     private final BroadcastReceiver nfcReceiver = new BroadcastReceiver()
     {
         @Override
@@ -325,10 +356,12 @@ public class SendCredentialFragment extends Fragment
         binding.discover.setVisibility(View.GONE);
         binding.devicesListView.setVisibility(View.GONE);
         binding.readerContainer.setVisibility(View.VISIBLE); // show the reader icon + instruction
+        if (binding.btnAliroBle != null) binding.btnAliroBle.setVisibility(View.GONE);
 
         requestNfcPermissions();
 
         IntentFilter filter = new IntentFilter("com.psia.pkoc.CREDENTIAL_SENT");
+        filter.addAction("com.psia.pkoc.ALIRO_CREDENTIAL_SENT");
         ContextCompat.registerReceiver(requireActivity(), nfcReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED);
     }
 
@@ -340,6 +373,60 @@ public class SendCredentialFragment extends Fragment
         requireActivity().unregisterReceiver(nfcReceiver);
     }
 
+    private void teardownAliroBle()
+    {
+        if (aliroBleReceiverRegistered)
+        {
+            try { requireActivity().unregisterReceiver(aliroBleReceiver); }
+            catch (Exception ignored) {}
+            aliroBleReceiverRegistered = false;
+        }
+    }
+
+    private void startAliroBle()
+    {
+        Log.i("SendCredentialFragment", "Starting Aliro BLE credential flow");
+
+        // Stop PKOC scanning if running
+        if (_IsScanning) setIsScanning(false);
+
+        // Close any active PKOC GATT connection — a second GATT connection to the same
+        // device causes status 133 errors in AliroBleCredentialService.
+        if (connectedGatt != null)
+        {
+            try
+            {
+                connectedGatt.disconnect();
+                connectedGatt.close();
+            }
+            catch (Exception ignored) {}
+            connectedGatt = null;
+            IsConnecting = false;
+        }
+
+        // Show the reader waiting UI
+        binding.discover.setVisibility(View.GONE);
+        binding.devicesListView.setVisibility(View.GONE);
+        if (binding.btnAliroBle != null) binding.btnAliroBle.setVisibility(View.GONE);
+        binding.readerContainer.setVisibility(View.VISIBLE);
+        binding.readerIcon.setImageResource(R.drawable.ic_reader_idle);
+        binding.statusText.setText("Searching for Aliro BLE reader...");
+        binding.statusText.setVisibility(View.VISIBLE);
+
+        // Register result receiver
+        if (!aliroBleReceiverRegistered)
+        {
+            IntentFilter filter = new IntentFilter(AliroBleCredentialService.ACTION_BLE_RESULT);
+            ContextCompat.registerReceiver(requireActivity(), aliroBleReceiver, filter,
+                    ContextCompat.RECEIVER_NOT_EXPORTED);
+            aliroBleReceiverRegistered = true;
+        }
+
+        // Start the service
+        Intent intent = new Intent(requireContext(), AliroBleCredentialService.class);
+        requireContext().startService(intent);
+    }
+
     /**
      * Initialize fragment for BLE usage
      */
@@ -348,6 +435,13 @@ public class SendCredentialFragment extends Fragment
         binding.discover.setVisibility(View.VISIBLE);
         binding.devicesListView.setVisibility(View.VISIBLE);
         binding.readerContainer.setVisibility(View.GONE); // hide reader icon in BLE mode
+
+        // Aliro BLE button — starts AliroBleCredentialService
+        if (binding.btnAliroBle != null)
+        {
+            binding.btnAliroBle.setVisibility(View.VISIBLE);
+            binding.btnAliroBle.setOnClickListener(v -> startAliroBle());
+        }
 
         mBTArrayAdapter = new ListModelAdapter(requireActivity());
         Log.i("SendCredentialFragment", "mBTArrayAdapter is not null");
@@ -670,6 +764,7 @@ public class SendCredentialFragment extends Fragment
         }
 
         teardownFragment();
+        teardownAliroBle();
         super.onDestroyView();
         binding = null;
     }
