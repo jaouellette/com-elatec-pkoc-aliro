@@ -60,6 +60,12 @@ public class AliroCryptoProvider
         (byte)0x93, 0x04, 0x4E, (byte)0x88, 0x7B, 0x4C
     };
 
+    /** interface_byte for NFC transport (section 8.3.1.13) */
+    public static final byte INTERFACE_BYTE_NFC = 0x5E;
+
+    /** interface_byte for BLE transport (section 8.3.1.13) */
+    public static final byte INTERFACE_BYTE_BLE = (byte)0xC3;
+
     // HKDF salt string "Volatile****" (hex: 566F6C6174696C652A2A2A2A)
     private static final byte[] HKDF_VOLATILE = {
         0x56, 0x6F, 0x6C, 0x61, 0x74, 0x69, 0x6C, 0x65,
@@ -232,6 +238,7 @@ public class AliroCryptoProvider
     {
         try
         {
+            // Use the pre-hashed value for Bouncy Castle ECDSA verifier
             byte[] hash = buildSignatureHash(readerID, udEphPubKeyX, readerEphPubKeyX,
                     transactionID, CREDENTIAL_SIG_FOOTER);
             if (hash == null) return false;
@@ -305,7 +312,9 @@ public class AliroCryptoProvider
             byte[] readerEphPubKeyX,
             byte[] udEphPubKeyX,
             byte[] selectProprietaryTLV,
-            byte[] auth0RspVendorTLV)
+            byte[] auth0RspVendorTLV,
+            byte interfaceByte,
+            byte[] flag)
     {
         try
         {
@@ -322,20 +331,25 @@ public class AliroCryptoProvider
             byte[] z = sha256.digest(); // 32 bytes
 
             // Step 2.3: HKDF-Extract
-            // salt = SHA-256(readerPubKeyX || "Volatile****" || readerID ||
-            //                0x5E 0x5C 0x02 || protocolVersion ||
-            //                readerEphPubKeyX || transactionID ||
-            //                0x00 0x01 || selectProprietaryTLV)
+            // salt = SHA-256(
+            //   readerGroupIdentifierKey.x || "Volatile****" || readerIdentifier ||
+            //   interface_byte || 0x5C 0x02 || protocolVersion ||
+            //   readerEphPubKey.x || transactionID ||
+            //   flag || 0xA5 proprietaryTLV)
+            // Per spec section 8.3.1.13:
+            //   interface_byte = 0x5E (NFC) or 0xC3 (BLE)
+            //   flag = command_parameters || authentication_policy from AUTH0
             sha256.reset();
-            sha256.update(readerPubKeyX);
-            sha256.update(HKDF_VOLATILE);
-            sha256.update(readerID);
-            sha256.update(new byte[]{0x5E, 0x5C, 0x02});
-            sha256.update(selectedProtocolVersion);
-            sha256.update(readerEphPubKeyX);
-            sha256.update(transactionID);
-            sha256.update(new byte[]{0x00, 0x01}); // auth0 flag + transaction code
-            sha256.update(selectProprietaryTLV);
+            sha256.update(readerPubKeyX);           // reader group identifier key X
+            sha256.update(HKDF_VOLATILE);            // "Volatile****"
+            sha256.update(readerID);                 // reader_identifier
+            sha256.update(interfaceByte);            // 0x5E=NFC, 0xC3=BLE
+            sha256.update(new byte[]{0x5C, 0x02});  // tag + len for protocol version
+            sha256.update(selectedProtocolVersion);  // 2-byte protocol version
+            sha256.update(readerEphPubKeyX);         // reader eph pub key X
+            sha256.update(transactionID);            // transaction_identifier
+            sha256.update(flag);                     // command_parameters || auth_policy
+            sha256.update(selectProprietaryTLV);     // 0xA5 proprietary TLV
             byte[] saltHash = sha256.digest(); // 32-byte salt
 
             // HMAC-SHA256(saltHash, z) → PRK (the HKDF pseudorandom key)
@@ -388,40 +402,71 @@ public class AliroCryptoProvider
     // AES-GCM encryption / decryption (for EXCHANGE command)
     // -------------------------------------------------------------------------
 
+    // -------------------------------------------------------------------------
+    // GCM for Reader commands (EXCHANGE): uses SKReader, reader_counter IV
+    // Section 8.3.1.8: IV = 0x0000000000000000 || reader_counter (starts at 1)
+    // -------------------------------------------------------------------------
+
     /**
-     * Encrypt plaintext with AES-256-GCM.
-     *
-     * IV is hard-coded to 0x000000000000000000000001 (counter=1, encrypt direction)
-     * matching the C EncryptMessage() implementation.
-     *
-     * @param key       32-byte AES key (ExpeditedSKReader)
-     * @param plaintext Data to encrypt
-     * @return ciphertext || 16-byte GCM tag, or null on failure
+     * Encrypt EXCHANGE command payload with SKReader.
+     * IV = 0x0000000000000000_00000001 (reader_counter=1)
      */
-    public static byte[] encryptGcm(byte[] key, byte[] plaintext)
+    public static byte[] encryptReaderGcm(byte[] skReader, byte[] plaintext)
     {
-        // Reader encrypt IV: 00 00 00 00 00 00 00 00 00 00 00 01
         byte[] iv = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                      0x00, 0x00, 0x00, 0x01};
-        return gcm(true, key, iv, plaintext);
+        return gcm(true, skReader, iv, plaintext);
     }
 
     /**
-     * Decrypt ciphertext+tag with AES-256-GCM.
-     *
-     * IV is hard-coded to 0x000000000000000100000001 (counter=1, decrypt direction)
-     * matching the C DecryptMessage() implementation.
-     *
-     * @param key            32-byte AES key (ExpeditedSKDevice)
-     * @param ciphertextAndTag ciphertext || 16-byte GCM tag
-     * @return decrypted plaintext, or null on failure
+     * Decrypt EXCHANGE command payload with SKReader (credential side).
+     * IV = 0x0000000000000000_00000001 (reader_counter=1)
      */
-    public static byte[] decryptGcm(byte[] key, byte[] ciphertextAndTag)
+    public static byte[] decryptReaderGcm(byte[] skReader, byte[] ciphertextAndTag)
     {
-        // Device decrypt IV: 00 00 00 00 00 00 00 01 00 00 00 01
+        byte[] iv = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                     0x00, 0x00, 0x00, 0x01};
+        return gcm(false, skReader, iv, ciphertextAndTag);
+    }
+
+    // -------------------------------------------------------------------------
+    // GCM for Device responses (AUTH1, EXCHANGE response): uses SKDevice, device_counter IV
+    // Section 8.3.1.6: IV = 0x0000000000000001 || device_counter (starts at 1)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Encrypt AUTH1 response (and EXCHANGE response) with SKDevice.
+     * IV = 0x0000000000000001_00000001 (device_counter=1)
+     */
+    public static byte[] encryptDeviceGcm(byte[] skDevice, byte[] plaintext)
+    {
         byte[] iv = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
                      0x00, 0x00, 0x00, 0x01};
-        return gcm(false, key, iv, ciphertextAndTag);
+        return gcm(true, skDevice, iv, plaintext);
+    }
+
+    /**
+     * Decrypt AUTH1 response (and EXCHANGE response) with SKDevice (reader side).
+     * IV = 0x0000000000000001_00000001 (device_counter=1)
+     */
+    public static byte[] decryptDeviceGcm(byte[] skDevice, byte[] ciphertextAndTag)
+    {
+        byte[] iv = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+                     0x00, 0x00, 0x00, 0x01};
+        return gcm(false, skDevice, iv, ciphertextAndTag);
+    }
+
+    // Keep old names as aliases for backward compatibility with EXCHANGE command
+    /** @deprecated use encryptReaderGcm or encryptDeviceGcm */
+    public static byte[] encryptGcm(byte[] key, byte[] plaintext)
+    {
+        return encryptReaderGcm(key, plaintext);
+    }
+
+    /** @deprecated use decryptReaderGcm or decryptDeviceGcm */
+    public static byte[] decryptGcm(byte[] key, byte[] ciphertextAndTag)
+    {
+        return decryptDeviceGcm(key, ciphertextAndTag);
     }
 
     // -------------------------------------------------------------------------
@@ -449,13 +494,17 @@ public class AliroCryptoProvider
     {
         try
         {
-            byte[] hash = buildSignatureHash(readerID, udEphPubKeyX, readerEphPubKeyX,
+            // Build the data to sign — same as the hash input but passed directly
+            // to SHA256withECDSA so Android KeyStore can sign it without needing
+            // to export the raw private key bytes (which hardware-backed keys forbid).
+            byte[] dataToSign = buildSignatureData(readerID, udEphPubKeyX, readerEphPubKeyX,
                     transactionID, CREDENTIAL_SIG_FOOTER);
-            if (hash == null) return null;
+            if (dataToSign == null) return null;
 
-            Signature sig = Signature.getInstance("NONEwithECDSA", new BouncyCastleProvider());
+            // Use SHA256withECDSA — compatible with Android KeyStore hardware-backed keys
+            Signature sig = Signature.getInstance("SHA256withECDSA");
             sig.initSign(credentialPrivateKey);
-            sig.update(hash);
+            sig.update(dataToSign);
             byte[] der = sig.sign();
             return derToRawSignature(der);
         }
@@ -539,6 +588,45 @@ public class AliroCryptoProvider
      *   footer
      * )
      */
+    /**
+     * Build the raw data buffer that gets fed into the signature.
+     * Used with SHA256withECDSA (Android KeyStore) — the Signature engine
+     * hashes it internally.
+     */
+    private static byte[] buildSignatureData(
+            byte[] readerID,
+            byte[] udEphPubKeyX,
+            byte[] readerEphPubKeyX,
+            byte[] transactionID,
+            byte[] footer)
+    {
+        try
+        {
+            int len = 2 + READER_ID_SIZE + 2 + 32 + 2 + 32 + 2 + TRANSACTION_ID_SIZE + footer.length;
+            byte[] data = new byte[len];
+            int i = 0;
+            data[i++] = 0x4D; data[i++] = (byte) READER_ID_SIZE;
+            System.arraycopy(readerID, 0, data, i, READER_ID_SIZE); i += READER_ID_SIZE;
+            data[i++] = (byte)0x86; data[i++] = 32;
+            System.arraycopy(udEphPubKeyX, 0, data, i, 32); i += 32;
+            data[i++] = (byte)0x87; data[i++] = 32;
+            System.arraycopy(readerEphPubKeyX, 0, data, i, 32); i += 32;
+            data[i++] = 0x4C; data[i++] = (byte) TRANSACTION_ID_SIZE;
+            System.arraycopy(transactionID, 0, data, i, TRANSACTION_ID_SIZE); i += TRANSACTION_ID_SIZE;
+            System.arraycopy(footer, 0, data, i, footer.length);
+            return data;
+        }
+        catch (Exception e)
+        {
+            Log.e(TAG, "buildSignatureData failed", e);
+            return null;
+        }
+    }
+
+    /**
+     * Build the SHA-256 hash of the signature data.
+     * Used with NONEwithECDSA (Bouncy Castle, for non-KeyStore keys like the reader).
+     */
     private static byte[] buildSignatureHash(
             byte[] readerID,
             byte[] udEphPubKeyX,
@@ -548,17 +636,10 @@ public class AliroCryptoProvider
     {
         try
         {
-            MessageDigest sha256 = MessageDigest.getInstance("SHA-256");
-            sha256.update(new byte[]{0x4D, (byte) READER_ID_SIZE});
-            sha256.update(readerID);
-            sha256.update(new byte[]{(byte) 0x86, 32});
-            sha256.update(udEphPubKeyX);
-            sha256.update(new byte[]{(byte) 0x87, 32});
-            sha256.update(readerEphPubKeyX);
-            sha256.update(new byte[]{0x4C, (byte) TRANSACTION_ID_SIZE});
-            sha256.update(transactionID);
-            sha256.update(footer);
-            return sha256.digest();
+            byte[] data = buildSignatureData(readerID, udEphPubKeyX, readerEphPubKeyX,
+                    transactionID, footer);
+            if (data == null) return null;
+            return MessageDigest.getInstance("SHA-256").digest(data);
         }
         catch (Exception e)
         {

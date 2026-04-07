@@ -53,6 +53,7 @@ public class LoginActivity extends AppCompatActivity
         setContentView(binding.getRoot());
 
         CryptoProvider.initializeCredentials(this);
+        Aliro_HostApduService.ensureAliroKeypairExists();
 
         if (!returnOnSuccess)
         {

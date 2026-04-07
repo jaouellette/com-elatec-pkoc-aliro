@@ -50,6 +50,20 @@ public class MainActivity extends AppCompatActivity
     {
         NavHostFragment navHostFragment = (NavHostFragment) getSupportFragmentManager().findFragmentById(R.id.nav_host_fragment);
         NavController navController = navHostFragment.getNavController();
-        return NavigationUI.onNavDestinationSelected(item, navController) || super.onOptionsItemSelected(item);
+
+        if (item.getItemId() == R.id.action_display_public_key)
+        {
+            navController.navigate(R.id.action_homeFragment_to_displayPublicKeyFragment);
+            return true;
+        }
+
+        if (item.getItemId() == R.id.action_aliro_config)
+        {
+            navController.navigate(R.id.action_homeFragment_to_aliroConfigFragment);
+            return true;
+        }
+
+        return NavigationUI.onNavDestinationSelected(item, navController)
+                || super.onOptionsItemSelected(item);
     }
 }

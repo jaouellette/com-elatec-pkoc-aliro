@@ -13,6 +13,9 @@
         <action
             android:id="@+id/action_homeFragment_to_displayPublicKeyFragment"
             app:destination="@id/displayPublicKeyFragment" />
+        <action
+            android:id="@+id/action_homeFragment_to_aliroConfigFragment"
+            app:destination="@id/aliroConfigFragment" />
     </fragment>
 
     <fragment
@@ -24,5 +27,11 @@
             android:id="@+id/action_displayPublicKeyFragment_to_homeFragment"
             app:destination="@id/homeFragment" />
     </fragment>
+
+    <fragment
+        android:id="@+id/aliroConfigFragment"
+        android:name="com.pkoc.readersimulator.AliroConfigFragment"
+        android:label="Aliro Config"
+        tools:layout="@layout/fragment_aliro_config" />
 
 </navigation>

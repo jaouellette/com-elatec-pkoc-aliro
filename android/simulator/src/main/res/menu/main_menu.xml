@@ -1,8 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <menu xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto">
+
     <item
         android:id="@+id/action_display_public_key"
         android:title="@string/display_reader_details"
         app:showAsAction="always" />
+
+    <item
+        android:id="@+id/action_aliro_config"
+        android:title="Aliro Config"
+        app:showAsAction="never" />
+
 </menu>

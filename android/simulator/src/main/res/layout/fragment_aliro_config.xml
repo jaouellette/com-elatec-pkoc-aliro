@@ -1,0 +1,155 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/colorBackground"
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="24dp">
+
+        <!-- Header -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Aliro Reader Configuration"
+            android:textSize="18sp"
+            android:textStyle="bold"
+            android:textColor="@color/colorPrimary"
+            android:layout_marginBottom="8dp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Enter values as hex strings. Private key and Reader ID are required. Issuer Public Key and Certificate are only needed when using Reader Certificates."
+            android:textSize="13sp"
+            android:textColor="@color/colorTextSecondary"
+            android:layout_marginBottom="24dp" />
+
+        <!-- Reader Private Key -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Reader Private Key (32 bytes / 64 hex chars)"
+            android:textSize="14sp"
+            android:textStyle="bold"
+            android:textColor="@color/colorTextPrimary"
+            android:layout_marginBottom="4dp" />
+
+        <EditText
+            android:id="@+id/editReaderPrivateKey"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="e.g. 4a3b2c1d..."
+            android:inputType="textNoSuggestions"
+            android:fontFamily="monospace"
+            android:textSize="13sp"
+            android:maxLines="2"
+            android:layout_marginBottom="20dp" />
+
+        <!-- Reader ID -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Reader Identifier (32 bytes / 64 hex chars)"
+            android:textSize="14sp"
+            android:textStyle="bold"
+            android:textColor="@color/colorTextPrimary"
+            android:layout_marginBottom="4dp" />
+
+        <EditText
+            android:id="@+id/editReaderId"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="e.g. 7f8e9d0c..."
+            android:inputType="textNoSuggestions"
+            android:fontFamily="monospace"
+            android:textSize="13sp"
+            android:maxLines="2"
+            android:layout_marginBottom="8dp" />
+
+        <!-- Certificate divider -->
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:background="@color/colorTextSecondary"
+            android:layout_marginBottom="16dp"
+            android:layout_marginTop="4dp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Reader Certificate (optional)"
+            android:textSize="15sp"
+            android:textStyle="bold"
+            android:textColor="@color/colorTextPrimary"
+            android:layout_marginBottom="12dp" />
+
+        <!-- Reader Issuer Public Key -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Reader Issuer Public Key (65 bytes / 130 hex chars)"
+            android:textSize="14sp"
+            android:textStyle="bold"
+            android:textColor="@color/colorTextPrimary"
+            android:layout_marginBottom="4dp" />
+
+        <EditText
+            android:id="@+id/editReaderIssuerPublicKey"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="04... (leave blank if not using a certificate)"
+            android:inputType="textNoSuggestions"
+            android:fontFamily="monospace"
+            android:textSize="13sp"
+            android:maxLines="3"
+            android:layout_marginBottom="20dp" />
+
+        <!-- Reader Certificate -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Reader Certificate (hex bytes)"
+            android:textSize="14sp"
+            android:textStyle="bold"
+            android:textColor="@color/colorTextPrimary"
+            android:layout_marginBottom="4dp" />
+
+        <EditText
+            android:id="@+id/editReaderCertificate"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="(leave blank if not using a certificate)"
+            android:inputType="textNoSuggestions"
+            android:fontFamily="monospace"
+            android:textSize="13sp"
+            android:maxLines="4"
+            android:layout_marginBottom="32dp" />
+
+        <!-- Save button -->
+        <Button
+            android:id="@+id/btnSaveAliroConfig"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Save"
+            android:backgroundTint="@color/colorPrimary"
+            android:textColor="@android:color/white"
+            android:layout_marginBottom="16dp" />
+
+        <!-- Status message -->
+        <TextView
+            android:id="@+id/txtAliroConfigStatus"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:textSize="13sp"
+            android:textColor="@color/colorTextSecondary"
+            android:gravity="center"
+            android:visibility="gone" />
+
+    </LinearLayout>
+</ScrollView>
