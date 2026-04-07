@@ -1,6 +1,6 @@
 <resources>
-    <string name="app_name">PSIA PKOC Core Library</string>
-    <string name="enter_custom_bit_length_65_255">Enter custom bit length (65–255)</string>
+    <string name="app_name">ELATEC PKOC/Aliro Core Library</string>
+    <string name="enter_custom_bit_length_65_255">Enter custom bit length (65–256)</string>
     <string name="copy_key">Copy Key</string>
     <string name="public_key_qr_code">Public Key QR Code</string>
     <string name="instructional_text_for_reader">Please scan this QR code to add this reader as a trusted device in your PKOC credential application.</string>

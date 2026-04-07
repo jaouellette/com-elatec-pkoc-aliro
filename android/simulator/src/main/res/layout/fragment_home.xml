@@ -1,28 +1,45 @@
 <?xml version="1.0" encoding="utf-8"?>
-<RelativeLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<androidx.constraintlayout.widget.ConstraintLayout
+    xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
     xmlns:tools="http://schemas.android.com/tools"
     android:id="@+id/mainLayout"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:background="@drawable/reader_background"
     tools:context=".HomeFragment">
 
+    <!-- Reader background fills entire screen -->
+    <ImageView
+        android:id="@+id/readerImageView"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:src="@drawable/reader_background"
+        android:scaleType="fitXY"
+        app:layout_constraintTop_toTopOf="parent"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintLeft_toLeftOf="parent"
+        app:layout_constraintRight_toRightOf="parent" />
+
+    <!-- Scroll content floats over the top portion of the image -->
     <ScrollView
-        android:layout_width="match_parent"
-        android:layout_height="match_parent"
-        android:background="@android:color/transparent">
+        android:id="@+id/scrollView"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:background="@android:color/transparent"
+        app:layout_constraintTop_toTopOf="parent"
+        app:layout_constraintLeft_toLeftOf="parent"
+        app:layout_constraintRight_toRightOf="parent">
 
         <RelativeLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:background="#00FFFFFF"
-            android:paddingBottom="16dp">
+            android:paddingBottom="8dp">
 
             <TextView
                 android:id="@+id/textView"
                 android:layout_width="match_parent"
-                android:layout_height="match_parent"
+                android:layout_height="wrap_content"
                 android:layout_centerHorizontal="true"
                 android:layout_marginTop="16dp"
                 android:background="@android:color/transparent"
@@ -36,7 +53,6 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:layout_below="@id/textView"
-                android:layout_centerHorizontal="false"
                 android:layout_marginTop="16dp"
                 android:text="Reader Location UUID: "
                 android:textSize="16sp"
@@ -47,7 +63,6 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:layout_below="@id/readerLocationUUID"
-                android:layout_centerHorizontal="false"
                 android:layout_marginTop="8dp"
                 android:text="Reader Site UUID: "
                 android:textSize="16sp"
@@ -58,7 +73,6 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:layout_below="@id/readerSiteUUID"
-                android:layout_centerHorizontal="false"
                 android:layout_marginTop="8dp"
                 android:text="Site Public Key: "
                 android:textSize="16sp"
@@ -69,7 +83,6 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:layout_below="@id/sitePublicKey"
-                android:layout_centerHorizontal="false"
                 android:layout_marginTop="8dp"
                 android:text="NFC Advertising Status: "
                 android:textSize="16sp"
@@ -118,18 +131,135 @@
                 android:text="Show Reader Details"
                 android:visibility="visible" />
 
-            <ImageView
-                android:id="@+id/reader_led"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="540dp"
-                android:layout_marginEnd="0dp"
-                android:background="#006A0000"
-                app:srcCompat="@drawable/green_led"
-                android:layout_marginStart="0dp"
-                android:visibility="visible" />
-
         </RelativeLayout>
     </ScrollView>
 
-</RelativeLayout>
+    <!-- Guidelines as % of the full screen — but now the image also fills
+         the full screen so these track correctly -->
+    <androidx.constraintlayout.widget.Guideline
+        android:id="@+id/guidelineKeypadTop"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        app:layout_constraintGuide_percent="0.55" />
+
+    <androidx.constraintlayout.widget.Guideline
+        android:id="@+id/guidelineKeypadBottom"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        app:layout_constraintGuide_percent="0.96" />
+
+    <androidx.constraintlayout.widget.Guideline
+        android:id="@+id/guidelineLeft"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        app:layout_constraintGuide_percent="0.08" />
+
+    <androidx.constraintlayout.widget.Guideline
+        android:id="@+id/guidelineRight"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        app:layout_constraintGuide_percent="0.92" />
+
+    <!-- Keypad constrained to guidelines within the full-screen image -->
+    <LinearLayout
+        android:id="@+id/keypadLayout"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:orientation="vertical"
+        android:weightSum="5"
+        android:background="@null"
+        app:layout_constraintTop_toTopOf="parent"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintLeft_toRightOf="@id/guidelineLeft"
+        app:layout_constraintRight_toLeftOf="@id/guidelineRight">
+
+        <TextView
+            android:id="@+id/pinDisplay"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:gravity="center"
+            android:hint=""
+            android:textColor="#AAAAAA"
+            android:textColorHint="#CCCCCC"
+            android:fontFamily="sans-serif-light"
+            android:textSize="18sp"
+            android:letterSpacing="0.3"
+            android:background="@null"
+            android:backgroundTint="@null" />
+
+        <!-- Row 1: 1 2 3 -->
+        <LinearLayout android:layout_width="match_parent" android:layout_height="0dp"
+            android:layout_weight="1" android:orientation="horizontal">
+            <Button android:id="@+id/key1" style="@style/KeypadButton"
+                android:layout_width="0dp" android:layout_height="match_parent"
+                android:layout_weight="1" android:text="1" android:background="@null"
+                android:backgroundTint="@null" />
+            <Button android:id="@+id/key2" style="@style/KeypadButton"
+                android:layout_width="0dp" android:layout_height="match_parent"
+                android:layout_weight="1" android:text="2"  android:background="@null"
+                android:backgroundTint="@null" />
+            <Button android:id="@+id/key3" style="@style/KeypadButton"
+                android:layout_width="0dp" android:layout_height="match_parent"
+                android:layout_weight="1" android:text="3"  android:background="@null"
+                android:backgroundTint="@null" />
+        </LinearLayout>
+
+        <!-- Row 2: 4 5 6 -->
+        <LinearLayout android:layout_width="match_parent" android:layout_height="0dp"
+            android:layout_weight="1" android:orientation="horizontal">
+            <Button android:id="@+id/key4" style="@style/KeypadButton"
+                android:layout_width="0dp" android:layout_height="match_parent"
+                android:layout_weight="1" android:text="4"  android:background="@null"
+                android:backgroundTint="@null" />
+            <Button android:id="@+id/key5" style="@style/KeypadButton"
+                android:layout_width="0dp" android:layout_height="match_parent"
+                android:layout_weight="1" android:text="5"  android:background="@null"
+                android:backgroundTint="@null" />
+            <Button android:id="@+id/key6" style="@style/KeypadButton"
+                android:layout_width="0dp" android:layout_height="match_parent"
+                android:layout_weight="1" android:text="6"  android:background="@null"
+                android:backgroundTint="@null" />
+        </LinearLayout>
+
+        <!-- Row 3: 7 8 9 -->
+        <LinearLayout android:layout_width="match_parent" android:layout_height="0dp"
+            android:layout_weight="1" android:orientation="horizontal">
+            <Button android:id="@+id/key7" style="@style/KeypadButton"
+                android:layout_width="0dp" android:layout_height="match_parent"
+                android:layout_weight="1" android:text="7"  android:background="@null"
+                android:backgroundTint="@null" />
+            <Button android:id="@+id/key8" style="@style/KeypadButton"
+                android:layout_width="0dp" android:layout_height="match_parent"
+                android:layout_weight="1" android:text="8" android:background="@null"
+                android:backgroundTint="@null" />
+            <Button android:id="@+id/key9" style="@style/KeypadButton"
+                android:layout_width="0dp" android:layout_height="match_parent"
+                android:layout_weight="1" android:text="9" android:background="@null"
+                android:backgroundTint="@null" />
+        </LinearLayout>
+
+        <!-- Row 4: * 0 # -->
+        <LinearLayout android:layout_width="match_parent" android:layout_height="0dp"
+            android:layout_weight="1" android:orientation="horizontal">
+            <Button android:id="@+id/keyStar" style="@style/KeypadButton"
+                android:layout_width="0dp" android:layout_height="match_parent"
+                android:layout_weight="1" android:text="*" android:background="@null"
+                android:backgroundTint="@null" />
+            <Button android:id="@+id/key0" style="@style/KeypadButton"
+                android:layout_width="0dp" android:layout_height="match_parent"
+                android:layout_weight="1" android:text="0" android:background="@null"
+                android:backgroundTint="@null" />
+            <Button android:id="@+id/keyHash" style="@style/KeypadButton"
+                android:layout_width="0dp" android:layout_height="match_parent"
+                android:layout_weight="1" android:text="#" android:background="@null"
+                android:backgroundTint="@null" />
+        </LinearLayout>
+
+    </LinearLayout>
+
+</androidx.constraintlayout.widget.ConstraintLayout>

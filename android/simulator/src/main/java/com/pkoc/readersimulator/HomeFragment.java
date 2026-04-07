@@ -28,12 +28,13 @@ import android.widget.ImageView;
 import android.widget.RelativeLayout;
 import android.widget.TextView;
 import android.widget.Toast;
-
+import android.widget.LinearLayout;
 import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.appcompat.app.AlertDialog;
+import androidx.constraintlayout.widget.ConstraintLayout;
 import androidx.fragment.app.Fragment;
 import android.text.SpannableStringBuilder;
 import android.text.SpannableString;
@@ -123,6 +124,13 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
 
     private ActivityResultLauncher<String[]> requestPermissionLauncher;
 
+    private ImageView readerImageView;
+    private LinearLayout keypadLayout;
+
+    private TextView pinDisplay;
+    private boolean isDisplayingResult = false;
+
+
     @Nullable
     @Override
     public View onCreateView(@NonNull LayoutInflater inflater, @Nullable ViewGroup container, @Nullable Bundle savedInstanceState)
@@ -145,7 +153,63 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
         readerSiteUUIDView = view.findViewById(R.id.readerSiteUUID);
         sitePublicKeyView = view.findViewById(R.id.sitePublicKey);
         nfcAdvertisingStatusView = view.findViewById(R.id.nfcadvertisingStatus);
-        bleAdvertisingStatusView = view.findViewById(R.id.bleadvertisingStatus);
+        bleAdvertisingStatusView = view.findViewById(R.id.bleadvertisingStatus);// Dynamically position keypad below LED area of reader image
+        View readerImage = view.findViewById(R.id.readerImageView);
+
+        readerImageView = view.findViewById(R.id.readerImageView);
+        keypadLayout = view.findViewById(R.id.keypadLayout);
+
+
+        readerImage.post(() -> {
+            int imageTop = readerImage.getTop();
+            int imageHeight = readerImage.getHeight();
+            int screenHeight = view.getHeight();
+
+            // LED indicators sit at ~18% down the reader image
+            // Keypad starts just below them at ~25% into the image
+            float keypadTopFraction = 0.36f;
+            float keypadBottomFraction = 0.94f;
+
+            int keypadTop = imageTop + (int)(imageHeight * keypadTopFraction);
+            int keypadBottom = imageTop + (int)(imageHeight * keypadBottomFraction);
+
+            androidx.constraintlayout.widget.ConstraintLayout.LayoutParams params =
+                    (androidx.constraintlayout.widget.ConstraintLayout.LayoutParams)
+                            keypadLayout.getLayoutParams();
+
+            // Remove guideline constraints and use absolute top margin instead
+            params.topToTop = androidx.constraintlayout.widget.ConstraintLayout.LayoutParams.PARENT_ID;
+            params.bottomToBottom = androidx.constraintlayout.widget.ConstraintLayout.LayoutParams.PARENT_ID;
+            params.topMargin = keypadTop;
+            params.bottomMargin = screenHeight - keypadBottom;
+            params.height = 0; // stretch between margins
+
+            keypadLayout.setLayoutParams(params);
+        });
+
+        // Set up keypad PIN display and click listeners
+        pinDisplay = view.findViewById(R.id.pinDisplay);
+        pinDisplay.setText("");  // explicitly clear on start
+
+        int[] keyIds = {
+            R.id.key1, R.id.key2, R.id.key3,
+            R.id.key4, R.id.key5, R.id.key6,
+            R.id.key7, R.id.key8, R.id.key9,
+            R.id.keyStar, R.id.key0, R.id.keyHash
+        };
+        String[] keyVals = {"1", "2", "3", "4", "5", "6", "7", "8", "9", "*", "0", "#"};
+
+        for (int i = 0; i < keyIds.length; i++) {
+            final String val = keyVals[i];
+            view.findViewById(keyIds[i]).setOnClickListener(v -> {
+                CharSequence current = pinDisplay.getText();
+                if (current.length() == 0) {
+                    pinDisplay.setText(val);
+                } else {
+                    pinDisplay.setText(current + val);
+                }
+            });
+        }
 
         CryptoProvider.initializeCredentials(requireActivity());
         initializeReaderAndSiteUUID();
@@ -175,13 +239,6 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
         sitePublicKeyView.setText(Html.fromHtml(sitePublicKeyText, Html.FROM_HTML_MODE_LEGACY));
         nfcAdvertisingStatusView.setText(Html.fromHtml(nfcAdvertisingStatusText, Html.FROM_HTML_MODE_LEGACY));
         bleAdvertisingStatusView.setText(Html.fromHtml(bleAdvertisingStatusText, Html.FROM_HTML_MODE_LEGACY));
-
-        ImageView ledImage = view.findViewById(R.id.reader_led);
-        AlphaAnimation blinkAnim = new AlphaAnimation(0.0f, 1.0f);
-        blinkAnim.setDuration(1000);
-        blinkAnim.setRepeatMode(Animation.REVERSE);
-        blinkAnim.setRepeatCount(Animation.INFINITE);
-        ledImage.startAnimation(blinkAnim);
 
         requestPermissionLauncher =
                 registerForActivityResult(new ActivityResultContracts.RequestMultiplePermissions(), isGranted -> {
@@ -388,6 +445,9 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                     {
                         requireActivity().runOnUiThread(() ->
                         {
+                            // Hide reader image and keypad when showing scan results
+                            readerImageView.setVisibility(View.GONE);
+                            keypadLayout.setVisibility(View.GONE);
                             String pk = Hex.toHexString(publicKey);
                             Log.d("NFC", "Public Key: \n" + pk);
                             displayPublicKeyInfo(pk, "Connection Type: Normal Flow");
@@ -450,9 +510,9 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
             String initialText = "<b>Scan a PKOC BLE or NFC Credential</b>";
             textView.setText(Html.fromHtml(initialText, Html.FROM_HTML_MODE_LEGACY));
 
-            RelativeLayout mainLayout = requireView().findViewById(R.id.mainLayout);
-            mainLayout.setBackgroundResource(0);
-            mainLayout.setBackgroundResource(R.drawable.reader_background);
+            ConstraintLayout mainLayout = requireView().findViewById(R.id.mainLayout);
+            //mainLayout.setBackgroundResource(0);
+            //mainLayout.setBackgroundResource(R.drawable.reader_background);
             // Hide the email button
             Button emailButton = requireView().findViewById(R.id.emailButton);
             emailButton.setVisibility(View.GONE);
@@ -464,15 +524,6 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
             // Show the reader button
             Button rdrButton = requireView().findViewById(R.id.rdrButton);
             rdrButton.setVisibility(View.VISIBLE);
-
-            // Show green LED
-            ImageView ledImage = requireView().findViewById(R.id.reader_led);
-            ledImage.setVisibility(View.VISIBLE);
-            AlphaAnimation blinkAnim = new AlphaAnimation(0.0f, 1.0f);
-            blinkAnim.setDuration(1000);
-            blinkAnim.setRepeatMode(Animation.REVERSE);
-            blinkAnim.setRepeatCount(Animation.INFINITE);
-            ledImage.startAnimation(blinkAnim);
 
             // Check if the button text is "Show Reader Details"
             if (rdrButton.getText().toString().equals("Show Reader Details"))
@@ -514,37 +565,37 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                 nfcAdvertisingStatusView.setVisibility(View.VISIBLE);
                 bleAdvertisingStatusView.setVisibility(View.VISIBLE);
             }
+            readerImageView.setVisibility(View.VISIBLE);
+            keypadLayout.setVisibility(View.VISIBLE);
+            pinDisplay.setText("");
+            isDisplayingResult = false;
         });
-    }
-
-    private void hideRdrDetails()
-    {
-        // Hide the reader details
-        readerLocationUUIDView.setVisibility(View.GONE);
-        readerSiteUUIDView.setVisibility(View.GONE);
-        sitePublicKeyView.setVisibility(View.GONE);
-        nfcAdvertisingStatusView.setVisibility(View.GONE);
-        bleAdvertisingStatusView.setVisibility(View.GONE);
-
-        // Change button text to "Show Reader Details"
-        rdrButton.setText(R.string.show_reader_details);
-        // Update OnClickListener to show details
-        rdrButton.setOnClickListener(v -> showRdrDetails());
     }
 
     private void showRdrDetails()
     {
-        // Show the reader details
+        readerImageView.setVisibility(View.GONE);
+        keypadLayout.setVisibility(View.GONE);
         readerLocationUUIDView.setVisibility(View.VISIBLE);
         readerSiteUUIDView.setVisibility(View.VISIBLE);
         sitePublicKeyView.setVisibility(View.VISIBLE);
         nfcAdvertisingStatusView.setVisibility(View.VISIBLE);
         bleAdvertisingStatusView.setVisibility(View.VISIBLE);
-
-        // Change button text to "Hide Reader Details"
         rdrButton.setText(R.string.hide_reader_details);
-        // Update OnClickListener to hide details
         rdrButton.setOnClickListener(v -> hideRdrDetails());
+    }
+
+    private void hideRdrDetails()
+    {
+        readerLocationUUIDView.setVisibility(View.GONE);
+        readerSiteUUIDView.setVisibility(View.GONE);
+        sitePublicKeyView.setVisibility(View.GONE);
+        nfcAdvertisingStatusView.setVisibility(View.GONE);
+        bleAdvertisingStatusView.setVisibility(View.GONE);
+        readerImageView.setVisibility(View.VISIBLE);
+        keypadLayout.setVisibility(View.VISIBLE);
+        rdrButton.setText(R.string.show_reader_details);
+        rdrButton.setOnClickListener(v -> showRdrDetails());
     }
 
     // Helper method to apply background, text color, font size, and bold attribute to a specific range of text
@@ -679,8 +730,17 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
         @Override
         public void onConnectionStateChange(BluetoothDevice device, int status, int newState)
         {
+            Log.d(TAG, ">>> onConnectionStateChange: device=" + device.getAddress() + " status=" + status + " newState=" + newState);
             if (newState == BluetoothProfile.STATE_CONNECTED)
             {
+                // Remove any stale entry for this device address before adding fresh one
+                for (int a = _connectedDevices.size() - 1; a >= 0; a--)
+                {
+                    if (device.getAddress().equals(_connectedDevices.get(a).connectedDevice.getAddress()))
+                    {
+                        _connectedDevices.remove(a);
+                    }
+                }
                 FlowModel newDevice = new FlowModel();
                 newDevice.connectedDevice = device;
                 _connectedDevices.add(newDevice);
@@ -705,6 +765,9 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                 {
                     _connectedDevices.remove(toRemove);
                 }
+                // Reset GATT operation queue so next connection starts clean
+                gattOperationQueue.clear();
+                isGattOperationInProgress = false;
                 Log.d(TAG, "Device disconnected: " + device.getAddress());
                 //layoutPost("Device disconnected", device.getAddress());
             }
@@ -712,14 +775,24 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
 
         public void InitiatePkocFlow(BluetoothDevice device)
         {
+            Log.d(TAG, ">>> InitiatePkocFlow called for " + device.getAddress());
             FlowModel deviceModel = getDeviceCredentialModel(device);
 
             if (deviceModel == null)
             {
+                Log.e(TAG, ">>> InitiatePkocFlow: deviceModel is NULL — device not in _connectedDevices!");
                 return;
             }
 
-            if (deviceModel.transientKeyPair == null && deviceModel.receivedTransientPublicKey == null && deviceModel.signature == null)
+            // Reset state for each new transaction (device may reconnect without full disconnect)
+            deviceModel.transientKeyPair = null;
+            deviceModel.receivedTransientPublicKey = null;
+            deviceModel.signature = null;
+            deviceModel.publicKey = null;
+            deviceModel.sharedSecret = null;
+            deviceModel.counter = 0;
+            deviceModel.connectionType = null;
+
             {
                 deviceModel.transientKeyPair = CryptoProvider.CreateTransientKeyPair();
                 byte[] encodedPublicKey = Objects.requireNonNull(deviceModel.transientKeyPair).getPublic().getEncoded();
@@ -771,6 +844,7 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                 if (canConnect)
                 {
                     Log.i(TAG, "Message sent in response for request to read PKOC read characteristic");
+                    Log.d(TAG, ">>> Sending reader opening message, length=" + toSend.length);
                     // Start the timeout timer
                     timeoutHandler.postDelayed(timeoutRunnable, 10000); //change this back to 1000 when done troubleshooting
                     writeToReadCharacteristic(device, toSend, false);
@@ -791,6 +865,7 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                                              int offset,
                                              byte[] value)
         {
+            Log.d(TAG, ">>> onDescriptorWriteRequest from " + device.getAddress() + ", uuid=" + descriptor.getUuid());
             if (Constants.ConfigUUID.equals(descriptor.getUuid()))
             {
                 if (responseNeeded)
@@ -853,6 +928,22 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                     {
                         mBluetoothGattServer.sendResponse(device, requestId, BluetoothGatt.GATT_FAILURE, offset, null);
                     }
+                    return;
+                }
+
+                // If the previous transaction completed (publicKey+signature set) and the
+                // credential app is sending again without disconnecting/re-subscribing,
+                // re-initiate the flow now so we send a fresh reader opening message first.
+                if (deviceModel.publicKey != null && deviceModel.signature != null && deviceModel.transientKeyPair != null)
+                {
+                    Log.d(TAG, ">>> Stale completed transaction detected on write — re-initiating flow");
+                    InitiatePkocFlow(device);
+                    // Send GATT response and let the credential app retry after receiving the new reader key
+                    if (responseNeeded)
+                    {
+                        mBluetoothGattServer.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value);
+                    }
+                    onGattOperationCompleted();
                     return;
                 }
 
@@ -982,10 +1073,12 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                     }
                 }
 // Check for standard flow
+                boolean completedFullFlow = false;
                 if (deviceModel.transientKeyPair != null
                         && deviceModel.publicKey != null
                         && deviceModel.signature != null)
                 {
+                    completedFullFlow = true;
                     timeoutHandler.removeCallbacks(timeoutRunnable);
                     byte[] pubKey = deviceModel.publicKey;
                     byte[] signature = deviceModel.signature;
@@ -1017,6 +1110,10 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
 // Parse the public key on the main thread
                     new Handler(Looper.getMainLooper()).post(() ->
                     {
+                        // Hide reader image and keypad when showing BLE scan results
+                        readerImageView.setVisibility(View.GONE);
+                        keypadLayout.setVisibility(View.GONE);
+
                         String publicKeyHex = Hex.toHexString(pubKey).toUpperCase();
                         String connectionTypeText = "Connection Type: Unknown";
                         if (deviceModel.connectionType == PKOC_ConnectionType.ECHDE_Full)
@@ -1085,11 +1182,21 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                             {
                                     response
                             });
+                    // Send GATT response FIRST so the credential app is ready to receive
+                    // the notification. Ordering matters: ACK the write, then notify.
+                    if (responseNeeded)
+                    {
+                        mBluetoothGattServer.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value);
+                    }
+
                     Log.d(TAG, "Message sent to connected device: " + Hex.toHexString(responseTLV));
                     writeToReadCharacteristic(device, responseTLV, true);
                     boolean finalSigValid = sigValid;
                     new Handler(Looper.getMainLooper()).post(() ->
                     {
+                        readerImageView.setVisibility(View.GONE);
+                        keypadLayout.setVisibility(View.GONE);
+
                         if (finalSigValid)
                         {
                             ToneGenerator toneGen1 = new ToneGenerator(AudioManager.STREAM_RING, 100);
@@ -1106,7 +1213,8 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                 Log.d(TAG, "Calling onGattOperationCompleted from onCharacteristicWriteRequest");
                 onGattOperationCompleted();
 
-                if (responseNeeded)
+                // For intermediate ECDHE writes (not the final full flow), send the response here
+                if (responseNeeded && !completedFullFlow)
                 {
                     mBluetoothGattServer.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value);
                 }
@@ -1172,13 +1280,15 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
 
                     boolean notified = mBluetoothGattServer.notifyCharacteristicChanged(device, readCharacteristic, false);
 
-                    Log.d(TAG, "Notified: " + notified);
+                    Log.d(TAG, ">>> notifyCharacteristicChanged returned: " + notified + ", dataLen=" + toWrite.length);
+                    if (!notified)
+                    {
+                        Log.e(TAG, ">>> NOTIFICATION FAILED — device may not be subscribed or a notification is already pending");
+                    }
                     //layoutPost("Notify characteristic changed", String.valueOf(notified));
 
-                    if (cancelConnectionAfterCompleted)
-                    {
-                        mBluetoothGattServer.cancelConnection(device);
-                    }
+                    // Do not cancel connection — credential app disconnects itself,
+                    // and cancelConnection() prevents the device from reconnecting.
                 }
                 else
                 {
@@ -1385,7 +1495,7 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
 
             formattedText.append(applyColorAndSize(yPortion.toUpperCase(), yPortion.length(), Color.WHITE, Color.parseColor("#707173"), false));
 
-            RelativeLayout mainLayout = requireView().findViewById(R.id.mainLayout);
+            ConstraintLayout mainLayout = requireView().findViewById(R.id.mainLayout);
             mainLayout.setBackgroundColor(getResources().getColor(android.R.color.white, requireActivity().getTheme()));
 
             // Update the screen with the public key read data
@@ -1394,11 +1504,6 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
             // Hide reader detail button
             Button rdrButton = requireView().findViewById(R.id.rdrButton);
             rdrButton.setVisibility(View.GONE);
-
-            // Hide the flashing green LED
-            ImageView ledflash = requireView().findViewById(R.id.reader_led);
-            ledflash.clearAnimation();
-            ledflash.setVisibility(View.GONE);
 
             // Set up the email button
             Button emailButton = requireView().findViewById(R.id.emailButton);

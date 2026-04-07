@@ -69,7 +69,9 @@ public class LoginActivity extends AppCompatActivity
         Set<String> savedIds = CredentialStore.getSelectedCredentialIds(this);
         if (savedIds.isEmpty())
         {
-            showNoContext();
+            // BYPASS: Skip Sentry org check, go straight to main screen
+            startActivity(new Intent(this, MainActivity.class));
+            finish();
             return;
         }
 
@@ -105,7 +107,9 @@ public class LoginActivity extends AppCompatActivity
                     if (matched.isEmpty())
                     {
                         CredentialStore.clear(LoginActivity.this);
-                        showNoContext();
+                        // BYPASS: Skip Sentry org check, go straight to main screen
+                        startActivity(new Intent(LoginActivity.this, MainActivity.class));
+                        finish();
                     }
                     else
                     {
@@ -119,7 +123,9 @@ public class LoginActivity extends AppCompatActivity
                 runOnUiThread(() ->
                 {
                     binding.progressBar.setVisibility(View.GONE);
-                    showNoContext();
+                    // BYPASS: Skip Sentry org check, go straight to main screen
+                    startActivity(new Intent(LoginActivity.this, MainActivity.class));
+                    finish();
                 });
             }
         });

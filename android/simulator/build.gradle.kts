@@ -75,6 +75,7 @@ dependencies {
     implementation(libs.constraintlayout)
     implementation(libs.bcpkix.jdk15to18)
     implementation(libs.bcprov.jdk15to18)
+    implementation("androidx.constraintlayout:constraintlayout:2.1.4")
     testImplementation(libs.robolectric)
     testImplementation(libs.junit)
     androidTestImplementation(libs.ext.junit)

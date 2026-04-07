@@ -106,23 +106,19 @@ public class SendCredentialFragment extends Fragment
                 return;
             }
 
-            Drawable originalDrawable = ContextCompat.getDrawable(context, R.drawable.door_closed_64);
-            Drawable newDrawable = ContextCompat.getDrawable(context, R.drawable.door_open_64);
+            binding.readerIcon.setImageResource(R.drawable.ic_reader_success);
+            binding.statusText.setText(getString(R.string.credential_sent));
+            binding.statusText.setVisibility(View.VISIBLE);
 
-            binding
-                .centerInstruction
-                .setCompoundDrawablesWithIntrinsicBounds(null, newDrawable, null, null);
-
-            binding.centerInstruction.postDelayed(() ->
+            binding.readerIcon.postDelayed(() ->
             {
                 if (!isAdded())
                 {
                     return;
                 }
 
-                binding
-                    .centerInstruction
-                    .setCompoundDrawablesWithIntrinsicBounds(null, originalDrawable, null, null);
+                binding.readerIcon.setImageResource(R.drawable.ic_reader_idle);
+                binding.statusText.setVisibility(View.INVISIBLE);
             }, 2000);
         }
     };
@@ -194,7 +190,7 @@ public class SendCredentialFragment extends Fragment
             {
                 if (!mBTAdapter.isEnabled())
                 {
-                     Toast.makeText(getContext(), getString(R.string.BTnotOn), Toast.LENGTH_SHORT).show();
+                    Toast.makeText(getContext(), getString(R.string.BTnotOn), Toast.LENGTH_SHORT).show();
                     return;
                 }
             }
@@ -275,15 +271,15 @@ public class SendCredentialFragment extends Fragment
         if (!nfcAdapter.isEnabled())
         {
             new AlertDialog.Builder(requireContext())
-                .setTitle(R.string.enable_nfc)
-                .setMessage(R.string.nfc_is_disabled_please_enable_it_if_you_intend_to_use_nfc_to_transmit_credentials)
-                .setPositiveButton(R.string.go_to_settings, (dialog, which) ->
-                {
-                    Intent intent = new Intent(Settings.ACTION_NFC_SETTINGS);
-                    startActivity(intent);
-                })
-                .setNegativeButton(R.string.cancel, null)
-                .show();
+                    .setTitle(R.string.enable_nfc)
+                    .setMessage(R.string.nfc_is_disabled_please_enable_it_if_you_intend_to_use_nfc_to_transmit_credentials)
+                    .setPositiveButton(R.string.go_to_settings, (dialog, which) ->
+                    {
+                        Intent intent = new Intent(Settings.ACTION_NFC_SETTINGS);
+                        startActivity(intent);
+                    })
+                    .setNegativeButton(R.string.cancel, null)
+                    .show();
         }
     }
 
@@ -297,11 +293,11 @@ public class SendCredentialFragment extends Fragment
             if (!hasPermission(Manifest.permission.ACCESS_FINE_LOCATION) || !hasPermission(Manifest.permission.BLUETOOTH_CONNECT) || !hasPermission(Manifest.permission.BLUETOOTH_SCAN))
             {
                 String[] permissionsForNewerPhones = new String[]
-                {
-                    Manifest.permission.ACCESS_FINE_LOCATION,
-                    Manifest.permission.BLUETOOTH_CONNECT,
-                    Manifest.permission.BLUETOOTH_SCAN
-                };
+                        {
+                                Manifest.permission.ACCESS_FINE_LOCATION,
+                                Manifest.permission.BLUETOOTH_CONNECT,
+                                Manifest.permission.BLUETOOTH_SCAN
+                        };
 
                 ActivityCompat.requestPermissions(this.requireActivity(), permissionsForNewerPhones, 1);
             }
@@ -311,10 +307,10 @@ public class SendCredentialFragment extends Fragment
             if (!hasPermission(Manifest.permission.ACCESS_FINE_LOCATION) || !hasPermission(Manifest.permission.BLUETOOTH_ADMIN))
             {
                 String[] permissionsForOlderPhones = new String[]
-                {
-                        Manifest.permission.ACCESS_FINE_LOCATION,
-                        Manifest.permission.BLUETOOTH_ADMIN
-                };
+                        {
+                                Manifest.permission.ACCESS_FINE_LOCATION,
+                                Manifest.permission.BLUETOOTH_ADMIN
+                        };
 
                 ActivityCompat.requestPermissions(this.requireActivity(), permissionsForOlderPhones, 1);
             }
@@ -328,7 +324,7 @@ public class SendCredentialFragment extends Fragment
     {
         binding.discover.setVisibility(View.GONE);
         binding.devicesListView.setVisibility(View.GONE);
-        binding.centerInstruction.setVisibility(View.VISIBLE);
+        binding.readerContainer.setVisibility(View.VISIBLE); // show the reader icon + instruction
 
         requestNfcPermissions();
 
@@ -351,19 +347,18 @@ public class SendCredentialFragment extends Fragment
     {
         binding.discover.setVisibility(View.VISIBLE);
         binding.devicesListView.setVisibility(View.VISIBLE);
-        binding.centerInstruction.setVisibility(View.GONE);
+        binding.readerContainer.setVisibility(View.GONE); // hide reader icon in BLE mode
 
         mBTArrayAdapter = new ListModelAdapter(requireActivity());
         Log.i("SendCredentialFragment", "mBTArrayAdapter is not null");
         binding.discover.setOnClickListener(v -> setIsScanning(!_IsScanning));
 
-        mBTAdapter = BluetoothAdapter.getDefaultAdapter(); // get a handle on the bluetooth radio
+        mBTAdapter = BluetoothAdapter.getDefaultAdapter();
 
-        binding.devicesListView.setAdapter(mBTArrayAdapter); // assign model to view
+        binding.devicesListView.setAdapter(mBTArrayAdapter);
         binding.devicesListView.setOnItemClickListener(mDeviceClickListener);
 
         Log.i("SendCredentialFragment", "Begin check permissions");
-        // Ask for location permission if not already allowed
         requestBluetoothPermissions();
         LoadUserPreferences();
 
@@ -387,11 +382,10 @@ public class SendCredentialFragment extends Fragment
 
                 chosenDevice.setIsBusy(false);
 
-                // Check for TLV Success (4, 1, 1) case where access cannot be decided
                 if (msg.what == ReaderUnlockStatus.CompletedTransaction.ordinal())
                 {
                     Log.i("SendCredentialFragment", "TLV Success - Access decision unknown");
-                    chosenDevice.setIcon(R.drawable.baseline_lock_open_24_yellow); // Use a different icon indicating unknown state
+                    chosenDevice.setIcon(R.drawable.baseline_lock_open_24_yellow);
                     Toast.makeText(getContext(), "TLV Success - Access decision unknown", Toast.LENGTH_SHORT).show();
 
                     new Handler(getMainLooper()).postDelayed(() ->
@@ -430,7 +424,7 @@ public class SendCredentialFragment extends Fragment
                             model.setIcon(R.drawable.baseline_lock_24);
                         }
                         mBTArrayAdapter.notifyDataSetChanged();
-                    }, 4000); // 4 second
+                    }, 4000);
                 }
                 else
                 {
@@ -453,7 +447,7 @@ public class SendCredentialFragment extends Fragment
                             model.setIcon(R.drawable.baseline_lock_24);
                         }
                         mBTArrayAdapter.notifyDataSetChanged();
-                    }, 4000); // 4 second
+                    }, 4000);
                 }
 
                 mBTArrayAdapter.notifyDataSetChanged();
@@ -524,7 +518,6 @@ public class SendCredentialFragment extends Fragment
 
     private void initializeFragment()
     {
-        // hide the logo in horizontal orientation as vertical space becomes more valuable
         int orientation = getResources().getConfiguration().orientation;
         if (orientation == Configuration.ORIENTATION_LANDSCAPE)
         {
@@ -565,18 +558,6 @@ public class SendCredentialFragment extends Fragment
         }
     }
 
-    /**
-     * on Create View
-     * @param inflater The LayoutInflater object that can be used to inflate
-     * any views in the fragment,
-     * @param container If non-null, this is the parent view that the fragment's
-     * UI should be attached to.  The fragment should not add the view itself,
-     * but this can be used to generate the LayoutParams of the view.
-     * @param savedInstanceState If non-null, this fragment is being re-constructed
-     * from a previous saved state as given here.
-     *
-     * @return View
-     */
     @Override
     public View onCreateView (@NonNull LayoutInflater inflater, @Nullable ViewGroup container, Bundle savedInstanceState)
     {
@@ -585,9 +566,6 @@ public class SendCredentialFragment extends Fragment
         return binding.getRoot();
     }
 
-    /**
-     * Initialize fragment with user preferences
-     */
     public void LoadUserPreferences ()
     {
         Log.i("SendCredentialFragment", "LoadUserPreferences");
@@ -620,16 +598,9 @@ public class SendCredentialFragment extends Fragment
             {
                 setIsScanning(false);
             }
-
         }
     }
 
-    /**
-     * On View Created
-     * @param view The View returned by {@link #onCreateView(LayoutInflater, ViewGroup, Bundle)}.
-     * @param savedInstanceState If non-null, this fragment is being re-constructed
-     * from a previous saved state as given here.
-     */
     public void onViewCreated (@NonNull View view, Bundle savedInstanceState)
     {
         super.onViewCreated(view, savedInstanceState);
@@ -689,9 +660,6 @@ public class SendCredentialFragment extends Fragment
         initializeFragment();
     }
 
-    /**
-     * On destroy view
-     */
     @Override
     public void onDestroyView ()
     {
@@ -708,9 +676,9 @@ public class SendCredentialFragment extends Fragment
 
     private final ScanCallback mLeScanCallback = new ScanCallback()
     {
-
         @Override
-        public void onScanResult(int callbackType, ScanResult result) {
+        public void onScanResult(int callbackType, ScanResult result)
+        {
             super.onScanResult(callbackType, result);
 
             if (!isAdded()) {
@@ -725,7 +693,6 @@ public class SendCredentialFragment extends Fragment
                     return;
             }
 
-            // ✅ Manual UUID filter
             ScanRecord scanRecord = result.getScanRecord();
             if (scanRecord == null || scanRecord.getServiceUuids() == null) return;
 
@@ -747,7 +714,7 @@ public class SendCredentialFragment extends Fragment
 
             for (int i = 0; i < mBTArrayAdapter.getCount(); i++) {
                 ListModel toCheck = (ListModel) mBTArrayAdapter.getItem(i);
-                if ((new Date()).getTime() - toCheck.getLastSeen().getTime() > 15 * 1000) // stale 15 seconds
+                if ((new Date()).getTime() - toCheck.getLastSeen().getTime() > 15 * 1000)
                     mBTArrayAdapter.remove(toCheck);
             }
 
@@ -800,7 +767,6 @@ public class SendCredentialFragment extends Fragment
             mBTArrayAdapter.notifyDataSetChanged();
         }
 
-
         @Override
         public void onBatchScanResults (List<ScanResult> results)
         {
@@ -814,7 +780,7 @@ public class SendCredentialFragment extends Fragment
         }
     };
 
-    public void connectDevice (ListModel lm)
+    public void connectDevice(ListModel lm)
     {
         Log.i("SendCredentialFragment", "connectDevice");
         if (mBTAdapter != null)
@@ -847,10 +813,27 @@ public class SendCredentialFragment extends Fragment
         SharedPreferences sharedPref = requireActivity().getPreferences(Context.MODE_PRIVATE);
         int ToFlow_int = sharedPref.getInt(PKOC_Preferences.PKOC_TransmissionFlow, PKOC_ConnectionType.Uncompressed.ordinal());
 
-        // Spawn a new thread to avoid blocking the GUI one
         PKOC_ConnectionType finalToFlow = PKOC_ConnectionType.values()[ToFlow_int];
         Log.i("SendCredentialFragment", "finalToFlow: " + finalToFlow);
         new Thread(() -> {
+            // Close any previous GATT client before opening a new one.
+            // Without this, the old client holds the connection open and the
+            // new connectGatt() call gets routed to the stale callback.
+            if (connectedGatt != null)
+            {
+                Log.i("SendCredentialFragment", "Closing previous GATT client");
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
+                {
+                    if (ActivityCompat.checkSelfPermission(requireContext(), Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED)
+                        connectedGatt.close();
+                }
+                else
+                {
+                    connectedGatt.close();
+                }
+                connectedGatt = null;
+            }
+
             BluetoothDevice device = mBTAdapter.getRemoteDevice(address);
 
             Log.i("SendCredentialFragment", "device: " + device);
@@ -864,13 +847,11 @@ public class SendCredentialFragment extends Fragment
             {
                 Log.i("SendCredentialFragment", "Checking for bluetooth connect permission");
                 if (ActivityCompat.checkSelfPermission(requireContext(), Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED)
-                    //Log.i("SendCredentialFragment", "Permission not granted");
                     return;
             }
             else
             {
                 if (ActivityCompat.checkSelfPermission(requireContext(), Manifest.permission.BLUETOOTH_ADMIN) != PackageManager.PERMISSION_GRANTED)
-                    //Log.i("SendCredentialFragment", "Permission not granted");
                     return;
             }
 
@@ -907,6 +888,8 @@ public class SendCredentialFragment extends Fragment
                     {
                         Log.w("SendCredentialFragment", "Disconnecting");
                         connectedGatt.disconnect();
+                        connectedGatt.close();
+                        connectedGatt = null;
                     }
 
                     IsConnecting = false;
@@ -925,7 +908,7 @@ public class SendCredentialFragment extends Fragment
                         setIsScanning(true);
                     }
                 }
-            }, 6000); // 6 seconds
+            }, 6000);
 
         }).start();
     }
@@ -943,15 +926,16 @@ public class SendCredentialFragment extends Fragment
             }
         }
     };
-    // Method to parse the device name from the scan record
-    private String parseDeviceName(byte[] scanRecord) {
+
+    private String parseDeviceName(byte[] scanRecord)
+    {
         int index = 0;
         while (index < scanRecord.length) {
             int length = scanRecord[index++];
             if (length == 0) break;
 
             int type = scanRecord[index];
-            if (type == 0x09) { // Complete Local Name
+            if (type == 0x09) {
                 return new String(Arrays.copyOfRange(scanRecord, index + 1, index + length));
             }
             index += length;

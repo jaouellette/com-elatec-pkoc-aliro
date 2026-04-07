@@ -183,7 +183,7 @@ public class CredentialSelectionActivity extends AppCompatActivity
             CheckBox checkBox = new CheckBox(this);
             checkBox.setText(label);
             checkBox.setChecked(true);
-            checkBox.setTextColor(ContextCompat.getColor(this, R.color.textPrimary));
+            checkBox.setTextColor(ContextCompat.getColor(this, R.color.colorTextPrimary));
             checkBox.setTextSize(15);
             checkBox.setPadding(8, 0, 8, 0);
 
