@@ -117,12 +117,9 @@ public class SendCredentialFragment extends Fragment
                     if (!isAdded()) return;
                     binding.readerIcon.setImageResource(R.drawable.ic_reader_idle);
                     binding.statusText.setVisibility(View.INVISIBLE);
-                    binding.readerContainer.setVisibility(View.GONE);
-                    binding.discover.setVisibility(View.VISIBLE);
-                    binding.devicesListView.setVisibility(View.VISIBLE);
+                    restoreButtonUI();
                     if (binding.btnAliroBle != null)
                     {
-                        binding.btnAliroBle.setVisibility(View.VISIBLE);
                         binding.btnAliroBle.setText("Aliro BLE");
                         binding.btnAliroBle.setOnClickListener(v -> startAliroBle());
                     }
@@ -530,6 +527,19 @@ public class SendCredentialFragment extends Fragment
         requireContext().bindService(intent, aliroBleConnection, Context.BIND_AUTO_CREATE);
     }
 
+    /** Restore the scan button UI and ensure no button retains focus. */
+    private void restoreButtonUI()
+    {
+        binding.readerContainer.setVisibility(View.GONE);
+        binding.discover.setVisibility(View.VISIBLE);
+        binding.devicesListView.setVisibility(View.VISIBLE);
+        if (binding.btnAliroBle != null) binding.btnAliroBle.setVisibility(View.VISIBLE);
+        // Explicitly clear focus so no button gets the highlight ring
+        binding.discover.clearFocus();
+        if (binding.btnAliroBle != null) binding.btnAliroBle.clearFocus();
+        if (binding.getRoot() != null) binding.getRoot().requestFocus();
+    }
+
     private void stopAliroBle()
     {
         if (aliroBleCredentialService != null) aliroBleCredentialService.stopScan();
@@ -553,12 +563,22 @@ public class SendCredentialFragment extends Fragment
         if (binding.btnAliroBle != null)
         {
             binding.btnAliroBle.setVisibility(View.VISIBLE);
-            binding.btnAliroBle.setOnClickListener(v -> startAliroBle());
+            binding.btnAliroBle.setOnClickListener(v ->
+            {
+                v.clearFocus();
+                if (binding.getRoot() != null) binding.getRoot().requestFocus();
+                startAliroBle();
+            });
         }
 
         mBTArrayAdapter = new ListModelAdapter(requireActivity());
         Log.i("SendCredentialFragment", "mBTArrayAdapter is not null");
-        binding.discover.setOnClickListener(v -> setIsScanning(!_IsScanning));
+        binding.discover.setOnClickListener(v ->
+        {
+            v.clearFocus();
+            if (binding.getRoot() != null) binding.getRoot().requestFocus();
+            setIsScanning(!_IsScanning);
+        });
 
         mBTAdapter = BluetoothAdapter.getDefaultAdapter();
 
@@ -621,7 +641,7 @@ public class SendCredentialFragment extends Fragment
                 else if (pkocUnknown)
                 {
                     binding.readerIcon.setImageResource(R.drawable.ic_reader_success);
-                    binding.statusText.setText("PKOC BLE: Credential Sent");
+                    binding.statusText.setText("Credential Sent");
                 }
                 else
                 {
@@ -636,10 +656,7 @@ public class SendCredentialFragment extends Fragment
                     if (!isAdded()) return;
                     binding.readerIcon.setImageResource(R.drawable.ic_reader_idle);
                     binding.statusText.setVisibility(View.INVISIBLE);
-                    binding.readerContainer.setVisibility(View.GONE);
-                    binding.discover.setVisibility(View.VISIBLE);
-                    binding.devicesListView.setVisibility(View.VISIBLE);
-                    if (binding.btnAliroBle != null) binding.btnAliroBle.setVisibility(View.VISIBLE);
+                    restoreButtonUI();
 
                     SharedPreferences sharedPref2 = requireActivity().getPreferences(Context.MODE_PRIVATE);
                     boolean AutoDiscover = sharedPref2.getBoolean(PKOC_Preferences.AutoDiscoverDevices, false);
