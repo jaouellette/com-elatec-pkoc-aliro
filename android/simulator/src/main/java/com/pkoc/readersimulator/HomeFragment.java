@@ -850,7 +850,7 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
     private void startAdvertising()
     {
         BluetoothAdapter mBluetoothAdapter = mBluetoothManager.getAdapter();
-        mBluetoothAdapter.setName("ELATEC Reader"); // Set the custom device
+        mBluetoothAdapter.setName("ELATEC PKOC"); // device name shown in scan results
         Log.d(TAG, "Starting BLE Advertising");
         mBluetoothLeAdvertiser = mBluetoothAdapter.getBluetoothLeAdvertiser();
         if (mBluetoothLeAdvertiser == null)
@@ -870,11 +870,11 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                 .setIncludeTxPowerLevel(false)
                 .addServiceUuid(new ParcelUuid(UUID.fromString("0000FFF0-0000-1000-8000-00805F9B34FB")))
                 .build();
-        // Scan response: second UUID only — no device name (legacy BLE limit is 31 bytes;
-        // a full 128-bit UUID already uses 18 bytes leaving no room for a long name).
+        // Scan response: device name + second UUID
+        // 128-bit UUID = 18 bytes, "ELATEC PKOC" = 13 bytes (2 overhead) = 15 bytes, total = 33 — too big.
+        // Use name only in scan response, drop the second UUID there.
         AdvertiseData scanResponseData = new AdvertiseData.Builder()
-                .setIncludeDeviceName(false)
-                .addServiceUuid(new ParcelUuid(UUID.fromString("41fb60a1-d4d0-4ae9-8cbb-b62b5ae81810")))
+                .setIncludeDeviceName(true)
                 .build();
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
         {
@@ -1322,7 +1322,7 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                         }
                         else if (deviceModel.connectionType == PKOC_ConnectionType.Uncompressed)
                         {
-                            connectionTypeText = "Connection Type: Normal Flow (PKOC)";
+                            connectionTypeText = "Connection Type: Normal Flow";
                         }
                         displayPublicKeyInfo(publicKeyHex, connectionTypeText);
                     });

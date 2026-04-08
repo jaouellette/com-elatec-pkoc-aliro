@@ -120,12 +120,82 @@ public class SendCredentialFragment extends Fragment
                     binding.readerContainer.setVisibility(View.GONE);
                     binding.discover.setVisibility(View.VISIBLE);
                     binding.devicesListView.setVisibility(View.VISIBLE);
-                    if (binding.btnAliroBle != null) binding.btnAliroBle.setVisibility(View.VISIBLE);
+                    if (binding.btnAliroBle != null)
+                    {
+                        binding.btnAliroBle.setVisibility(View.VISIBLE);
+                        binding.btnAliroBle.setText("Aliro BLE");
+                        binding.btnAliroBle.setOnClickListener(v -> startAliroBle());
+                    }
+                    // Clear the list so stale Aliro entries don't linger
+                    if (mBTArrayAdapter != null) { mBTArrayAdapter.clear(); mBTArrayAdapter.notifyDataSetChanged(); }
+                    aliroDeviceAddresses.clear();
                 }, 3000);
             });
         }
     };
     private boolean aliroBleReceiverRegistered = false;
+    private boolean aliroBleDeviceReceiverRegistered = false;
+    private AliroBleCredentialService aliroBleCredentialService;
+    private boolean aliroBleServiceBound = false;
+    // Tracks which list entries are Aliro BLE (vs PKOC BLE) so the click listener can route correctly
+    private final java.util.Set<String> aliroDeviceAddresses = new java.util.HashSet<>();
+
+    private final android.content.ServiceConnection aliroBleConnection = new android.content.ServiceConnection()
+    {
+        @Override
+        public void onServiceConnected(android.content.ComponentName name, android.os.IBinder service)
+        {
+            aliroBleCredentialService = ((AliroBleCredentialService.LocalBinder) service).getService();
+            aliroBleServiceBound = true;
+        }
+        @Override
+        public void onServiceDisconnected(android.content.ComponentName name)
+        {
+            aliroBleCredentialService = null;
+            aliroBleServiceBound = false;
+        }
+    };
+
+    private final BroadcastReceiver aliroBleDeviceReceiver = new BroadcastReceiver()
+    {
+        @Override
+        public void onReceive(Context context, Intent intent)
+        {
+            if (!isAdded()) return;
+            String address = intent.getStringExtra(AliroBleCredentialService.EXTRA_DEVICE_ADDRESS);
+            String name    = intent.getStringExtra(AliroBleCredentialService.EXTRA_DEVICE_NAME);
+            int    rssi    = intent.getIntExtra(AliroBleCredentialService.EXTRA_DEVICE_RSSI, 0);
+            if (address == null) return;
+
+            new Handler(getMainLooper()).post(() ->
+            {
+                if (!isAdded() || mBTArrayAdapter == null) return;
+
+                aliroDeviceAddresses.add(address);
+
+                // Update existing entry or add new one
+                for (int i = 0; i < mBTArrayAdapter.getCount(); i++)
+                {
+                    ListModel m = (ListModel) mBTArrayAdapter.getItem(i);
+                    if (m.getAddress().equals(address))
+                    {
+                        m.setRssi(rssi);
+                        m.setLastSeen(new java.util.Date());
+                        mBTArrayAdapter.notifyDataSetChanged();
+                        return;
+                    }
+                }
+                ListModel entry = new ListModel();
+                entry.setAddress(address);
+                entry.setName("[Aliro] " + name);
+                entry.setRssi(rssi);
+                entry.setIcon(R.drawable.baseline_lock_24);
+                entry.setLastSeen(new java.util.Date());
+                mBTArrayAdapter.add(entry);
+                mBTArrayAdapter.notifyDataSetChanged();
+            });
+        }
+    };
 
     private final BroadcastReceiver nfcReceiver = new BroadcastReceiver()
     {
@@ -381,50 +451,93 @@ public class SendCredentialFragment extends Fragment
             catch (Exception ignored) {}
             aliroBleReceiverRegistered = false;
         }
+        if (aliroBleDeviceReceiverRegistered)
+        {
+            try { requireActivity().unregisterReceiver(aliroBleDeviceReceiver); }
+            catch (Exception ignored) {}
+            aliroBleDeviceReceiverRegistered = false;
+        }
+        if (aliroBleServiceBound)
+        {
+            try { requireContext().unbindService(aliroBleConnection); }
+            catch (Exception ignored) {}
+            aliroBleServiceBound = false;
+            aliroBleCredentialService = null;
+        }
     }
 
     private void startAliroBle()
     {
-        Log.i("SendCredentialFragment", "Starting Aliro BLE credential flow");
+        Log.i("SendCredentialFragment", "Starting Aliro BLE scan");
 
         // Stop PKOC scanning if running
         if (_IsScanning) setIsScanning(false);
 
-        // Close any active PKOC GATT connection — a second GATT connection to the same
-        // device causes status 133 errors in AliroBleCredentialService.
+        // Close any active PKOC GATT connection
         if (connectedGatt != null)
         {
-            try
-            {
-                connectedGatt.disconnect();
-                connectedGatt.close();
-            }
+            try { connectedGatt.disconnect(); connectedGatt.close(); }
             catch (Exception ignored) {}
             connectedGatt = null;
             IsConnecting = false;
         }
 
-        // Show the reader waiting UI
-        binding.discover.setVisibility(View.GONE);
-        binding.devicesListView.setVisibility(View.GONE);
-        if (binding.btnAliroBle != null) binding.btnAliroBle.setVisibility(View.GONE);
-        binding.readerContainer.setVisibility(View.VISIBLE);
-        binding.readerIcon.setImageResource(R.drawable.ic_reader_idle);
-        binding.statusText.setText("Searching for Aliro BLE reader...");
-        binding.statusText.setVisibility(View.VISIBLE);
+        // Clear previous Aliro entries from list and address set
+        aliroDeviceAddresses.clear();
+        if (mBTArrayAdapter != null)
+        {
+            for (int i = mBTArrayAdapter.getCount() - 1; i >= 0; i--)
+            {
+                ListModel m = (ListModel) mBTArrayAdapter.getItem(i);
+                if (aliroDeviceAddresses.contains(m.getAddress()))
+                    mBTArrayAdapter.remove(m);
+            }
+            // Since we just cleared aliroDeviceAddresses above, clear all and let PKOC rescan
+            // Actually just clear everything — user tapped Aliro BLE so PKOC list is stale
+            mBTArrayAdapter.clear();
+            mBTArrayAdapter.notifyDataSetChanged();
+        }
+
+        // Show the device list so user can pick a reader
+        binding.readerContainer.setVisibility(View.GONE);
+        binding.discover.setVisibility(View.VISIBLE);
+        binding.devicesListView.setVisibility(View.VISIBLE);
+        if (binding.btnAliroBle != null) binding.btnAliroBle.setVisibility(View.VISIBLE);
+        binding.btnAliroBle.setText("Stop Aliro Scan");
+        binding.btnAliroBle.setOnClickListener(v -> stopAliroBle());
+
+        // Register device-found receiver
+        if (!aliroBleDeviceReceiverRegistered)
+        {
+            IntentFilter deviceFilter = new IntentFilter(AliroBleCredentialService.ACTION_DEVICE_FOUND);
+            ContextCompat.registerReceiver(requireActivity(), aliroBleDeviceReceiver, deviceFilter,
+                    ContextCompat.RECEIVER_NOT_EXPORTED);
+            aliroBleDeviceReceiverRegistered = true;
+        }
 
         // Register result receiver
         if (!aliroBleReceiverRegistered)
         {
-            IntentFilter filter = new IntentFilter(AliroBleCredentialService.ACTION_BLE_RESULT);
-            ContextCompat.registerReceiver(requireActivity(), aliroBleReceiver, filter,
+            IntentFilter resultFilter = new IntentFilter(AliroBleCredentialService.ACTION_BLE_RESULT);
+            ContextCompat.registerReceiver(requireActivity(), aliroBleReceiver, resultFilter,
                     ContextCompat.RECEIVER_NOT_EXPORTED);
             aliroBleReceiverRegistered = true;
         }
 
-        // Start the service
+        // Start + bind service
         Intent intent = new Intent(requireContext(), AliroBleCredentialService.class);
         requireContext().startService(intent);
+        requireContext().bindService(intent, aliroBleConnection, Context.BIND_AUTO_CREATE);
+    }
+
+    private void stopAliroBle()
+    {
+        if (aliroBleCredentialService != null) aliroBleCredentialService.stopScan();
+        if (binding.btnAliroBle != null)
+        {
+            binding.btnAliroBle.setText("Aliro BLE");
+            binding.btnAliroBle.setOnClickListener(v -> startAliroBle());
+        }
     }
 
     /**
@@ -475,103 +588,70 @@ public class SendCredentialFragment extends Fragment
                 }
 
                 chosenDevice.setIsBusy(false);
+                mBTArrayAdapter.notifyDataSetChanged();
 
-                if (msg.what == ReaderUnlockStatus.CompletedTransaction.ordinal())
+                // Determine result type
+                boolean pkocGranted  = msg.what == ReaderUnlockStatus.AccessGranted.ordinal();
+                boolean pkocUnknown  = msg.what == ReaderUnlockStatus.CompletedTransaction.ordinal();
+                boolean pkocDenied   = msg.what == ReaderUnlockStatus.AccessDenied.ordinal()
+                                    || msg.what == ReaderUnlockStatus.Unrecognized.ordinal()
+                                    || msg.what == ReaderUnlockStatus.Unknown.ordinal();
+
+                // Vibrate feedback
+                Vibrator vibrator = requireContext().getSystemService(Vibrator.class);
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
                 {
-                    Log.i("SendCredentialFragment", "TLV Success - Access decision unknown");
-                    chosenDevice.setIcon(R.drawable.baseline_lock_open_24_yellow);
-                    Toast.makeText(getContext(), "TLV Success - Access decision unknown", Toast.LENGTH_SHORT).show();
-
-                    new Handler(getMainLooper()).postDelayed(() ->
-                    {
-                        Log.i("SendCredentialFragment", "Resetting icon");
-                        var model = getModelFromAddress(deviceAddress);
-                        if (model != null)
-                        {
-                            model.setIcon(R.drawable.baseline_lock_24);
-                        }
-                        mBTArrayAdapter.notifyDataSetChanged();
-                    }, 4000);
-
-                    mBTArrayAdapter.notifyDataSetChanged();
-                    return;
+                    if (pkocGranted || pkocUnknown)
+                        vibrator.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_DOUBLE_CLICK));
+                    else
+                        vibrator.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_HEAVY_CLICK));
                 }
 
-                if (msg.what == ReaderUnlockStatus.AccessGranted.ordinal())
+                // Show reader display UI — same as Aliro
+                binding.discover.setVisibility(View.GONE);
+                binding.devicesListView.setVisibility(View.GONE);
+                if (binding.btnAliroBle != null) binding.btnAliroBle.setVisibility(View.GONE);
+                binding.readerContainer.setVisibility(View.VISIBLE);
+
+                if (pkocGranted)
                 {
-                    Log.i("SendCredentialFragment", "Access Granted");
-                    chosenDevice.setIcon(R.drawable.baseline_lock_open_24);
-
-                    Vibrator vibrator = requireContext().getSystemService(Vibrator.class);
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
-                    {
-                        Log.i("SendCredentialFragment", "Vibrating");
-                        vibrator.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_DOUBLE_CLICK));
-                    }
-
-                    new Handler(getMainLooper()).postDelayed(() ->
-                    {
-                        Log.i("SendCredentialFragment", "Resetting icon");
-                        var model = getModelFromAddress(deviceAddress);
-                        if (model != null)
-                        {
-                            model.setIcon(R.drawable.baseline_lock_24);
-                        }
-                        mBTArrayAdapter.notifyDataSetChanged();
-                    }, 4000);
+                    binding.readerIcon.setImageResource(R.drawable.ic_reader_success);
+                    binding.statusText.setText(getString(R.string.credential_sent));
+                }
+                else if (pkocUnknown)
+                {
+                    binding.readerIcon.setImageResource(R.drawable.ic_reader_success);
+                    binding.statusText.setText("PKOC BLE: Credential Sent");
                 }
                 else
                 {
-                    Log.i("SendCredentialFragment", "Access Denied");
-                    chosenDevice.setIcon(R.drawable.baseline_lock_24_red);
-
-                    Vibrator vibrator = requireContext().getSystemService(Vibrator.class);
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
-                    {
-                        Log.i("SendCredentialFragment", "Vibrating");
-                        vibrator.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_HEAVY_CLICK));
-                    }
-
-                    new Handler(getMainLooper()).postDelayed(() ->
-                    {
-                        Log.i("SendCredentialFragment", "Resetting icon");
-                        var model = getModelFromAddress(deviceAddress);
-                        if (model != null)
-                        {
-                            model.setIcon(R.drawable.baseline_lock_24);
-                        }
-                        mBTArrayAdapter.notifyDataSetChanged();
-                    }, 4000);
+                    binding.readerIcon.setImageResource(R.drawable.ic_reader_error);
+                    binding.statusText.setText("Access Denied");
                 }
+                binding.statusText.setVisibility(View.VISIBLE);
 
-                mBTArrayAdapter.notifyDataSetChanged();
+                // Restore list after 3 seconds
+                binding.readerIcon.postDelayed(() ->
+                {
+                    if (!isAdded()) return;
+                    binding.readerIcon.setImageResource(R.drawable.ic_reader_idle);
+                    binding.statusText.setVisibility(View.INVISIBLE);
+                    binding.readerContainer.setVisibility(View.GONE);
+                    binding.discover.setVisibility(View.VISIBLE);
+                    binding.devicesListView.setVisibility(View.VISIBLE);
+                    if (binding.btnAliroBle != null) binding.btnAliroBle.setVisibility(View.VISIBLE);
+
+                    SharedPreferences sharedPref2 = requireActivity().getPreferences(Context.MODE_PRIVATE);
+                    boolean AutoDiscover = sharedPref2.getBoolean(PKOC_Preferences.AutoDiscoverDevices, false);
+                    if (AutoDiscover && isAdded())
+                        setIsScanning(true);
+                }, 3000);
 
                 if (msg.what == ReaderUnlockStatus.Unrecognized.ordinal())
-                {
                     Log.i("SendCredentialFragment", "Reader is not recognized in this mode");
-                    Toast.makeText(getContext(), "Reader is not recognized in this mode", Toast.LENGTH_SHORT).show();
-                }
 
                 if (msg.what == ReaderUnlockStatus.Unknown.ordinal())
-                {
                     Log.i("SendCredentialFragment", "Lost connection with reader");
-                    Toast.makeText(getContext(), "Lost connection with reader", Toast.LENGTH_SHORT).show();
-                }
-
-                SharedPreferences sharedPref = requireActivity().getPreferences(Context.MODE_PRIVATE);
-                boolean AutoDiscover = sharedPref.getBoolean(PKOC_Preferences.AutoDiscoverDevices, false);
-
-                if (AutoDiscover)
-                {
-                    Log.i("SendCredentialFragment", "Setting scanning to true");
-                    new Handler(getMainLooper()).postDelayed(() ->
-                    {
-                        if (isAdded())
-                        {
-                            setIsScanning(true);
-                        }
-                    }, 4000);
-                }
             }
         };
     }
@@ -829,6 +909,11 @@ public class SendCredentialFragment extends Fragment
             {
                 Name = "Unknown Reader";
             }
+            // Prefix PKOC so user can distinguish from Aliro readers in the list
+            if (!Name.startsWith("[PKOC]"))
+            {
+                Name = "[PKOC] " + Name;
+            }
             ToUpdate.setName(Name);
             ToUpdate.setRssi(result.getRssi());
 
@@ -1014,8 +1099,35 @@ public class SendCredentialFragment extends Fragment
         public void onItemClick(AdapterView<?> parent, View view, int position, long id)
         {
             ListModel lm = (ListModel) mBTArrayAdapter.getItem(position);
-            if (!IsConnecting)
+
+            if (aliroDeviceAddresses.contains(lm.getAddress()))
             {
+                // Aliro BLE device — route to AliroBleCredentialService
+                stopAliroBle(); // stop scanning
+                if (aliroBleCredentialService != null)
+                {
+                    android.bluetooth.BluetoothAdapter btAdapter = android.bluetooth.BluetoothAdapter.getDefaultAdapter();
+                    android.bluetooth.BluetoothDevice device = btAdapter.getRemoteDevice(lm.getAddress());
+
+                    // Show waiting UI
+                    binding.discover.setVisibility(View.GONE);
+                    binding.devicesListView.setVisibility(View.GONE);
+                    if (binding.btnAliroBle != null) binding.btnAliroBle.setVisibility(View.GONE);
+                    binding.readerContainer.setVisibility(View.VISIBLE);
+                    binding.readerIcon.setImageResource(R.drawable.ic_reader_idle);
+                    binding.statusText.setText("Connecting to " + lm.getName() + "...");
+                    binding.statusText.setVisibility(View.VISIBLE);
+
+                    aliroBleCredentialService.connectToReader(device);
+                }
+                else
+                {
+                    Toast.makeText(requireContext(), "Aliro service not ready, try again", Toast.LENGTH_SHORT).show();
+                }
+            }
+            else if (!IsConnecting)
+            {
+                // PKOC BLE device — existing flow
                 IsConnecting = true;
                 connectDevice(lm);
             }

@@ -68,9 +68,13 @@ public class AliroBleCredentialService extends Service
     static final UUID CHAR_SPSM_UUID = UUID.fromString("D3B5A130-9E23-4B3A-8BE4-6B1EE5F980A3");
     static final UUID CHAR_DEV_VERSION_UUID = UUID.fromString("BD4B9502-3F54-11EC-B919-0242AC120005");
 
-    public static final String ACTION_BLE_RESULT = "com.psia.pkoc.ALIRO_BLE_RESULT";
-    public static final String EXTRA_ACCESS_GRANTED = "accessGranted";
-    public static final String EXTRA_STATUS_MESSAGE = "statusMessage";
+    public static final String ACTION_BLE_RESULT    = "com.psia.pkoc.ALIRO_BLE_RESULT";
+    public static final String ACTION_DEVICE_FOUND   = "com.psia.pkoc.ALIRO_BLE_DEVICE_FOUND";
+    public static final String EXTRA_ACCESS_GRANTED  = "accessGranted";
+    public static final String EXTRA_STATUS_MESSAGE  = "statusMessage";
+    public static final String EXTRA_DEVICE_ADDRESS  = "deviceAddress";
+    public static final String EXTRA_DEVICE_NAME     = "deviceName";
+    public static final String EXTRA_DEVICE_RSSI     = "deviceRssi";
 
     // Proprietary TLV (same as in Aliro_HostApduService)
     private static final byte[] PROPRIETARY_TLV = {
@@ -212,15 +216,20 @@ public class AliroBleCredentialService extends Service
         {
             if (!scanning) return;
             BluetoothDevice device = result.getDevice();
-            Log.d(TAG, "Found Aliro reader: " + device.getAddress());
+            String address = device.getAddress();
+            String name = device.getName();
+            if (name == null || name.isEmpty()) name = "Unknown Aliro Reader";
+            int rssi = result.getRssi();
+            Log.d(TAG, "Found Aliro reader: " + address + " rssi=" + rssi);
 
-            // Stop scanning, connect to first device found
-            scanning = false;
-            scanner.stopScan(this);
-
-            // Connect GATT
-            lastDevice = device;
-            connectToDevice(device);
+            // Broadcast to fragment so it can populate the device list
+            // Keep scanning so multiple readers can be discovered
+            Intent found = new Intent(ACTION_DEVICE_FOUND);
+            found.setPackage(getPackageName());
+            found.putExtra(EXTRA_DEVICE_ADDRESS, address);
+            found.putExtra(EXTRA_DEVICE_NAME, name);
+            found.putExtra(EXTRA_DEVICE_RSSI, rssi);
+            sendBroadcast(found);
         }
 
         @Override
@@ -231,6 +240,20 @@ public class AliroBleCredentialService extends Service
             broadcastResult(false, "BLE scan failed: " + errorCode);
         }
     };
+
+    /**
+     * Called by the fragment when the user taps a device in the list.
+     * Stops scanning and runs the full Aliro BLE-Only flow to that device.
+     */
+    @SuppressLint("MissingPermission")
+    public void connectToReader(BluetoothDevice device)
+    {
+        Log.d(TAG, "connectToReader: " + device.getAddress());
+        stopScan();
+        lastDevice = device;
+        gatt133RetryCount = 0;
+        connectToDevice(device);
+    }
 
     // -------------------------------------------------------------------------
     // GATT helpers

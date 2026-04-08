@@ -391,6 +391,9 @@ public class AliroBleReaderService extends Service
                 .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
                 .build();
 
+        // Set device name so credential app can display it in the reader list
+        bluetoothAdapter.setName("ELATEC Aliro");
+
         ParcelUuid aliroUuid = ParcelUuid.fromString("0000FFF2-0000-1000-8000-00805F9B34FB");
 
         // Primary ADV packet: service UUID only (needed for ScanFilter.setServiceUuid() to match)
@@ -400,11 +403,11 @@ public class AliroBleReaderService extends Service
                 .addServiceUuid(aliroUuid)
                 .build();
 
-        // Scan response: structured Aliro service data payload (Table 11-2)
+        // Scan response: device name + structured Aliro service data payload (Table 11-2)
+        // "ELATEC Aliro" = 14 bytes (2 overhead = 16), service data = 3+24 = 27 — too big together.
+        // Use name only; Aliro spec service data is informational, SPSM comes from GATT.
         AdvertiseData scanResponse = new AdvertiseData.Builder()
-                .setIncludeDeviceName(false)
-                .setIncludeTxPowerLevel(false)
-                .addServiceData(aliroUuid, serviceData)
+                .setIncludeDeviceName(true)
                 .build();
 
         advertiser.startAdvertising(settings, advertiseData, scanResponse, advertiseCallback);
@@ -731,7 +734,7 @@ public class AliroBleReaderService extends Service
                         int action = rkePlain[2] & 0xFF;
                         Log.d(TAG, "RKE action: " + action + " (0=secure, 1=unsecure)");
                     }
-                    broadcastResult(true, "BLE Credential Sent", finalCredPubKey, finalSigValid);
+                    broadcastResult(true, "BLE Access Granted", finalCredPubKey, finalSigValid);
                 }
                 else
                 {
@@ -742,7 +745,7 @@ public class AliroBleReaderService extends Service
             else
             {
                 Log.w(TAG, "Did not receive expected RKE Request");
-                broadcastResult(sigValid, sigValid ? "BLE Credential Sent (no RKE)" : "BLE Signature Invalid");
+                broadcastResult(sigValid, sigValid ? "BLE Access Granted (no RKE)" : "BLE Signature Invalid");
             }
         }
         catch (IOException e)
