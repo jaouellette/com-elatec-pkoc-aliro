@@ -5,11 +5,23 @@
     <item
         android:id="@+id/action_display_public_key"
         android:title="@string/display_reader_details"
-        app:showAsAction="always" />
+        app:showAsAction="never" />
 
     <item
         android:id="@+id/action_aliro_config"
         android:title="Aliro Config"
+        app:showAsAction="never" />
+
+    <item
+        android:id="@+id/action_self_test"
+        android:title="Aliro Self-Test"
+        android:orderInCategory="200"
+        app:showAsAction="never" />
+
+    <item
+        android:id="@+id/action_pkoc_self_test"
+        android:title="PKOC Self-Test"
+        android:orderInCategory="201"
         app:showAsAction="never" />
 
 </menu>

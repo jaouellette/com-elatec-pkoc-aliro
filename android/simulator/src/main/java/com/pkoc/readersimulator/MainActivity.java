@@ -1,5 +1,6 @@
 package com.pkoc.readersimulator;
 
+import android.content.Intent;
 import android.os.Bundle;
 import android.view.Menu;
 import android.view.MenuItem;
@@ -60,6 +61,18 @@ public class MainActivity extends AppCompatActivity
         if (item.getItemId() == R.id.action_aliro_config)
         {
             navController.navigate(R.id.action_homeFragment_to_aliroConfigFragment);
+            return true;
+        }
+
+        if (item.getItemId() == R.id.action_self_test)
+        {
+            startActivity(new Intent(this, AliroSelfTestActivity.class));
+            return true;
+        }
+
+        if (item.getItemId() == R.id.action_pkoc_self_test)
+        {
+            startActivity(new Intent(this, PKOCSelfTestActivity.class));
             return true;
         }
 
