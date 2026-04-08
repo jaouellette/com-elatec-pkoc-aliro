@@ -31,6 +31,16 @@ public class MainActivity extends AppCompatActivity
         NavigationUI.setupActionBarWithNavController(this, navController, appBarConfiguration);
     }
 
+    /** Navigate to Aliro Config screen. Can be called from fragments. */
+    public void navigateToAliroConfig()
+    {
+        NavHostFragment navHostFragment = (NavHostFragment) getSupportFragmentManager()
+                .findFragmentById(R.id.nav_host_fragment);
+        if (navHostFragment != null)
+            navHostFragment.getNavController()
+                    .navigate(R.id.action_homeFragment_to_aliroConfigFragment);
+    }
+
     @Override
     public boolean onSupportNavigateUp()
     {
@@ -60,7 +70,7 @@ public class MainActivity extends AppCompatActivity
 
         if (item.getItemId() == R.id.action_aliro_config)
         {
-            navController.navigate(R.id.action_homeFragment_to_aliroConfigFragment);
+            navigateToAliroConfig();
             return true;
         }
 

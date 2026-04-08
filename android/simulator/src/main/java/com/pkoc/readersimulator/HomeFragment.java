@@ -2073,7 +2073,16 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
 
             if (!isSW9000(auth1Response))
             {
-                showAliroError("AUTH1 failed: SW=" + swHex(auth1Response));
+                String sw = swHex(auth1Response);
+                if ("6400".equalsIgnoreCase(sw) || "6982".equalsIgnoreCase(sw) || "6985".equalsIgnoreCase(sw))
+                {
+                    // Credential rejected the reader's certificate/signature
+                    showAliroCredentialRejectDialog(sw);
+                }
+                else
+                {
+                    showAliroError("AUTH1 failed: SW=" + sw);
+                }
                 return;
             }
 
@@ -2430,6 +2439,33 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
     }
 
     /** Show a toast error for Aliro failures */
+    private void showAliroCredentialRejectDialog(String sw)
+    {
+        Log.e(TAG, "Aliro AUTH1 rejected by credential: SW=" + sw);
+        requireActivity().runOnUiThread(() ->
+        {
+            if (!isAdded()) return;
+            new AlertDialog.Builder(requireContext())
+                    .setTitle("Credential Rejected Reader")
+                    .setMessage(
+                        "The credential rejected this reader during authentication (SW=" + sw + ").\n\n" +
+                        "This typically means:\n\n" +
+                        "\u2022 The reader\u2019s certificate was not signed by an issuer the credential trusts, or\n" +
+                        "\u2022 The reader\u2019s private key does not match the public key in its certificate, or\n" +
+                        "\u2022 The reader certificate or issuer public key is not correctly configured.\n\n" +
+                        "Check the Aliro Config screen and verify that the reader certificate, " +
+                        "private key, and issuer public key are all from the same trusted issuer.")
+                    .setPositiveButton("Open Aliro Config", (d, w) ->
+                    {
+                        if (requireActivity() instanceof MainActivity)
+                            ((MainActivity) requireActivity()).navigateToAliroConfig();
+                    })
+                    .setNegativeButton("Dismiss", null)
+                    .setIcon(android.R.drawable.ic_dialog_alert)
+                    .show();
+        });
+    }
+
     private void showAliroError(String message)
     {
         Log.e(TAG, "Aliro error: " + message);
