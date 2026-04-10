@@ -75,6 +75,7 @@ public class AliroBleReaderService extends Service
     public static final String EXTRA_SIG_VALID           = "sigValid";
     public static final String EXTRA_DEVICE_RESPONSE     = "deviceResponse";
     public static final String EXTRA_STEP_UP_ELEMENT_ID  = "stepUpElementId";
+    public static final String EXTRA_MAILBOX_RESULT      = "mailboxResult";
 
     // Proprietary TLV from SELECT response (used in key derivation)
     private static final byte[] PROPRIETARY_TLV = {
@@ -450,6 +451,7 @@ public class AliroBleReaderService extends Service
         int deviceCounter = 1;
         byte[] finalDeviceResponse  = null;  // populated if ENVELOPE succeeds
         String finalStepUpElementId = null;  // element ID requested
+        String finalMailboxResult   = null;  // populated if mailbox read/write/set succeeds
 
         try
         {
@@ -677,9 +679,113 @@ public class AliroBleReaderService extends Service
             final boolean finalSigValid  = sigValid;
 
             // ------------------------------------------------------------------
-            // Step 7: Send EXCHANGE
+            // Step 7: Send EXCHANGE with optional mailbox operations
+            // Per CI-8: On BLE success, 0x97 is ABSENT; on failure, include 0x97 after 0xBA
+            // Per Table 8-15 / CI-7: 0xBA comes BEFORE 0x97
             // ------------------------------------------------------------------
-            byte[] exchangePayload = { (byte)0x97, 0x02, sigValid ? (byte)0x01 : 0x00, (byte)0x82 };
+            boolean mailboxEnabled = prefs.getBoolean(AliroPreferences.MAILBOX_ENABLED, false);
+            String mailboxOp = null;
+            int mailboxReadLen = 0;
+            byte[] mailboxBA = null;
+
+            if (mailboxEnabled)
+            {
+                mailboxOp = prefs.getString(AliroPreferences.MAILBOX_OPERATION, "read");
+                int mOffset = Integer.parseInt(prefs.getString(AliroPreferences.MAILBOX_OFFSET, "0"));
+                int mLength = Integer.parseInt(prefs.getString(AliroPreferences.MAILBOX_LENGTH, "16"));
+                boolean atomic = prefs.getBoolean(AliroPreferences.MAILBOX_ATOMIC, false);
+
+                java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+
+                // 0x8C is MANDATORY inside 0xBA (Table 8-16)
+                if (atomic)
+                {
+                    baos.write(new byte[]{ (byte)0x8C, 0x01, 0x01 }, 0, 3);
+                }
+                else
+                {
+                    baos.write(new byte[]{ (byte)0x8C, 0x01, 0x00 }, 0, 3);
+                }
+
+                if ("read".equals(mailboxOp))
+                {
+                    baos.write(new byte[]{
+                        (byte)0x87, 0x04,
+                        (byte)((mOffset >> 8) & 0xFF), (byte)(mOffset & 0xFF),
+                        (byte)((mLength >> 8) & 0xFF), (byte)(mLength & 0xFF)
+                    }, 0, 6);
+                    mailboxReadLen = mLength;
+                }
+                else if ("write".equals(mailboxOp))
+                {
+                    String dataHex = prefs.getString(AliroPreferences.MAILBOX_DATA, "");
+                    byte[] writeData = dataHex.isEmpty() ? new byte[0] : Hex.decode(dataHex);
+                    int writeLen = 2 + writeData.length;
+                    baos.write(new byte[]{
+                        (byte)0x8A, (byte)(writeLen & 0xFF),
+                        (byte)((mOffset >> 8) & 0xFF), (byte)(mOffset & 0xFF)
+                    }, 0, 4);
+                    baos.write(writeData, 0, writeData.length);
+                }
+                else if ("set".equals(mailboxOp))
+                {
+                    String setValHex = prefs.getString(AliroPreferences.MAILBOX_SET_VALUE, "00");
+                    byte setVal = (byte)(Integer.parseInt(setValHex, 16) & 0xFF);
+                    baos.write(new byte[]{
+                        (byte)0x95, 0x05,
+                        (byte)((mOffset >> 8) & 0xFF), (byte)(mOffset & 0xFF),
+                        (byte)((mLength >> 8) & 0xFF), (byte)(mLength & 0xFF),
+                        setVal
+                    }, 0, 7);
+                }
+
+                if (atomic)
+                {
+                    baos.write(new byte[]{ (byte)0x8C, 0x01, 0x00 }, 0, 3);
+                }
+
+                byte[] innerTlvs = baos.toByteArray();
+                mailboxBA = new byte[2 + innerTlvs.length];
+                mailboxBA[0] = (byte)0xBA;
+                mailboxBA[1] = (byte)(innerTlvs.length & 0xFF);
+                System.arraycopy(innerTlvs, 0, mailboxBA, 2, innerTlvs.length);
+
+                Log.d(TAG, "Mailbox BA TLV: " + Hex.toHexString(mailboxBA));
+            }
+
+            // Build EXCHANGE plaintext per CI-8:
+            // BLE success: [0xBA mailbox] only (NO 0x97)
+            // BLE failure: [0xBA mailbox] + 0x97
+            byte[] exchangePayload;
+            if (sigValid)
+            {
+                // CI-8: success over BLE omits 0x97
+                if (mailboxBA != null)
+                {
+                    exchangePayload = mailboxBA;
+                }
+                else
+                {
+                    // CI-8: BLE success with no mailbox — empty plaintext (no 0x97)
+                    exchangePayload = new byte[0];
+                }
+            }
+            else
+            {
+                // Failure: include 0x97 after 0xBA
+                byte[] statusTlv = new byte[]{ (byte)0x97, 0x02, 0x00, (byte)0x82 };
+                if (mailboxBA != null)
+                {
+                    exchangePayload = new byte[mailboxBA.length + statusTlv.length];
+                    System.arraycopy(mailboxBA, 0, exchangePayload, 0, mailboxBA.length);
+                    System.arraycopy(statusTlv, 0, exchangePayload, mailboxBA.length, statusTlv.length);
+                }
+                else
+                {
+                    exchangePayload = statusTlv;
+                }
+            }
+
             byte[] encExchange = AliroCryptoProvider.encryptReaderGcm(skReader, exchangePayload, readerCounter++);
             if (encExchange != null)
             {
@@ -702,9 +808,41 @@ public class AliroBleReaderService extends Service
                     encExchangeRsp = Arrays.copyOfRange(exchangeRspApdu, 0, exchangeRspApdu.length - 2);
                 }
                 byte[] decExchangeRsp = AliroCryptoProvider.decryptDeviceGcm(skDevice, encExchangeRsp, deviceCounter++);
+
+            if (decExchangeRsp != null && mailboxEnabled
+                    && ("write".equals(mailboxOp) || "set".equals(mailboxOp)))
+            {
+                finalMailboxResult = mailboxOp.toUpperCase() + " OK";
+                Log.d(TAG, "Mailbox " + mailboxOp + " accepted by credential");
+            }
                 if (decExchangeRsp != null)
                 {
                     Log.d(TAG, "EXCHANGE response decrypted: " + Hex.toHexString(decExchangeRsp));
+
+                    // Mailbox read data comes BEFORE status bytes
+                    if (mailboxEnabled && "read".equals(mailboxOp) && mailboxReadLen > 0)
+                    {
+                        if (decExchangeRsp.length > 4)
+                        {
+                            int readDataLen = decExchangeRsp.length - 4;
+                            if (readDataLen > 0)
+                            {
+                                byte[] mailboxReadData = Arrays.copyOfRange(decExchangeRsp, 0, readDataLen);
+                                finalMailboxResult = "Read " + readDataLen + "B: " + Hex.toHexString(mailboxReadData);
+                                Log.d(TAG, "Mailbox READ response (" + readDataLen + " bytes): "
+                                        + Hex.toHexString(mailboxReadData));
+                            }
+                            else
+                            {
+                                finalMailboxResult = "Read — empty (mailbox may not be initialized)";
+                            }
+                        }
+                        else
+                        {
+                            finalMailboxResult = "Read — empty (mailbox may not be initialized)";
+                            Log.d(TAG, "Mailbox READ: no data returned");
+                        }
+                    }
                 }
             }
 
@@ -857,7 +995,7 @@ public class AliroBleReaderService extends Service
                         Log.d(TAG, "RKE action: " + action + " (0=secure, 1=unsecure)");
                     }
                     broadcastResult(true, "BLE Access Granted", finalCredPubKey, finalSigValid,
-                            finalDeviceResponse, finalStepUpElementId);
+                            finalDeviceResponse, finalStepUpElementId, finalMailboxResult);
                 }
                 else
                 {
@@ -1081,12 +1219,13 @@ public class AliroBleReaderService extends Service
     private void broadcastResult(boolean accessGranted, String message,
                                   byte[] credentialPubKey, boolean sigValid)
     {
-        broadcastResult(accessGranted, message, credentialPubKey, sigValid, null, null);
+        broadcastResult(accessGranted, message, credentialPubKey, sigValid, null, null, null);
     }
 
     private void broadcastResult(boolean accessGranted, String message,
                                   byte[] credentialPubKey, boolean sigValid,
-                                  byte[] deviceResponse, String stepUpElementId)
+                                  byte[] deviceResponse, String stepUpElementId,
+                                  String mailboxResult)
     {
         Intent intent = new Intent(ACTION_BLE_RESULT);
         intent.setPackage(getPackageName());
@@ -1105,6 +1244,10 @@ public class AliroBleReaderService extends Service
         if (stepUpElementId != null)
         {
             intent.putExtra(EXTRA_STEP_UP_ELEMENT_ID, stepUpElementId);
+        }
+        if (mailboxResult != null)
+        {
+            intent.putExtra(EXTRA_MAILBOX_RESULT, mailboxResult);
         }
         sendBroadcast(intent);
         Log.d(TAG, "Broadcast: accessGranted=" + accessGranted + " msg=" + message

@@ -186,8 +186,10 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
             String credPubKeyHex  = intent.getStringExtra(AliroBleReaderService.EXTRA_CREDENTIAL_PUB_KEY);
             byte[] deviceResponse = intent.getByteArrayExtra(AliroBleReaderService.EXTRA_DEVICE_RESPONSE);
             String stepUpElemId   = intent.getStringExtra(AliroBleReaderService.EXTRA_STEP_UP_ELEMENT_ID);
+            String mailboxResult  = intent.getStringExtra(AliroBleReaderService.EXTRA_MAILBOX_RESULT);
             Log.d(TAG, "Aliro BLE result: granted=" + granted + " sigValid=" + sigValid
-                    + " stepUp=" + (deviceResponse != null ? deviceResponse.length + "B" : "none"));
+                    + " stepUp=" + (deviceResponse != null ? deviceResponse.length + "B" : "none")
+                    + " mailbox=" + (mailboxResult != null ? mailboxResult : "none"));
             requireActivity().runOnUiThread(() ->
             {
                 if (!isAdded()) return;
@@ -210,6 +212,8 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                         else
                             connectionType += "\nStep-Up: Access Document received";
                     }
+                    if (mailboxResult != null)
+                        connectionType += "\nMailbox: " + mailboxResult;
 
                     // Show the credential result screen — same as Aliro NFC
                     readerImageView.setVisibility(View.GONE);
@@ -380,6 +384,9 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
     public void onResume()
     {
         super.onResume();
+        // Clear any stale keypad input when returning from another fragment
+        if (pinDisplay != null) pinDisplay.setText("");
+
         nfcAdapter = NfcAdapter.getDefaultAdapter(requireContext());
         if (nfcAdapter == null)
         {
@@ -2151,13 +2158,99 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
             Log.d(TAG, "Aliro credential signature valid: " + sigValid);
 
             // ------------------------------------------------------------------
-            // Send EXCHANGE with access decision
-            // Plaintext payload: 97 02 <success byte> <status byte>
-            //   success=01, status=82 = "unknown/not available" (simulator doesn't
-            //   have real access control, so we always grant and report unknown state)
+            // Send EXCHANGE with access decision + optional mailbox operations
+            // Per Table 8-15: 0xBA (mailbox) comes BEFORE 0x97 (access decision)
             // ------------------------------------------------------------------
+            // Build mailbox TLVs if enabled in preferences
+            SharedPreferences mailboxPrefs = requireActivity().getPreferences(Context.MODE_PRIVATE);
+            boolean mailboxEnabled = mailboxPrefs.getBoolean(AliroPreferences.MAILBOX_ENABLED, false);
+            byte[] mailboxBA = null;
+            String mailboxOp = null;
+            int mailboxReadLen = 0;
+            String mailboxResultHex = null; // populated if mailbox read succeeds
+
+            if (mailboxEnabled)
+            {
+                mailboxOp = mailboxPrefs.getString(AliroPreferences.MAILBOX_OPERATION, "read");
+                int mOffset = Integer.parseInt(mailboxPrefs.getString(AliroPreferences.MAILBOX_OFFSET, "0"));
+                int mLength = Integer.parseInt(mailboxPrefs.getString(AliroPreferences.MAILBOX_LENGTH, "16"));
+                boolean atomic = mailboxPrefs.getBoolean(AliroPreferences.MAILBOX_ATOMIC, false);
+
+                java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+
+                // 0x8C is MANDATORY inside 0xBA (Table 8-16)
+                if (atomic)
+                {
+                    baos.write(new byte[]{ (byte)0x8C, 0x01, 0x01 }, 0, 3); // start atomic
+                }
+                else
+                {
+                    baos.write(new byte[]{ (byte)0x8C, 0x01, 0x00 }, 0, 3); // no atomic
+                }
+
+                if ("read".equals(mailboxOp))
+                {
+                    // 0x87 04 offsetMSB offsetLSB lengthMSB lengthLSB
+                    baos.write(new byte[]{
+                        (byte)0x87, 0x04,
+                        (byte)((mOffset >> 8) & 0xFF), (byte)(mOffset & 0xFF),
+                        (byte)((mLength >> 8) & 0xFF), (byte)(mLength & 0xFF)
+                    }, 0, 6);
+                    mailboxReadLen = mLength;
+                }
+                else if ("write".equals(mailboxOp))
+                {
+                    String dataHex = mailboxPrefs.getString(AliroPreferences.MAILBOX_DATA, "");
+                    byte[] writeData = dataHex.isEmpty() ? new byte[0] : Hex.decode(dataHex);
+                    int writeLen = 2 + writeData.length; // offset(2) + data
+                    baos.write(new byte[]{
+                        (byte)0x8A, (byte)(writeLen & 0xFF),
+                        (byte)((mOffset >> 8) & 0xFF), (byte)(mOffset & 0xFF)
+                    }, 0, 4);
+                    baos.write(writeData, 0, writeData.length);
+                }
+                else if ("set".equals(mailboxOp))
+                {
+                    String setValHex = mailboxPrefs.getString(AliroPreferences.MAILBOX_SET_VALUE, "00");
+                    byte setVal = (byte)(Integer.parseInt(setValHex, 16) & 0xFF);
+                    baos.write(new byte[]{
+                        (byte)0x95, 0x05,
+                        (byte)((mOffset >> 8) & 0xFF), (byte)(mOffset & 0xFF),
+                        (byte)((mLength >> 8) & 0xFF), (byte)(mLength & 0xFF),
+                        setVal
+                    }, 0, 7);
+                }
+
+                if (atomic)
+                {
+                    baos.write(new byte[]{ (byte)0x8C, 0x01, 0x00 }, 0, 3); // stop atomic
+                }
+
+                byte[] innerTlvs = baos.toByteArray();
+                // Wrap in 0xBA outer tag (per Table 8-15, CI-7)
+                mailboxBA = new byte[2 + innerTlvs.length];
+                mailboxBA[0] = (byte)0xBA;
+                mailboxBA[1] = (byte)(innerTlvs.length & 0xFF);
+                System.arraycopy(innerTlvs, 0, mailboxBA, 2, innerTlvs.length);
+
+                Log.d(TAG, "Mailbox BA TLV: " + Hex.toHexString(mailboxBA));
+            }
+
+            // Build EXCHANGE plaintext: [0xBA mailbox (if any)] + 0x97 access decision
+            byte[] statusTlv = new byte[]{ (byte)0x97, 0x02, sigValid ? (byte)0x01 : 0x00, (byte)0x82 };
+            byte[] exchangePayload;
+            if (mailboxBA != null)
+            {
+                exchangePayload = new byte[mailboxBA.length + statusTlv.length];
+                System.arraycopy(mailboxBA, 0, exchangePayload, 0, mailboxBA.length);
+                System.arraycopy(statusTlv, 0, exchangePayload, mailboxBA.length, statusTlv.length);
+            }
+            else
+            {
+                exchangePayload = statusTlv;
+            }
+
             // Encrypt EXCHANGE command using reader_counter=1 (§8.3.1.8), then increment.
-            byte[] exchangePayload = new byte[]{ (byte)0x97, 0x02, sigValid ? (byte)0x01 : 0x00, (byte)0x82 };
             byte[] encryptedExchange = AliroCryptoProvider.encryptReaderGcm(skReader, exchangePayload, readerCounter++);
             if (encryptedExchange == null)
             {
@@ -2178,10 +2271,47 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                 if (exchangeDecrypted != null)
                 {
                     Log.d(TAG, "EXCHANGE response decrypted: " + Hex.toHexString(exchangeDecrypted));
-                    // 0x0002 0x00 0x00 = success
-                    if (exchangeDecrypted.length >= 4
-                            && exchangeDecrypted[0] == 0x00 && exchangeDecrypted[1] == 0x02
-                            && exchangeDecrypted[2] == 0x00 && exchangeDecrypted[3] == 0x00)
+
+                    // Mailbox read data comes BEFORE the status bytes (0x00 0x02 0x00 0x00)
+                    if (mailboxEnabled && "read".equals(mailboxOp) && mailboxReadLen > 0)
+                    {
+                        if (exchangeDecrypted.length > 4)
+                        {
+                            int readDataLen = exchangeDecrypted.length - 4;
+                            if (readDataLen > 0)
+                            {
+                                byte[] mailboxReadData = Arrays.copyOfRange(exchangeDecrypted, 0, readDataLen);
+                                mailboxResultHex = "Read " + readDataLen + "B: " + Hex.toHexString(mailboxReadData);
+                                Log.d(TAG, "Mailbox READ response (" + readDataLen + " bytes): "
+                                        + Hex.toHexString(mailboxReadData));
+                            }
+                            else
+                            {
+                                mailboxResultHex = "Read — empty (mailbox may not be initialized)";
+                                Log.d(TAG, "Mailbox READ: no data returned (response has no read bytes)");
+                            }
+                        }
+                        else
+                        {
+                            mailboxResultHex = "Read — empty (mailbox may not be initialized)";
+                            Log.d(TAG, "Mailbox READ: no data returned (response only has status bytes)");
+                        }
+                    }
+
+                    // If operation was write or set and credential accepted, note it
+                    if (mailboxEnabled && ("write".equals(mailboxOp) || "set".equals(mailboxOp)))
+                    {
+                        mailboxResultHex = mailboxOp.toUpperCase() + " OK";
+                        Log.d(TAG, "Mailbox " + mailboxOp + " accepted by credential");
+                    }
+
+                    // Check status bytes at end
+                    int statusStart = exchangeDecrypted.length - 4;
+                    if (statusStart >= 0
+                            && exchangeDecrypted[statusStart] == 0x00
+                            && exchangeDecrypted[statusStart + 1] == 0x02
+                            && exchangeDecrypted[statusStart + 2] == 0x00
+                            && exchangeDecrypted[statusStart + 3] == 0x00)
                     {
                         Log.d(TAG, "EXCHANGE: credential confirmed success");
                     }
@@ -2273,6 +2403,7 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
             // Show result on UI
             // ------------------------------------------------------------------
             final boolean finalSigValid    = sigValid;
+            final String  finalMailboxResult = mailboxResultHex;
             final byte[]  finalCredPubKey  = credentialPubKey;
             final String  finalStepUpResult = stepUpResult;
             requireActivity().runOnUiThread(() ->
@@ -2286,6 +2417,8 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                         : "Aliro — Signature INVALID";
                 if (finalStepUpResult != null)
                     connectionType += "\nStep-Up: " + finalStepUpResult;
+                if (finalMailboxResult != null)
+                    connectionType += "\nMailbox: " + finalMailboxResult;
                 displayPublicKeyInfo(pk, connectionType);
 
                 ToneGenerator toneGen = new ToneGenerator(AudioManager.STREAM_RING, 100);

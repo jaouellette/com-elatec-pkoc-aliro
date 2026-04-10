@@ -9,8 +9,12 @@ import android.text.TextUtils;
 import android.view.LayoutInflater;
 import android.view.View;
 import android.view.ViewGroup;
+import android.widget.ArrayAdapter;
+import android.widget.AdapterView;
 import android.widget.Button;
+import android.widget.CheckBox;
 import android.widget.EditText;
+import android.widget.Spinner;
 import android.widget.TextView;
 
 import androidx.activity.result.ActivityResultLauncher;
@@ -36,6 +40,18 @@ public class AliroConfigFragment extends Fragment
     private EditText editStepUpElementId;
     private EditText editStepUpIssuerPubKey;
     private TextView txtStatus;
+
+    // Mailbox fields
+    private CheckBox chkMailboxEnabled;
+    private Spinner  spinnerMailboxOperation;
+    private EditText editMailboxOffset;
+    private EditText editMailboxLength;
+    private TextView lblMailboxLength;
+    private EditText editMailboxData;
+    private TextView lblMailboxData;
+    private EditText editMailboxSetValue;
+    private TextView lblMailboxSetValue;
+    private CheckBox chkMailboxAtomic;
 
     private final ActivityResultLauncher<ScanOptions> qrScanLauncher =
             registerForActivityResult(new ScanContract(), this::onQrScanResult);
@@ -64,10 +80,51 @@ public class AliroConfigFragment extends Fragment
         Button btnSave          = view.findViewById(R.id.btnSaveAliroConfig);
         Button btnScanQr        = view.findViewById(R.id.btnScanIssuerKeyQr);
 
+        // Mailbox bindings
+        chkMailboxEnabled       = view.findViewById(R.id.chkMailboxEnabled);
+        spinnerMailboxOperation = view.findViewById(R.id.spinnerMailboxOperation);
+        editMailboxOffset       = view.findViewById(R.id.editMailboxOffset);
+        editMailboxLength       = view.findViewById(R.id.editMailboxLength);
+        lblMailboxLength        = view.findViewById(R.id.lblMailboxLength);
+        editMailboxData         = view.findViewById(R.id.editMailboxData);
+        lblMailboxData          = view.findViewById(R.id.lblMailboxData);
+        editMailboxSetValue     = view.findViewById(R.id.editMailboxSetValue);
+        lblMailboxSetValue      = view.findViewById(R.id.lblMailboxSetValue);
+        chkMailboxAtomic        = view.findViewById(R.id.chkMailboxAtomic);
+
+        // Setup mailbox operation spinner
+        String[] ops = { "read", "write", "set" };
+        ArrayAdapter<String> adapter = new ArrayAdapter<>(requireContext(),
+                android.R.layout.simple_spinner_item, ops);
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        spinnerMailboxOperation.setAdapter(adapter);
+        spinnerMailboxOperation.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener()
+        {
+            @Override public void onItemSelected(AdapterView<?> parent, View v, int pos, long id)
+            {
+                updateMailboxFieldVisibility(ops[pos]);
+            }
+            @Override public void onNothingSelected(AdapterView<?> parent) {}
+        });
+
         loadFromPreferences();
 
         btnSave.setOnClickListener(v -> saveToPreferences());
         btnScanQr.setOnClickListener(v -> launchQrScanner());
+    }
+
+    private void updateMailboxFieldVisibility(String op)
+    {
+        boolean isWrite = "write".equals(op);
+        boolean isSet   = "set".equals(op);
+        boolean isRead  = "read".equals(op);
+
+        lblMailboxLength.setVisibility(isRead || isSet ? View.VISIBLE : View.GONE);
+        editMailboxLength.setVisibility(isRead || isSet ? View.VISIBLE : View.GONE);
+        lblMailboxData.setVisibility(isWrite ? View.VISIBLE : View.GONE);
+        editMailboxData.setVisibility(isWrite ? View.VISIBLE : View.GONE);
+        lblMailboxSetValue.setVisibility(isSet ? View.VISIBLE : View.GONE);
+        editMailboxSetValue.setVisibility(isSet ? View.VISIBLE : View.GONE);
     }
 
     // -------------------------------------------------------------------------
@@ -89,6 +146,25 @@ public class AliroConfigFragment extends Fragment
                 prefs.getString(AliroPreferences.STEP_UP_ELEMENT_ID, ""));
         editStepUpIssuerPubKey.setText(
                 prefs.getString(AliroPreferences.STEP_UP_ISSUER_PUB_KEY, ""));
+
+        // Load mailbox config
+        chkMailboxEnabled.setChecked(prefs.getBoolean(AliroPreferences.MAILBOX_ENABLED, false));
+        String mailboxOp = prefs.getString(AliroPreferences.MAILBOX_OPERATION, "read");
+        String[] ops = { "read", "write", "set" };
+        for (int i = 0; i < ops.length; i++)
+        {
+            if (ops[i].equals(mailboxOp))
+            {
+                spinnerMailboxOperation.setSelection(i);
+                break;
+            }
+        }
+        editMailboxOffset.setText(prefs.getString(AliroPreferences.MAILBOX_OFFSET, "0"));
+        editMailboxLength.setText(prefs.getString(AliroPreferences.MAILBOX_LENGTH, "16"));
+        editMailboxData.setText(prefs.getString(AliroPreferences.MAILBOX_DATA, ""));
+        editMailboxSetValue.setText(prefs.getString(AliroPreferences.MAILBOX_SET_VALUE, "00"));
+        chkMailboxAtomic.setChecked(prefs.getBoolean(AliroPreferences.MAILBOX_ATOMIC, false));
+        updateMailboxFieldVisibility(mailboxOp);
     }
 
     private void saveToPreferences()
@@ -141,6 +217,23 @@ public class AliroConfigFragment extends Fragment
         editor.putString(AliroPreferences.READER_CERTIFICATE,    cert);
         editor.putString(AliroPreferences.STEP_UP_ELEMENT_ID,    stepUpElementId);
         editor.putString(AliroPreferences.STEP_UP_ISSUER_PUB_KEY, stepUpIssuerKey);
+
+        // Save mailbox config
+        editor.putBoolean(AliroPreferences.MAILBOX_ENABLED,
+                chkMailboxEnabled.isChecked());
+        editor.putString(AliroPreferences.MAILBOX_OPERATION,
+                (String) spinnerMailboxOperation.getSelectedItem());
+        editor.putString(AliroPreferences.MAILBOX_OFFSET,
+                editMailboxOffset.getText().toString().trim());
+        editor.putString(AliroPreferences.MAILBOX_LENGTH,
+                editMailboxLength.getText().toString().trim());
+        editor.putString(AliroPreferences.MAILBOX_DATA,
+                editMailboxData.getText().toString().trim());
+        editor.putString(AliroPreferences.MAILBOX_SET_VALUE,
+                editMailboxSetValue.getText().toString().trim());
+        editor.putBoolean(AliroPreferences.MAILBOX_ATOMIC,
+                chkMailboxAtomic.isChecked());
+
         editor.apply();
 
         showStatus("Saved.", true);

@@ -152,6 +152,7 @@ public class AliroSelfTestEngine
         runAndReport(results, cb, this::testMailboxReadRequest);
         runAndReport(results, cb, this::testMailboxSetRequest);
         runAndReport(results, cb, this::testMailboxAtomicSession);
+        runAndReport(results, cb, this::testMailboxWriteThenRead);
 
         // Group 3 additions: EXCHANGE compliance (CI-7/CI-8) + BLE Step-Up
         runAndReport(results, cb, this::testExchange0xBAWrapper);
@@ -165,6 +166,7 @@ public class AliroSelfTestEngine
         runAndReport(results, cb, this::testNegSessionKeyDestroy);
         runAndReport(results, cb, this::testNegEnvelopeWrongState);
         runAndReport(results, cb, this::testNegStepUpSkDestroy);
+        runAndReport(results, cb, this::testMailboxOutOfBounds);
 
         if (cb != null) cb.onAllComplete(results);
         return results;
@@ -2012,6 +2014,237 @@ public class AliroSelfTestEngine
         }
     }
 
+    /**
+     * MAILBOX_WRITE_THEN_READ — Round-trip mailbox test (§7.32).
+     *
+     * Writes 4 bytes (DEADBEEF) at offset 0 in EXCHANGE 1, then reads them
+     * back in EXCHANGE 2 (with atomic session close), verifying the data matches.
+     *
+     * Counter tracking:
+     *   AUTH1 response                  → cred.deviceCounter=1 consumed
+     *   EXCHANGE 1 command              → cred.readerCounter=1 consumed
+     *   EXCHANGE 1 response             → cred.deviceCounter=2 consumed
+     *   EXCHANGE 2 command              → cred.readerCounter=2 consumed
+     *   EXCHANGE 2 response             → cred.deviceCounter=3 consumed
+     * On the reader side:
+     *   reader.deviceCounter starts at 1; AUTH1 slot=1 skipped (+1); EXCHANGE 1 resp=2;
+     *   EXCHANGE 2 resp=3.
+     */
+    private TestResult testMailboxWriteThenRead()
+    {
+        long start = System.currentTimeMillis();
+        try
+        {
+            LoopbackReader reader = new LoopbackReader();
+            LoopbackCredential cred = new LoopbackCredential();
+
+            // Initialize credential's mailbox to 256 zero bytes
+            cred.initMailbox(256);
+
+            // Full NFC flow through AUTH1
+            byte[] selectResp = cred.process(reader.buildSelectCommand());
+            if (!isSW9000(selectResp))
+                return result("MAILBOX_WRITE_THEN_READ", "Full Flow",
+                        "Mailbox round-trip: write 4 bytes at offset 0, read back and verify data matches",
+                        false, "SELECT failed", start);
+
+            byte[] auth0Resp = cred.process(reader.buildAuth0Command());
+            if (!isSW9000(auth0Resp))
+                return result("MAILBOX_WRITE_THEN_READ", "Full Flow",
+                        "Mailbox round-trip: write 4 bytes at offset 0, read back and verify data matches",
+                        false, "AUTH0 failed", start);
+            reader.parseAuth0Response(auth0Resp);
+            reader.deriveKeys(AliroCryptoProvider.INTERFACE_BYTE_NFC);
+
+            byte[] auth1Resp = cred.process(reader.buildAuth1CommandFull());
+            if (!isSW9000(auth1Resp))
+                return result("MAILBOX_WRITE_THEN_READ", "Full Flow",
+                        "Mailbox round-trip: write 4 bytes at offset 0, read back and verify data matches",
+                        false, "AUTH1 failed", start);
+
+            // EXCHANGE 1: Write DE AD BE EF at offset 0 — no atomic session needed
+            // (single-EXCHANGE writes are atomic by default per §8.3.3.5)
+            // Plaintext: [0xBA <len> [0x8C 01 00] [0x8A 06 00 00 DE AD BE EF]] [0x97 02 01 82]
+            byte[] innerWrite = new byte[]{
+                    (byte) 0x8C, 0x01, 0x00,                                          // no atomic session
+                    (byte) 0x8A, 0x06, 0x00, 0x00, (byte)0xDE, (byte)0xAD, (byte)0xBE, (byte)0xEF // write offset=0
+            };
+            byte[] statusTlv = new byte[]{(byte) 0x97, 0x02, 0x01, (byte) 0x82};
+            byte[] plaintext1 = new byte[2 + innerWrite.length + statusTlv.length];
+            plaintext1[0] = (byte) 0xBA;
+            plaintext1[1] = (byte) innerWrite.length;
+            System.arraycopy(innerWrite, 0, plaintext1, 2, innerWrite.length);
+            System.arraycopy(statusTlv, 0, plaintext1, 2 + innerWrite.length, statusTlv.length);
+
+            byte[] enc1 = AliroCryptoProvider.encryptReaderGcm(reader.skReader, plaintext1, reader.readerCounter++);
+            if (enc1 == null)
+                return result("MAILBOX_WRITE_THEN_READ", "Full Flow",
+                        "Mailbox round-trip: write 4 bytes at offset 0, read back and verify data matches",
+                        false, "EXCHANGE 1 encryption failed", start);
+
+            byte[] resp1 = cred.process(buildExchangeApdu(enc1));
+            if (!isSW9000(resp1))
+                return result("MAILBOX_WRITE_THEN_READ", "Full Flow",
+                        "Mailbox round-trip: write 4 bytes at offset 0, read back and verify data matches",
+                        false, "EXCHANGE 1 (write) failed: " + swHex(resp1), start);
+
+            // EXCHANGE 2: Read 4 bytes at offset 0 — data should be committed from EXCHANGE 1
+            // Plaintext: [0xBA <len> [0x8C 01 00] [0x87 04 00 00 00 04]] [0x97 02 01 82]
+            byte[] innerRead = new byte[]{
+                    (byte) 0x8C, 0x01, 0x00,                          // no atomic session
+                    (byte) 0x87, 0x04, 0x00, 0x00, 0x00, 0x04         // read offset=0, length=4
+            };
+            byte[] plaintext2 = new byte[2 + innerRead.length + statusTlv.length];
+            plaintext2[0] = (byte) 0xBA;
+            plaintext2[1] = (byte) innerRead.length;
+            System.arraycopy(innerRead, 0, plaintext2, 2, innerRead.length);
+            System.arraycopy(statusTlv, 0, plaintext2, 2 + innerRead.length, statusTlv.length);
+
+            byte[] enc2 = AliroCryptoProvider.encryptReaderGcm(reader.skReader, plaintext2, reader.readerCounter++);
+            if (enc2 == null)
+                return result("MAILBOX_WRITE_THEN_READ", "Full Flow",
+                        "Mailbox round-trip: write 4 bytes at offset 0, read back and verify data matches",
+                        false, "EXCHANGE 2 encryption failed", start);
+
+            byte[] resp2 = cred.process(buildExchangeApdu(enc2));
+            if (!isSW9000(resp2))
+                return result("MAILBOX_WRITE_THEN_READ", "Full Flow",
+                        "Mailbox round-trip: write 4 bytes at offset 0, read back and verify data matches",
+                        false, "EXCHANGE 2 (close+read) failed: " + swHex(resp2), start);
+
+            // Decrypt EXCHANGE 2 response.
+            // AUTH1 consumed deviceCounter=1; EXCHANGE 1 response consumed deviceCounter=2;
+            // EXCHANGE 2 response uses deviceCounter=3.
+            byte[] encPayload2 = Arrays.copyOfRange(resp2, 0, resp2.length - 2);
+            reader.deviceCounter++; // skip AUTH1 slot (counter=1)
+            reader.deviceCounter++; // skip EXCHANGE 1 response slot (counter=2)
+            byte[] decrypted2 = AliroCryptoProvider.decryptDeviceGcm(
+                    reader.skDevice, encPayload2, reader.deviceCounter++);
+            if (decrypted2 == null)
+                return result("MAILBOX_WRITE_THEN_READ", "Full Flow",
+                        "Mailbox round-trip: write 4 bytes at offset 0, read back and verify data matches",
+                        false, "EXCHANGE 2 response decryption failed", start);
+
+            // Response plaintext should be: [DE AD BE EF] [00 02 00 00]
+            // First 4 bytes = read data (DEADBEEF), next 4 = status
+            if (decrypted2.length < 4)
+                return result("MAILBOX_WRITE_THEN_READ", "Full Flow",
+                        "Mailbox round-trip: write 4 bytes at offset 0, read back and verify data matches",
+                        false, "Response too short: " + decrypted2.length + " bytes", start);
+
+            if ((decrypted2[0] & 0xFF) != 0xDE || (decrypted2[1] & 0xFF) != 0xAD
+                    || (decrypted2[2] & 0xFF) != 0xBE || (decrypted2[3] & 0xFF) != 0xEF)
+                return result("MAILBOX_WRITE_THEN_READ", "Full Flow",
+                        "Mailbox round-trip: write 4 bytes at offset 0, read back and verify data matches",
+                        false, String.format("Read data mismatch: %02X %02X %02X %02X (expected DE AD BE EF)",
+                                decrypted2[0] & 0xFF, decrypted2[1] & 0xFF,
+                                decrypted2[2] & 0xFF, decrypted2[3] & 0xFF), start);
+
+            return result("MAILBOX_WRITE_THEN_READ", "Full Flow",
+                    "Mailbox round-trip: write 4 bytes at offset 0, read back and verify data matches",
+                    true, "Read back DEADBEEF at offset 0 — data matches", start);
+        }
+        catch (Exception e)
+        {
+            return result("MAILBOX_WRITE_THEN_READ", "Full Flow",
+                    "Mailbox round-trip: write 4 bytes at offset 0, read back and verify data matches",
+                    false, e.toString(), start);
+        }
+    }
+
+    /**
+     * MAILBOX_OUT_OF_BOUNDS — Read beyond mailbox size returns no data (§7.33).
+     *
+     * Initializes a 16-byte mailbox and attempts to read 32 bytes at offset 0,
+     * which exceeds the mailbox size. Per spec, the credential silently omits
+     * out-of-bounds data, so the response contains only the status bytes.
+     */
+    private TestResult testMailboxOutOfBounds()
+    {
+        long start = System.currentTimeMillis();
+        try
+        {
+            LoopbackReader reader = new LoopbackReader();
+            LoopbackCredential cred = new LoopbackCredential();
+
+            // Initialize credential's mailbox to 16 bytes (small)
+            cred.initMailbox(16);
+
+            // Full NFC flow through AUTH1
+            byte[] selectResp = cred.process(reader.buildSelectCommand());
+            if (!isSW9000(selectResp))
+                return result("MAILBOX_OUT_OF_BOUNDS", "Negative",
+                        "Mailbox read beyond size returns no data (§7.33)",
+                        false, "SELECT failed", start);
+
+            byte[] auth0Resp = cred.process(reader.buildAuth0Command());
+            if (!isSW9000(auth0Resp))
+                return result("MAILBOX_OUT_OF_BOUNDS", "Negative",
+                        "Mailbox read beyond size returns no data (§7.33)",
+                        false, "AUTH0 failed", start);
+            reader.parseAuth0Response(auth0Resp);
+            reader.deriveKeys(AliroCryptoProvider.INTERFACE_BYTE_NFC);
+
+            byte[] auth1Resp = cred.process(reader.buildAuth1CommandFull());
+            if (!isSW9000(auth1Resp))
+                return result("MAILBOX_OUT_OF_BOUNDS", "Negative",
+                        "Mailbox read beyond size returns no data (§7.33)",
+                        false, "AUTH1 failed", start);
+
+            // EXCHANGE: Read at offset 0, length 32 (exceeds 16-byte mailbox)
+            // Plaintext: [0xBA <len> [0x87 04 00 00 00 20]] [0x97 02 01 82]
+            byte[] innerRead = new byte[]{
+                    (byte) 0x87, 0x04, 0x00, 0x00, 0x00, 0x20  // read offset=0, length=32
+            };
+            byte[] statusTlv = new byte[]{(byte) 0x97, 0x02, 0x01, (byte) 0x82};
+            byte[] plaintext = new byte[2 + innerRead.length + statusTlv.length];
+            plaintext[0] = (byte) 0xBA;
+            plaintext[1] = (byte) innerRead.length;
+            System.arraycopy(innerRead, 0, plaintext, 2, innerRead.length);
+            System.arraycopy(statusTlv, 0, plaintext, 2 + innerRead.length, statusTlv.length);
+
+            byte[] enc = AliroCryptoProvider.encryptReaderGcm(reader.skReader, plaintext, reader.readerCounter++);
+            if (enc == null)
+                return result("MAILBOX_OUT_OF_BOUNDS", "Negative",
+                        "Mailbox read beyond size returns no data (§7.33)",
+                        false, "Encryption failed", start);
+
+            byte[] resp = cred.process(buildExchangeApdu(enc));
+            if (!isSW9000(resp))
+                return result("MAILBOX_OUT_OF_BOUNDS", "Negative",
+                        "Mailbox read beyond size returns no data (§7.33)",
+                        false, "EXCHANGE failed: " + swHex(resp), start);
+
+            // Decrypt response. AUTH1 consumed deviceCounter=1;
+            // EXCHANGE response uses deviceCounter=2.
+            byte[] encPayload = Arrays.copyOfRange(resp, 0, resp.length - 2);
+            reader.deviceCounter++; // skip AUTH1 slot (counter=1)
+            byte[] decrypted = AliroCryptoProvider.decryptDeviceGcm(
+                    reader.skDevice, encPayload, reader.deviceCounter++);
+            if (decrypted == null)
+                return result("MAILBOX_OUT_OF_BOUNDS", "Negative",
+                        "Mailbox read beyond size returns no data (§7.33)",
+                        false, "Response decryption failed", start);
+
+            // Out-of-bounds read should return only status bytes (no read data prepended).
+            // The response plaintext length must be <= 4 (just the 4-byte status).
+            if (decrypted.length > 4)
+                return result("MAILBOX_OUT_OF_BOUNDS", "Negative",
+                        "Mailbox read beyond size returns no data (§7.33)",
+                        false, "Response contains " + decrypted.length + " bytes; expected <= 4 (status only, no read data)", start);
+
+            return result("MAILBOX_OUT_OF_BOUNDS", "Negative",
+                    "Mailbox read beyond size returns no data (§7.33)",
+                    true, "Out-of-bounds read returned " + decrypted.length + " bytes (status only, no read data)", start);
+        }
+        catch (Exception e)
+        {
+            return result("MAILBOX_OUT_OF_BOUNDS", "Negative",
+                    "Mailbox read beyond size returns no data (§7.33)",
+                    false, e.toString(), start);
+        }
+    }
+
     // =========================================================================
     // GROUP 4 ADDITIONS: Negative Tests
     // =========================================================================
@@ -2720,6 +2953,14 @@ public class AliroSelfTestEngine
         byte[] skDevice;
         byte[] stepUpSK;
 
+        // Mailbox storage (null until initMailbox() is called)
+        byte[] mailbox = null;
+
+        void initMailbox(int size)
+        {
+            mailbox = new byte[size];
+        }
+
         // Credential keypair (generated fresh for self-test, not from Android KeyStore)
         KeyPair credentialKP;
         byte[] credentialPubBytes;
@@ -2995,10 +3236,25 @@ public class AliroSelfTestEngine
                 byte[] decrypted = AliroCryptoProvider.decryptReaderGcm(skReader, encryptedPayload, readerCounter++);
                 if (decrypted == null) return SW_ERROR;
 
-                // Response: encrypted 0x0002 0x00 0x00
-                byte[] successPayload = new byte[]{0x00, 0x02, 0x00, 0x00};
+                // Process mailbox TLVs and collect any read data.
+                byte[] readData = processMailboxTlvs(decrypted);
+
+                // Build response payload: [read data (if any)] + status [0x00 0x02 0x00 0x00]
+                byte[] statusPayload = new byte[]{0x00, 0x02, 0x00, 0x00};
+                byte[] responsePayload;
+                if (readData != null && readData.length > 0)
+                {
+                    responsePayload = new byte[readData.length + statusPayload.length];
+                    System.arraycopy(readData, 0, responsePayload, 0, readData.length);
+                    System.arraycopy(statusPayload, 0, responsePayload, readData.length, statusPayload.length);
+                }
+                else
+                {
+                    responsePayload = statusPayload;
+                }
+
                 // Encrypt response using current device_counter then increment per §8.3.1.6.
-                byte[] encryptedResponse = AliroCryptoProvider.encryptDeviceGcm(skDevice, successPayload, deviceCounter++);
+                byte[] encryptedResponse = AliroCryptoProvider.encryptDeviceGcm(skDevice, responsePayload, deviceCounter++);
                 if (encryptedResponse == null) return SW_ERROR;
 
                 state = State.EXCHANGE_DONE;
@@ -3014,6 +3270,152 @@ public class AliroSelfTestEngine
                 Log.e(TAG, "LoopbackCredential EXCHANGE error", e);
                 return SW_ERROR;
             }
+        }
+
+        /**
+         * Process mailbox TLVs from decrypted EXCHANGE plaintext.
+         * Replicates Aliro_HostApduService.processMailboxTags() logic.
+         * Tags per Table 8-16:
+         *   0xBA <len> <inner TLVs> — outer wrapper containing mailbox commands
+         *   0x8C 01 <options>       — atomic session: bit0=1 start, bit0=0 stop
+         *   0x87 04 <off_hi><off_lo><len_hi><len_lo> — read
+         *   0x8A var <off_hi><off_lo><data...>        — write
+         *   0x95 05 <off_hi><off_lo><len_hi><len_lo><value> — set (fill)
+         * Returns concatenated read data, or null if no reads.
+         */
+        private byte[] processMailboxTlvs(byte[] decrypted)
+        {
+            if (decrypted == null || decrypted.length < 2) return null;
+
+            java.io.ByteArrayOutputStream readOutput = new java.io.ByteArrayOutputStream();
+            boolean atomicActive = false;
+            byte[] atomicPending = null;
+
+            int i = 0;
+            while (i < decrypted.length - 1)
+            {
+                int tag = decrypted[i] & 0xFF;
+                int len = decrypted[i + 1] & 0xFF;
+                int valOff = i + 2;
+                if (valOff + len > decrypted.length) break;
+
+                switch (tag)
+                {
+                    case 0xBA: // Outer mailbox wrapper — recurse into inner TLVs
+                    {
+                        byte[] inner = Arrays.copyOfRange(decrypted, valOff, valOff + len);
+                        byte[] innerRead = processMailboxTlvs(inner);
+                        if (innerRead != null && innerRead.length > 0)
+                        {
+                            readOutput.write(innerRead, 0, innerRead.length);
+                        }
+                        break;
+                    }
+
+                    case 0x8C: // Atomic session control
+                        if (len == 1)
+                        {
+                            boolean start = (decrypted[valOff] & 0x01) == 1;
+                            if (start && !atomicActive)
+                            {
+                                atomicActive  = true;
+                                atomicPending = (mailbox != null)
+                                        ? Arrays.copyOf(mailbox, mailbox.length)
+                                        : new byte[0];
+                            }
+                            else if (!start && atomicActive)
+                            {
+                                // Commit pending writes
+                                if (atomicPending != null)
+                                {
+                                    mailbox = atomicPending;
+                                }
+                                atomicActive  = false;
+                                atomicPending = null;
+                            }
+                        }
+                        break;
+
+                    case 0x87: // Read: offset(2) || length(2)
+                        if (len == 4)
+                        {
+                            int offset  = ((decrypted[valOff]     & 0xFF) << 8)
+                                         | (decrypted[valOff + 1] & 0xFF);
+                            int readLen = ((decrypted[valOff + 2] & 0xFF) << 8)
+                                         | (decrypted[valOff + 3] & 0xFF);
+                            byte[] src  = atomicActive ? atomicPending : mailbox;
+                            if (src != null && offset + readLen <= src.length)
+                            {
+                                readOutput.write(src, offset, readLen);
+                            }
+                            // Out-of-bounds: write nothing (empty read result)
+                        }
+                        break;
+
+                    case 0x8A: // Write: offset(2) || data(var)
+                        if (len >= 2)
+                        {
+                            int offset  = ((decrypted[valOff]     & 0xFF) << 8)
+                                         | (decrypted[valOff + 1] & 0xFF);
+                            int dataLen = len - 2;
+                            byte[] target = atomicActive
+                                    ? atomicPending
+                                    : (mailbox != null ? mailbox : new byte[0]);
+                            int needed = offset + dataLen;
+                            if (needed > target.length)
+                            {
+                                target = Arrays.copyOf(target, needed);
+                            }
+                            System.arraycopy(decrypted, valOff + 2, target, offset, dataLen);
+                            if (atomicActive)
+                            {
+                                atomicPending = target;
+                            }
+                            else
+                            {
+                                mailbox = target;
+                            }
+                        }
+                        break;
+
+                    case 0x95: // Set: offset(2) || length(2) || value(1)
+                        if (len == 5)
+                        {
+                            int offset  = ((decrypted[valOff]     & 0xFF) << 8)
+                                         | (decrypted[valOff + 1] & 0xFF);
+                            int setLen  = ((decrypted[valOff + 2] & 0xFF) << 8)
+                                         | (decrypted[valOff + 3] & 0xFF);
+                            byte value  =   decrypted[valOff + 4];
+                            byte[] target = atomicActive
+                                    ? atomicPending
+                                    : (mailbox != null ? mailbox : new byte[0]);
+                            int needed  = offset + setLen;
+                            if (needed > target.length)
+                            {
+                                target = Arrays.copyOf(target, needed);
+                            }
+                            Arrays.fill(target, offset, offset + setLen, value);
+                            if (atomicActive)
+                            {
+                                atomicPending = target;
+                            }
+                            else
+                            {
+                                mailbox = target;
+                            }
+                        }
+                        break;
+
+                    default:
+                        // Unknown tag — skip per spec
+                        break;
+                }
+
+                i = valOff + len; // advance to next TLV
+            }
+
+            byte[] result = readOutput.toByteArray();
+            return result.length > 0 ? result : null;
         }
 
         /**

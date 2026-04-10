@@ -38,5 +38,30 @@ public class AliroPreferences
      */
     public static final String STEP_UP_ISSUER_PUB_KEY = "aliro_step_up_issuer_pub_key";
 
+    // -------------------------------------------------------------------------
+    // Mailbox configuration (reader side — sent in EXCHANGE command)
+    // -------------------------------------------------------------------------
+
+    /** Boolean: enable mailbox operations in EXCHANGE */
+    public static final String MAILBOX_ENABLED = "aliro_mailbox_enabled";
+
+    /** String: operation type — "read", "write", or "set" */
+    public static final String MAILBOX_OPERATION = "aliro_mailbox_operation";
+
+    /** Int stored as String: offset into mailbox (0-based decimal) */
+    public static final String MAILBOX_OFFSET = "aliro_mailbox_offset";
+
+    /** Int stored as String: length for read/set operations (decimal) */
+    public static final String MAILBOX_LENGTH = "aliro_mailbox_length";
+
+    /** Hex string: data bytes for write operation */
+    public static final String MAILBOX_DATA = "aliro_mailbox_data";
+
+    /** 2-char hex string: single byte value for set (fill) operation */
+    public static final String MAILBOX_SET_VALUE = "aliro_mailbox_set_value";
+
+    /** Boolean: wrap operations in atomic session (0x8C start/stop) */
+    public static final String MAILBOX_ATOMIC = "aliro_mailbox_atomic";
+
     private AliroPreferences() {}
 }

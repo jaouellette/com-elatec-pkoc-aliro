@@ -196,7 +196,7 @@
             android:fontFamily="monospace"
             android:textSize="13sp"
             android:maxLines="3"
-            android:layout_marginBottom="32dp" />
+            android:layout_marginBottom="8dp" />
 
         <Button
             android:id="@+id/btnScanIssuerKeyQr"
@@ -206,6 +206,151 @@
             android:backgroundTint="@color/colorPrimaryDark"
             android:textColor="@android:color/white"
             android:layout_marginBottom="32dp" />
+
+
+        <!-- Mailbox divider -->
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:background="@color/colorTextSecondary"
+            android:layout_marginBottom="16dp"
+            android:layout_marginTop="8dp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Mailbox Configuration"
+            android:textSize="15sp"
+            android:textStyle="bold"
+            android:textColor="@color/colorTextPrimary"
+            android:layout_marginBottom="4dp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Configure mailbox operations sent in the EXCHANGE command. The credential maintains a persistent byte array that the reader can read, write, or fill."
+            android:textSize="13sp"
+            android:textColor="@color/colorTextSecondary"
+            android:layout_marginBottom="12dp" />
+
+        <CheckBox
+            android:id="@+id/chkMailboxEnabled"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Enable mailbox operations"
+            android:textSize="14sp"
+            android:layout_marginBottom="12dp" />
+
+        <!-- Operation type -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Operation"
+            android:textSize="14sp"
+            android:textStyle="bold"
+            android:textColor="@color/colorTextPrimary"
+            android:layout_marginBottom="4dp" />
+
+        <Spinner
+            android:id="@+id/spinnerMailboxOperation"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="12dp" />
+
+        <!-- Offset -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Offset (decimal, 0-based)"
+            android:textSize="14sp"
+            android:textStyle="bold"
+            android:textColor="@color/colorTextPrimary"
+            android:layout_marginBottom="4dp" />
+
+        <EditText
+            android:id="@+id/editMailboxOffset"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="0"
+            android:inputType="number"
+            android:textSize="13sp"
+            android:layout_marginBottom="12dp" />
+
+        <!-- Length (for read/set) -->
+        <TextView
+            android:id="@+id/lblMailboxLength"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Length (decimal)"
+            android:textSize="14sp"
+            android:textStyle="bold"
+            android:textColor="@color/colorTextPrimary"
+            android:layout_marginBottom="4dp" />
+
+        <EditText
+            android:id="@+id/editMailboxLength"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="16"
+            android:inputType="number"
+            android:textSize="13sp"
+            android:layout_marginBottom="12dp" />
+
+        <!-- Data (for write) -->
+        <TextView
+            android:id="@+id/lblMailboxData"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Data (hex string)"
+            android:textSize="14sp"
+            android:textStyle="bold"
+            android:textColor="@color/colorTextPrimary"
+            android:layout_marginBottom="4dp"
+            android:visibility="gone" />
+
+        <EditText
+            android:id="@+id/editMailboxData"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="e.g. DEADBEEF"
+            android:inputType="textNoSuggestions"
+            android:fontFamily="monospace"
+            android:textSize="13sp"
+            android:layout_marginBottom="12dp"
+            android:visibility="gone" />
+
+        <!-- Set value (for set/fill) -->
+        <TextView
+            android:id="@+id/lblMailboxSetValue"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Fill Value (2 hex chars, e.g. FF)"
+            android:textSize="14sp"
+            android:textStyle="bold"
+            android:textColor="@color/colorTextPrimary"
+            android:layout_marginBottom="4dp"
+            android:visibility="gone" />
+
+        <EditText
+            android:id="@+id/editMailboxSetValue"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="00"
+            android:inputType="textNoSuggestions"
+            android:fontFamily="monospace"
+            android:textSize="13sp"
+            android:maxLength="2"
+            android:layout_marginBottom="12dp"
+            android:visibility="gone" />
+
+        <!-- Atomic session -->
+        <CheckBox
+            android:id="@+id/chkMailboxAtomic"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Use atomic session"
+            android:textSize="14sp"
+            android:layout_marginBottom="24dp" />
 
         <!-- Save button -->
         <Button

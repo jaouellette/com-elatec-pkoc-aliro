@@ -13,10 +13,13 @@ import android.text.TextUtils;
 import android.view.LayoutInflater;
 import android.view.View;
 import android.view.ViewGroup;
+import android.util.Base64;
+import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
+import android.widget.Spinner;
 import android.widget.TextView;
 
 import com.google.zxing.BarcodeFormat;
@@ -57,6 +60,17 @@ public class CredentialAliroConfigFragment extends Fragment
     private EditText    editElementId;
     private TextView    txtStatus;
 
+    // Mailbox viewer
+    private TextView    txtMailboxSize;
+    private TextView    txtMailboxHexDump;
+    private Spinner     spinnerMailboxSize;
+    private Button      btnInitMailbox;
+    private Button      btnClearMailbox;
+
+    private static final String MAILBOX_PREFS_NAME = "AliroMailbox";
+    private static final String MAILBOX_PREF_KEY   = "mailbox";
+    private static final String[] MAILBOX_SIZES = { "64", "128", "256", "512", "1024" };
+
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
     private final Handler         uiHandler = new Handler(Looper.getMainLooper());
 
@@ -85,13 +99,36 @@ public class CredentialAliroConfigFragment extends Fragment
         editElementId      = view.findViewById(R.id.editElementIdentifier);
         txtStatus          = view.findViewById(R.id.txtCredAliroStatus);
 
+        // Mailbox viewer
+        txtMailboxSize      = view.findViewById(R.id.txtMailboxSize);
+        txtMailboxHexDump   = view.findViewById(R.id.txtMailboxHexDump);
+        spinnerMailboxSize  = view.findViewById(R.id.spinnerMailboxSize);
+        btnInitMailbox      = view.findViewById(R.id.btnInitMailbox);
+        btnClearMailbox     = view.findViewById(R.id.btnClearMailbox);
+
+        ArrayAdapter<String> sizeAdapter = new ArrayAdapter<>(
+                requireContext(), android.R.layout.simple_spinner_item, MAILBOX_SIZES);
+        sizeAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        spinnerMailboxSize.setAdapter(sizeAdapter);
+        spinnerMailboxSize.setSelection(2); // default: 256
+
         refreshDocumentStatus();
+        refreshMailboxViewer();
 
         btnGenerateTest.setOnClickListener(v -> generateTestDocument());
         btnImport.setOnClickListener(v -> showImportDialog());
         btnClear.setOnClickListener(v -> clearDocument());
         btnCopyIssuerKey.setOnClickListener(v -> copyIssuerKeyToClipboard());
         btnShowQr.setOnClickListener(v -> showIssuerKeyQrDialog());
+        btnInitMailbox.setOnClickListener(v -> initializeMailbox());
+        btnClearMailbox.setOnClickListener(v -> clearMailbox());
+    }
+
+    @Override
+    public void onResume()
+    {
+        super.onResume();
+        refreshMailboxViewer();
     }
 
     @Override
@@ -397,6 +434,103 @@ public class CredentialAliroConfigFragment extends Fragment
         else
             System.arraycopy(raw, raw.length - 32, out, 0, 32);
         return out;
+    }
+
+    // -------------------------------------------------------------------------
+    // Mailbox viewer
+    // -------------------------------------------------------------------------
+
+    private void refreshMailboxViewer()
+    {
+        if (!isAdded()) return;
+        byte[] mailbox = loadMailboxBytes();
+        if (mailbox == null || mailbox.length == 0)
+        {
+            txtMailboxSize.setText("Size: 0 bytes");
+            txtMailboxHexDump.setText("(empty)");
+            return;
+        }
+
+        txtMailboxSize.setText("Size: " + mailbox.length + " bytes");
+        txtMailboxHexDump.setText(formatHexDump(mailbox));
+    }
+
+    private void initializeMailbox()
+    {
+        int size = Integer.parseInt(MAILBOX_SIZES[spinnerMailboxSize.getSelectedItemPosition()]);
+        byte[] mailbox = new byte[size];
+        saveMailboxBytes(mailbox);
+        refreshMailboxViewer();
+        showStatus("Mailbox initialized: " + size + " bytes", true);
+    }
+
+    private void clearMailbox()
+    {
+        new android.app.AlertDialog.Builder(requireContext())
+                .setTitle("Clear Mailbox")
+                .setMessage("Remove all mailbox data?")
+                .setPositiveButton("Clear", (d, w) ->
+                {
+                    saveMailboxBytes(new byte[0]);
+                    refreshMailboxViewer();
+                    showStatus("Mailbox cleared.", true);
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    private byte[] loadMailboxBytes()
+    {
+        try
+        {
+            SharedPreferences prefs = requireContext()
+                    .getSharedPreferences(MAILBOX_PREFS_NAME, Context.MODE_PRIVATE);
+            String encoded = prefs.getString(MAILBOX_PREF_KEY, null);
+            if (encoded == null) return new byte[0];
+            return Base64.decode(encoded, Base64.DEFAULT);
+        }
+        catch (Exception e) { return new byte[0]; }
+    }
+
+    private void saveMailboxBytes(byte[] data)
+    {
+        SharedPreferences prefs = requireContext()
+                .getSharedPreferences(MAILBOX_PREFS_NAME, Context.MODE_PRIVATE);
+        if (data == null || data.length == 0)
+        {
+            prefs.edit().remove(MAILBOX_PREF_KEY).apply();
+        }
+        else
+        {
+            prefs.edit().putString(MAILBOX_PREF_KEY,
+                    Base64.encodeToString(data, Base64.DEFAULT)).apply();
+        }
+    }
+
+    /**
+     * Format byte array as hex dump with address offsets (16 bytes per line).
+     * e.g. "0000: 00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F"
+     */
+    private static String formatHexDump(byte[] data)
+    {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < data.length; i += 16)
+        {
+            sb.append(String.format("%04X: ", i));
+            for (int j = 0; j < 16; j++)
+            {
+                if (i + j < data.length)
+                {
+                    sb.append(String.format("%02X ", data[i + j] & 0xFF));
+                }
+                else
+                {
+                    sb.append("   ");
+                }
+            }
+            sb.append('\n');
+        }
+        return sb.toString().trim();
     }
 
     // -------------------------------------------------------------------------
