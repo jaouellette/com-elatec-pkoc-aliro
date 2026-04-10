@@ -10,7 +10,7 @@ android {
     compileSdk = 36
 
     defaultConfig {
-        minSdk = 24
+        minSdk = 29
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -61,6 +61,7 @@ protobuf {
 dependencies {
     implementation(libs.bcpkix.jdk15to18)
     implementation(libs.bcprov.jdk15to18)
+    implementation(libs.cbor)                 // CBOR encoding for Aliro Access Document
     implementation(libs.appcompat)
     implementation(libs.material)
     implementation(libs.core)

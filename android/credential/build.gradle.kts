@@ -12,7 +12,7 @@ android {
 
     defaultConfig {
         applicationId = "com.psia.pkoc"
-        minSdk = 24
+        minSdk = 29
         targetSdk = 36
         versionCode = 1
         versionName = "3.5"
@@ -91,6 +91,7 @@ dependencies {
     implementation(libs.navigation.ui)
     implementation(libs.bcpkix.jdk15to18)
     implementation(libs.bcprov.jdk15to18)
+    implementation(libs.cbor)                 // CBOR encoding for Aliro Access Document
     testImplementation(libs.robolectric)
     testImplementation(libs.junit)
     androidTestImplementation(libs.ext.junit)

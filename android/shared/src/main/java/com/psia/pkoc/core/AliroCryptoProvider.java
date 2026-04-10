@@ -83,10 +83,15 @@ public class AliroCryptoProvider
     /**
      * Generate cryptographically secure random bytes.
      */
+    // Single shared SecureRandom instance — thread-safe after initialization.
+    // Avoids entropy pool exhaustion from repeated new SecureRandom() calls
+    // during rapid test loops on Android.
+    private static final SecureRandom SECURE_RANDOM = new SecureRandom();
+
     public static byte[] generateRandom(int size)
     {
         byte[] out = new byte[size];
-        new SecureRandom().nextBytes(out);
+        SECURE_RANDOM.nextBytes(out);
         return out;
     }
 
@@ -278,8 +283,12 @@ public class AliroCryptoProvider
     /**
      * Derive Aliro session keys from the ECDH shared secret.
      *
-     * Produces a buffer of the requested size. By convention the caller
-     * requests 64 bytes: first 32 = ExpeditedSKReader, last 32 = ExpeditedSKDevice.
+     * Produces a buffer of the requested size. Key material layout:
+     *   offset  0–31 : ExpeditedSKReader
+     *   offset 32–63 : ExpeditedSKDevice
+     *   offset 64–95 : StepUpSKReader   (request outputSize >= 96)
+     *   offset 80–95 : StepUpSKDevice   (request outputSize >= 96)
+     *   offset 96–127: BleSK            (request outputSize = 128, BLE only)
      *
      * This is a direct port of AliroDeriveKeys() from aliro_flow.h:
      *   Step 1: ECDH → X coordinate
@@ -408,52 +417,117 @@ public class AliroCryptoProvider
     // -------------------------------------------------------------------------
 
     /**
-     * Encrypt EXCHANGE command payload with SKReader.
-     * IV = 0x0000000000000000_00000001 (reader_counter=1)
+     * Build the 12-byte AES-GCM IV for a reader command.
+     * Per §8.3.1.8: IV = 0x0000000000000000 || counter (big-endian 4 bytes).
+     * Counter SHALL start at 1 and increment by 1 for each subsequent message.
      */
+    private static byte[] readerIv(int counter)
+    {
+        return new byte[]{
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            (byte)(counter >> 24), (byte)(counter >> 16),
+            (byte)(counter >> 8),  (byte) counter
+        };
+    }
+
+    /**
+     * Build the 12-byte AES-GCM IV for a device response.
+     * Per §8.3.1.6: IV = 0x0000000000000001 || counter (big-endian 4 bytes).
+     * Counter SHALL start at 1 and increment by 1 for each subsequent message.
+     */
+    private static byte[] deviceIv(int counter)
+    {
+        return new byte[]{
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+            (byte)(counter >> 24), (byte)(counter >> 16),
+            (byte)(counter >> 8),  (byte) counter
+        };
+    }
+
+    /**
+     * Encrypt a reader command payload (EXCHANGE) with SKReader.
+     * Per §8.3.1.8: IV = 0x0000000000000000 || reader_counter.
+     *
+     * @param skReader  32-byte ExpeditedSKReader
+     * @param plaintext payload to encrypt
+     * @param counter   reader_counter value for this message (starts at 1)
+     * @return ciphertext || 16-byte auth tag, or null on failure
+     */
+    public static byte[] encryptReaderGcm(byte[] skReader, byte[] plaintext, int counter)
+    {
+        return gcm(true, skReader, readerIv(counter), plaintext);
+    }
+
+    /**
+     * Decrypt a reader command payload (EXCHANGE) with SKReader (credential side).
+     * Per §8.3.1.9: IV = 0x0000000000000000 || reader_counter.
+     *
+     * @param skReader         32-byte ExpeditedSKReader
+     * @param ciphertextAndTag ciphertext || 16-byte auth tag
+     * @param counter          reader_counter value for this message (starts at 1)
+     * @return plaintext, or null if authentication tag verification fails
+     */
+    public static byte[] decryptReaderGcm(byte[] skReader, byte[] ciphertextAndTag, int counter)
+    {
+        return gcm(false, skReader, readerIv(counter), ciphertextAndTag);
+    }
+
+    /**
+     * Encrypt a device response payload (AUTH1, EXCHANGE response) with SKDevice.
+     * Per §8.3.1.6: IV = 0x0000000000000001 || device_counter.
+     *
+     * @param skDevice  32-byte ExpeditedSKDevice
+     * @param plaintext payload to encrypt
+     * @param counter   device_counter value for this message (starts at 1)
+     * @return ciphertext || 16-byte auth tag, or null on failure
+     */
+    public static byte[] encryptDeviceGcm(byte[] skDevice, byte[] plaintext, int counter)
+    {
+        return gcm(true, skDevice, deviceIv(counter), plaintext);
+    }
+
+    /**
+     * Decrypt a device response payload (AUTH1, EXCHANGE response) with SKDevice (reader side).
+     * Per §8.3.1.7: IV = 0x0000000000000001 || device_counter.
+     *
+     * @param skDevice         32-byte ExpeditedSKDevice
+     * @param ciphertextAndTag ciphertext || 16-byte auth tag
+     * @param counter          device_counter value for this message (starts at 1)
+     * @return plaintext, or null if authentication tag verification fails
+     */
+    public static byte[] decryptDeviceGcm(byte[] skDevice, byte[] ciphertextAndTag, int counter)
+    {
+        return gcm(false, skDevice, deviceIv(counter), ciphertextAndTag);
+    }
+
+    // -------------------------------------------------------------------------
+    // Convenience overloads: counter=1 (single-EXCHANGE transactions).
+    // These remain fully correct for any transaction that sends exactly one
+    // EXCHANGE command, which is the common case.
+    // -------------------------------------------------------------------------
+
+    /** Encrypt reader command with counter=1. Use the counter overload for multi-EXCHANGE. */
     public static byte[] encryptReaderGcm(byte[] skReader, byte[] plaintext)
     {
-        byte[] iv = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                     0x00, 0x00, 0x00, 0x01};
-        return gcm(true, skReader, iv, plaintext);
+        return encryptReaderGcm(skReader, plaintext, 1);
     }
 
-    /**
-     * Decrypt EXCHANGE command payload with SKReader (credential side).
-     * IV = 0x0000000000000000_00000001 (reader_counter=1)
-     */
+    /** Decrypt reader command with counter=1. Use the counter overload for multi-EXCHANGE. */
     public static byte[] decryptReaderGcm(byte[] skReader, byte[] ciphertextAndTag)
     {
-        byte[] iv = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                     0x00, 0x00, 0x00, 0x01};
-        return gcm(false, skReader, iv, ciphertextAndTag);
+        return decryptReaderGcm(skReader, ciphertextAndTag, 1);
     }
 
-    // -------------------------------------------------------------------------
-    // GCM for Device responses (AUTH1, EXCHANGE response): uses SKDevice, device_counter IV
-    // Section 8.3.1.6: IV = 0x0000000000000001 || device_counter (starts at 1)
-    // -------------------------------------------------------------------------
-
-    /**
-     * Encrypt AUTH1 response (and EXCHANGE response) with SKDevice.
-     * IV = 0x0000000000000001_00000001 (device_counter=1)
-     */
+    /** Encrypt device response with counter=1. Use the counter overload for multi-EXCHANGE. */
     public static byte[] encryptDeviceGcm(byte[] skDevice, byte[] plaintext)
     {
-        byte[] iv = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
-                     0x00, 0x00, 0x00, 0x01};
-        return gcm(true, skDevice, iv, plaintext);
+        return encryptDeviceGcm(skDevice, plaintext, 1);
     }
 
-    /**
-     * Decrypt AUTH1 response (and EXCHANGE response) with SKDevice (reader side).
-     * IV = 0x0000000000000001_00000001 (device_counter=1)
-     */
+    /** Decrypt device response with counter=1. Use the counter overload for multi-EXCHANGE. */
     public static byte[] decryptDeviceGcm(byte[] skDevice, byte[] ciphertextAndTag)
     {
-        byte[] iv = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
-                     0x00, 0x00, 0x00, 0x01};
-        return gcm(false, skDevice, iv, ciphertextAndTag);
+        return decryptDeviceGcm(skDevice, ciphertextAndTag, 1);
     }
 
     // Keep old names as aliases for backward compatibility with EXCHANGE command
@@ -866,6 +940,43 @@ public class AliroCryptoProvider
      * @param length Output key length in bytes (32)
      * @return Derived key, or null on failure
      */
+    // -------------------------------------------------------------------------
+    // Step-Up session key derivation (ISO 18013-5 §9.1.1.5, as modified by
+    // Aliro §8.4.3: IKM = StepUpSK, salt = empty)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Derives the two session encryption keys used for ENVELOPE/GET RESPONSE
+     * messages in the Aliro Step-Up phase.
+     *
+     * Per Aliro §8.4.3 + ISO 18013-5 §9.1.1.5:
+     *   SKDevice = HKDF(IKM=StepUpSK, salt=empty, info="SKDevice", len=32)
+     *   SKReader  = HKDF(IKM=StepUpSK, salt=empty, info="SKReader",  len=32)
+     *
+     * @param stepUpSK  32-byte StepUpSK from deriveKeys() at offset 64
+     * @return          byte[64]: SKDevice[0..31] || SKReader[32..63], or null
+     */
+    public static byte[] deriveStepUpSessionKeys(byte[] stepUpSK)
+    {
+        if (stepUpSK == null || stepUpSK.length < 32) return null;
+        try
+        {
+            byte[] emptySalt  = new byte[0];
+            byte[] skDevice   = hkdfDeriveKey(stepUpSK, "SKDevice", emptySalt, 32);
+            byte[] skReader   = hkdfDeriveKey(stepUpSK, "SKReader",  emptySalt, 32);
+            if (skDevice == null || skReader == null) return null;
+            byte[] result = new byte[64];
+            arraycopy(skDevice, 0, result,  0, 32);
+            arraycopy(skReader, 0, result, 32, 32);
+            return result;
+        }
+        catch (Exception e)
+        {
+            Log.e(TAG, "deriveStepUpSessionKeys failed", e);
+            return null;
+        }
+    }
+
     public static byte[] hkdfDeriveKey(byte[] ikm, String info, byte[] salt, int length)
     {
         try

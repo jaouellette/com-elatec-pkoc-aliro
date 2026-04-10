@@ -1,11 +1,17 @@
 package com.psia.pkoc;
 
+import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.nfc.cardemulation.HostApduService;
 import android.os.Bundle;
+import android.util.Base64;
 import android.util.Log;
 
 import com.psia.pkoc.core.AliroCryptoProvider;
+import com.psia.pkoc.core.AliroAccessDocument;
+
+import com.upokecenter.cbor.CBORObject;
 
 import org.bouncycastle.util.encoders.Hex;
 
@@ -16,7 +22,7 @@ import java.security.interfaces.ECPublicKey;
 import java.util.Arrays;
 
 /**
- * HCE service for the Aliro Expedited Standard NFC credential flow.
+ * HCE service for the Aliro Expedited Standard NFC credential flow + Mailbox.
  *
  * AID: A0 00 00 09 09 AC CE 55 01
  *
@@ -25,10 +31,11 @@ import java.util.Arrays;
  *   2. AUTH0         → parse reader ephemeral key + TID + reader ID;
  *                      generate UD ephemeral keypair; respond with UD ephemeral public key
  *   3. LOAD CERT     → (optional) receive and store reader certificate; respond 9000
- *   4. AUTH1         → receive encrypted reader signature;
- *                      derive session keys; decrypt; verify reader sig;
+ *   4. AUTH1         → derive session keys (96-byte: ExpeditedSK[0..63], StepUpSK[64..95]);
  *                      build encrypted response with credential pub key + credential sig
- *   5. EXCHANGE      → decrypt reader access decision; broadcast result
+ *   5. EXCHANGE      → decrypt; process mailbox ops (0x8C/0x87/0x8A/0x95); broadcast result
+ *   6. ENVELOPE      → (Step-Up) accumulate DeviceRequest chunks; return DeviceResponse
+ *   7. GET RESPONSE  → return next chunk of pending Step-Up response
  */
 public class Aliro_HostApduService extends HostApduService
 {
@@ -80,23 +87,53 @@ public class Aliro_HostApduService extends HostApduService
     private static final byte[] SW_OK            = { (byte)0x90, 0x00 };
     private static final byte[] SW_ERROR         = { 0x6A, (byte)0x82 }; // File not found
     private static final byte[] SW_CONDITIONS    = { 0x69, (byte)0x85 }; // Conditions not satisfied
+    private static final byte[] SW_WRONG_LENGTH  = { 0x67, 0x00 };        // Wrong length
+    // 61 xx = response bytes still available (GET RESPONSE)
+    // 90 00 = success
+
+    // -------------------------------------------------------------------------
+    // Mailbox constants
+    // -------------------------------------------------------------------------
+    private static final String PREFS_NAME         = "AliroMailbox";
+    private static final String PREF_MAILBOX_KEY   = "mailbox";
+    /** Maximum mailbox size per spec — 64 KB */
+    private static final int    MAILBOX_MAX_SIZE    = 65536;
 
     // -------------------------------------------------------------------------
     // Per-transaction state (reset on deactivation)
     // -------------------------------------------------------------------------
-    private enum State { IDLE, SELECTED, AUTH0_DONE, CERT_LOADED, AUTH1_DONE }
+    private enum State { IDLE, SELECTED, AUTH0_DONE, CERT_LOADED, AUTH1_DONE, EXCHANGE_DONE }
 
-    private State state = State.IDLE;
+    private State   state = State.IDLE;
     private KeyPair udEphKP;              // UD ephemeral keypair (generated in AUTH0)
-    private byte[] udEphPubBytes;         // 65-byte uncompressed UD ephemeral public key
-    private byte[] readerEphPubBytes;     // 65-byte reader ephemeral public key from AUTH0
-    private byte[] readerIdBytes;         // 32-byte reader ID from AUTH0
-    private byte[] transactionId;         // 16-byte TID from AUTH0
-    private byte[] selectedProtocol;      // 2-byte protocol version from AUTH0
-    private byte[] auth0Flag;             // command_parameters || authentication_policy from AUTH0
-    private byte[] readerStaticPubKeyX;   // 32-byte reader static public key X (from LOAD CERT tag 85)
-    private byte[] skReader;              // ExpeditedSKReader (32 bytes) — for decrypting EXCHANGE
-    private byte[] skDevice;              // ExpeditedSKDevice (32 bytes) — for encrypting AUTH1 response
+    private byte[]  udEphPubBytes;        // 65-byte uncompressed UD ephemeral public key
+    private byte[]  readerEphPubBytes;    // 65-byte reader ephemeral public key from AUTH0
+    private byte[]  readerIdBytes;        // 32-byte reader ID from AUTH0
+    private byte[]  transactionId;        // 16-byte TID from AUTH0
+    private byte[]  selectedProtocol;     // 2-byte protocol version from AUTH0
+    private byte[]  auth0Flag;            // command_parameters || authentication_policy from AUTH0
+    private byte[]  readerStaticPubKeyX;  // 32-byte reader static public key X (from LOAD CERT tag 85)
+    private byte[]  readerStaticPubKey;   // 65-byte uncompressed reader public key 04||X||Y (from LOAD CERT tag 85)
+    private byte[]  skReader;             // ExpeditedSKReader (32 bytes) — for decrypting EXCHANGE
+    private byte[]  skDevice;             // ExpeditedSKDevice (32 bytes) — for encrypting AUTH1 response
+    private byte[]  stepUpSK;             // StepUpSK (32 bytes) at HKDF offset 64 — for ENVELOPE session
+
+    // Per-message GCM counters (§8.3.1.6 / §8.3.1.8).
+    // device_counter: starts at 1, AUTH1 response uses 1 (then becomes 2), EXCHANGE responses use 2, 3, ...
+    // reader_counter: starts at 1, first EXCHANGE command uses 1, then 2, 3, ...
+    private int     readerCounter = 1;    // reader_counter  — first EXCHANGE command uses 1
+    private int     deviceCounter = 1;    // device_counter  — AUTH1 response uses 1, EXCHANGE responses use 2+
+
+    // Mailbox atomic session tracking
+    private boolean mailboxAtomicActive   = false;  // true when atomic session started (0x8C bit0=1)
+    private byte[]  mailboxPendingWrites  = null;   // buffered writes during atomic session
+
+    // ENVELOPE / GET RESPONSE state (Step-Up phase)
+    private byte[]  envelopeBuffer        = null;   // accumulates chained ENVELOPE command data
+    private byte[]  pendingGetResponse    = null;   // pending response data for GET RESPONSE
+    private int     pendingGetResponseOff = 0;      // offset into pendingGetResponse
+    /** Max chunk size for GET RESPONSE (NFC short APDU limit = 256 bytes response) */
+    private static final int GET_RESPONSE_CHUNK = 240;
 
     // -------------------------------------------------------------------------
 
@@ -120,6 +157,8 @@ public class Aliro_HostApduService extends HostApduService
             case (byte)0x81: return handleAuth1(apdu);
             case (byte)0xC9: return handleExchange(apdu);
             case (byte)0x3C: return handleControlFlow(apdu);
+            case (byte)0xC3: return handleEnvelope(apdu);   // Step-Up ENVELOPE
+            case (byte)0xC0: return handleGetResponse(apdu); // Step-Up GET RESPONSE
             default:
                 Log.w(TAG, "Unknown INS: " + String.format("%02X", ins));
                 return SW_ERROR;
@@ -323,7 +362,12 @@ public class Aliro_HostApduService extends HostApduService
                         // cert[i+2] = 0x00 prefix, cert[i+3] = 0x04 uncompressed marker
                         if (i + 68 <= cert.length && cert[i+2] == 0x00 && cert[i+3] == 0x04)
                         {
-                            readerStaticPubKeyX = Arrays.copyOfRange(cert, i + 4, i + 36); // X coord
+                            // tag 0x85 value: 00 04 <X 32B> <Y 32B>
+                            readerStaticPubKeyX = Arrays.copyOfRange(cert, i + 4, i + 36); // X coord only (for HKDF)
+                            // Reconstruct full 65-byte uncompressed point: 04 || X || Y (for sig verify)
+                            readerStaticPubKey = new byte[65];
+                            readerStaticPubKey[0] = 0x04;
+                            System.arraycopy(cert, i + 4, readerStaticPubKey, 1, 64); // X(32) + Y(32)
                             Log.d(TAG, "LOAD CERT: reader static pub key X = " +
                                     org.bouncycastle.util.encoders.Hex.toHexString(readerStaticPubKeyX));
                         }
@@ -408,10 +452,21 @@ public class Aliro_HostApduService extends HostApduService
             byte[] readerEphPubX = Arrays.copyOfRange(readerEphPubBytes, 1, 33);
             byte[] udEphPubX     = Arrays.copyOfRange(udEphPubBytes, 1, 33);
 
-            // Verify reader signature (optional for simulator — we log but don't block)
-            boolean readerSigValid = AliroCryptoProvider.verifyReaderSignature(
-                    readerSig, credPubKeyBytes,  // using credential pub key as stand-in
-                    readerIdBytes, udEphPubX, readerEphPubX, transactionId);
+            // Verify reader signature against the reader's public key from LOAD CERT (tag 0x85).
+            // Per §8.3.3.4.5 the credential SHALL verify the reader signature and execute the
+            // failure process if it fails. We log but stay permissive for now so that readers
+            // without a provisioned CA key still complete the transaction.
+            boolean readerSigValid = false;
+            if (readerStaticPubKey != null)
+            {
+                readerSigValid = AliroCryptoProvider.verifyReaderSignature(
+                        readerSig, readerStaticPubKey,
+                        readerIdBytes, udEphPubX, readerEphPubX, transactionId);
+            }
+            else
+            {
+                Log.w(TAG, "AUTH1: no reader public key available for signature verification");
+            }
             Log.d(TAG, "Reader signature valid: " + readerSigValid);
 
             // Derive session keys.
@@ -423,10 +478,12 @@ public class Aliro_HostApduService extends HostApduService
             Log.d(TAG, "AUTH1: using readerPubKeyX from " +
                     (readerStaticPubKeyX != null ? "LOAD CERT" : "eph key fallback"));
 
+            // Derive 96 bytes: ExpeditedSKReader[0..31], ExpeditedSKDevice[32..63],
+            // StepUpSKReader[64..79], StepUpSKDevice[80..95] per Aliro §8.3.1.13
             byte[] keybuf = AliroCryptoProvider.deriveKeys(
                     udEphKP.getPrivate(),
                     readerEphPubBytes,
-                    64,
+                    96,
                     selectedProtocol,
                     hkdfReaderPubKeyX,
                     readerIdBytes,
@@ -443,8 +500,9 @@ public class Aliro_HostApduService extends HostApduService
                 Log.e(TAG, "AUTH1: key derivation failed");
                 return SW_ERROR;
             }
-            skReader = Arrays.copyOfRange(keybuf, 0, 32);
-            skDevice = Arrays.copyOfRange(keybuf, 32, 64);
+            skReader  = Arrays.copyOfRange(keybuf, 0,  32);  // ExpeditedSKReader
+            skDevice  = Arrays.copyOfRange(keybuf, 32, 64);  // ExpeditedSKDevice
+            stepUpSK  = Arrays.copyOfRange(keybuf, 64, 96);  // StepUpSK (for ENVELOPE)
 
             // Compute credential signature
             byte[] credSig = AliroCryptoProvider.computeCredentialSignature(
@@ -455,15 +513,37 @@ public class Aliro_HostApduService extends HostApduService
                 return SW_ERROR;
             }
 
-            // Build AUTH1 response plaintext: 5A 41 <cred pub key 65> 9E 40 <sig 64>
-            byte[] plaintext = new byte[2 + 65 + 2 + 64];
+            // Build signaling_bitmap (tag 0x5E, 2 bytes big-endian) per Table 8-11.
+            // Bit0 = 1: Access Document available → reader SHALL send ENVELOPE.
+            // Bit2 = 1: Step-Up AID SELECT required before ENVELOPE (NFC only).
+            // For Android-to-Android NFC the AID session is already open so Bit2 is
+            // not set — only Bit0 is needed to gate the Step-Up ENVELOPE flow.
+            byte[] storedDoc = AliroAccessDocument.getDocumentBytes(this);
+            boolean hasAccessDoc = (storedDoc != null && storedDoc.length > 0);
+            int signalingBits = hasAccessDoc ? 0x0001 : 0x0000;
+            Log.d(TAG, "AUTH1: signaling_bitmap=0x" + String.format("%04X", signalingBits)
+                    + " (hasAccessDoc=" + hasAccessDoc + ")");
+
+            // Build AUTH1 response plaintext:
+            //   5A 41 <cred pub key 65>      — credential public key  (Table 8-10)
+            //   9E 40 <cred sig 64>           — credential signature   (Table 8-10)
+            //   5E 02 <bitmap_hi> <bitmap_lo> — signaling_bitmap       (Table 8-11, MANDATORY)
+            // Per Table 8-11, signaling_bitmap (0x5E) is MANDATORY and SHALL always be present,
+            // even when all bits are zero. Omitting it would be a spec violation.
+            int plaintextLen = 2 + 65 + 2 + 64 + 4; // always includes 5E 02 bitmap
+            byte[] plaintext = new byte[plaintextLen];
             plaintext[0] = 0x5A; plaintext[1] = 0x41;
             System.arraycopy(credPubKeyBytes, 0, plaintext, 2, 65);
             plaintext[67] = (byte)0x9E; plaintext[68] = 0x40;
             System.arraycopy(credSig, 0, plaintext, 69, 64);
+            plaintext[133] = 0x5E;
+            plaintext[134] = 0x02;
+            plaintext[135] = (byte)((signalingBits >> 8) & 0xFF); // bitmap high byte
+            plaintext[136] = (byte)(signalingBits & 0xFF);         // bitmap low byte
 
-            // Encrypt AUTH1 response with SKDevice using device_counter IV
-            byte[] encrypted = AliroCryptoProvider.encryptDeviceGcm(skDevice, plaintext);
+            // Encrypt AUTH1 response plaintext with SKDevice, device_counter=1 (§8.3.1.6).
+            // device_counter starts at 1 and is consumed here; EXCHANGE responses start at 2.
+            byte[] encrypted = AliroCryptoProvider.encryptDeviceGcm(skDevice, plaintext, deviceCounter++);
             if (encrypted == null)
             {
                 Log.e(TAG, "AUTH1: encryption failed");
@@ -477,7 +557,8 @@ public class Aliro_HostApduService extends HostApduService
             System.arraycopy(encrypted, 0, response, 0, encrypted.length);
             response[encrypted.length]     = (byte)0x90;
             response[encrypted.length + 1] = 0x00;
-            Log.d(TAG, "AUTH1 response length: " + response.length);
+            Log.d(TAG, "AUTH1 response length: " + response.length
+                    + " (signaling_bitmap=0x" + String.format("%04X", signalingBits) + ")");
             return response;
         }
         catch (Exception e)
@@ -493,7 +574,10 @@ public class Aliro_HostApduService extends HostApduService
 
     private byte[] handleExchange(byte[] apdu)
     {
-        if (state != State.AUTH1_DONE)
+        // Per §8.3.3.5: multiple consecutive EXCHANGE commands are valid within
+        // a transaction (mailbox atomic sessions, multiple reads/writes, etc.).
+        // Accept from AUTH1_DONE or EXCHANGE_DONE.
+        if (state != State.AUTH1_DONE && state != State.EXCHANGE_DONE)
         {
             Log.w(TAG, "EXCHANGE in wrong state: " + state);
             return SW_CONDITIONS;
@@ -506,11 +590,12 @@ public class Aliro_HostApduService extends HostApduService
             if (dataOffset < 0 || dataLen < 16) return SW_ERROR;
 
             byte[] encryptedPayload = Arrays.copyOfRange(apdu, dataOffset, dataOffset + dataLen);
-            byte[] decrypted = AliroCryptoProvider.decryptReaderGcm(skReader, encryptedPayload);
+            // Decrypt using the current reader_counter, then increment per §8.3.1.9.
+            byte[] decrypted = AliroCryptoProvider.decryptReaderGcm(skReader, encryptedPayload, readerCounter++);
 
             if (decrypted == null)
             {
-                Log.e(TAG, "EXCHANGE: decryption failed");
+                Log.e(TAG, "EXCHANGE: decryption failed (readerCounter was " + (readerCounter - 1) + ")");
                 return SW_ERROR;
             }
             Log.d(TAG, "EXCHANGE decrypted: " + Hex.toHexString(decrypted));
@@ -530,19 +615,35 @@ public class Aliro_HostApduService extends HostApduService
 
             Log.d(TAG, "Aliro transaction complete, access granted: " + accessGranted);
 
+            // ----------------------------------------------------------------
+            // Process mailbox operations from the decrypted EXCHANGE payload
+            // Tags: 0x8C (atomic session), 0x87 (read), 0x8A (write), 0x95 (set)
+            // Per Aliro §8.3.3.5, Table 8-16
+            // ----------------------------------------------------------------
+            byte[] mailboxReadData = processMailboxTags(decrypted);
+
             // Broadcast result to the UI
             Intent intent = new Intent("com.psia.pkoc.ALIRO_CREDENTIAL_SENT");
             intent.setPackage(getPackageName());
             intent.putExtra("accessGranted", accessGranted);
             sendBroadcast(intent);
 
+            state = State.EXCHANGE_DONE;
+
             // EXCHANGE response: per §8.3.3.5.5, SHALL return encrypted 0x0002||0x00||0x00
-            // indicating successful execution, encrypted with SKDevice.
-            byte[] successPayload = new byte[]{ 0x00, 0x02, 0x00, 0x00 };
-            byte[] encryptedResponse = AliroCryptoProvider.encryptDeviceGcm(skDevice, successPayload);
+            // plus any mailbox read data, all encrypted with SKDevice.
+            // Build: [mailboxReadData (if any)] || 0x00 0x02 0x00 0x00
+            byte[] successSuffix   = new byte[]{ 0x00, 0x02, 0x00, 0x00 };
+            int readLen            = (mailboxReadData != null) ? mailboxReadData.length : 0;
+            byte[] plaintext       = new byte[readLen + successSuffix.length];
+            if (readLen > 0) System.arraycopy(mailboxReadData, 0, plaintext, 0, readLen);
+            System.arraycopy(successSuffix, 0, plaintext, readLen, successSuffix.length);
+
+            // Encrypt response using the current device_counter, then increment per §8.3.1.6.
+            byte[] encryptedResponse = AliroCryptoProvider.encryptDeviceGcm(skDevice, plaintext, deviceCounter++);
             if (encryptedResponse == null)
             {
-                Log.e(TAG, "EXCHANGE: response encryption failed");
+                Log.e(TAG, "EXCHANGE: response encryption failed (deviceCounter was " + (deviceCounter - 1) + ")");
                 return SW_ERROR;
             }
             byte[] response = new byte[encryptedResponse.length + 2];
@@ -555,6 +656,503 @@ public class Aliro_HostApduService extends HostApduService
         {
             Log.e(TAG, "EXCHANGE error", e);
             return SW_ERROR;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Mailbox tag processing (called from handleExchange)
+    // Tags per Table 8-16:
+    //   0x8C 01 <options>   — atomic session: bit0=1 start, bit0=0 stop
+    //   0x87 04 <off_hi><off_lo><len_hi><len_lo>  — read
+    //   0x8A var <off_hi><off_lo><data...>         — write
+    //   0x95 05 <off_hi><off_lo><len_hi><len_lo><value> — set (fill)
+    // Returns: concatenated data for any read requests, or null if none.
+    // -------------------------------------------------------------------------
+
+    private byte[] processMailboxTags(byte[] decrypted)
+    {
+        if (decrypted == null || decrypted.length < 2) return null;
+
+        byte[] mailbox    = loadMailbox();
+        boolean didWrite  = false;
+        java.io.ByteArrayOutputStream readOutput = new java.io.ByteArrayOutputStream();
+
+        int i = 0;
+        while (i < decrypted.length - 1)
+        {
+            int tag = decrypted[i] & 0xFF;
+            int len = decrypted[i + 1] & 0xFF;
+            int valOff = i + 2;
+            if (valOff + len > decrypted.length) break;
+
+            switch (tag)
+            {
+                case 0x8C: // Atomic session control
+                    if (len == 1)
+                    {
+                        boolean start = (decrypted[valOff] & 0x01) == 1;
+                        if (start && !mailboxAtomicActive)
+                        {
+                            mailboxAtomicActive  = true;
+                            mailboxPendingWrites = (mailbox != null)
+                                    ? Arrays.copyOf(mailbox, mailbox.length)
+                                    : new byte[0];
+                            Log.d(TAG, "Mailbox: atomic session START");
+                        }
+                        else if (!start && mailboxAtomicActive)
+                        {
+                            // Commit pending writes
+                            if (mailboxPendingWrites != null)
+                            {
+                                saveMailbox(mailboxPendingWrites);
+                                mailbox = mailboxPendingWrites;
+                                didWrite = true;
+                            }
+                            mailboxAtomicActive  = false;
+                            mailboxPendingWrites = null;
+                            Log.d(TAG, "Mailbox: atomic session STOP — committed");
+                        }
+                    }
+                    break;
+
+                case 0x87: // Read: offset(2) || length(2)
+                    if (len == 4)
+                    {
+                        int offset  = ((decrypted[valOff]     & 0xFF) << 8)
+                                     | (decrypted[valOff + 1] & 0xFF);
+                        int readLen = ((decrypted[valOff + 2] & 0xFF) << 8)
+                                     | (decrypted[valOff + 3] & 0xFF);
+                        byte[] src  = mailboxAtomicActive ? mailboxPendingWrites : mailbox;
+                        if (src != null && offset + readLen <= src.length)
+                        {
+                            readOutput.write(src, offset, readLen);
+                            Log.d(TAG, "Mailbox: read offset=" + offset + " len=" + readLen);
+                        }
+                        else
+                        {
+                            Log.w(TAG, "Mailbox: read out of bounds offset=" + offset
+                                    + " len=" + readLen
+                                    + " mailboxSize=" + (src != null ? src.length : 0));
+                        }
+                    }
+                    break;
+
+                case 0x8A: // Write: offset(2) || data(var)
+                    if (len >= 2)
+                    {
+                        int offset    = ((decrypted[valOff]     & 0xFF) << 8)
+                                       | (decrypted[valOff + 1] & 0xFF);
+                        int dataLen   = len - 2;
+                        byte[] target = mailboxAtomicActive
+                                ? mailboxPendingWrites
+                                : (mailbox != null ? mailbox : new byte[0]);
+                        int needed    = offset + dataLen;
+                        if (needed > MAILBOX_MAX_SIZE)
+                        {
+                            Log.w(TAG, "Mailbox: write exceeds max size, ignoring");
+                            break;
+                        }
+                        if (needed > target.length)
+                        {
+                            target = Arrays.copyOf(target, needed);
+                        }
+                        System.arraycopy(decrypted, valOff + 2, target, offset, dataLen);
+                        if (mailboxAtomicActive)
+                        {
+                            mailboxPendingWrites = target;
+                        }
+                        else
+                        {
+                            mailbox  = target;
+                            didWrite = true;
+                        }
+                        Log.d(TAG, "Mailbox: write offset=" + offset + " len=" + dataLen);
+                    }
+                    break;
+
+                case 0x95: // Set: offset(2) || length(2) || value(1)
+                    if (len == 5)
+                    {
+                        int offset  = ((decrypted[valOff]     & 0xFF) << 8)
+                                     | (decrypted[valOff + 1] & 0xFF);
+                        int setLen  = ((decrypted[valOff + 2] & 0xFF) << 8)
+                                     | (decrypted[valOff + 3] & 0xFF);
+                        byte value  =   decrypted[valOff + 4];
+                        byte[] target = mailboxAtomicActive
+                                ? mailboxPendingWrites
+                                : (mailbox != null ? mailbox : new byte[0]);
+                        int needed  = offset + setLen;
+                        if (needed > MAILBOX_MAX_SIZE)
+                        {
+                            Log.w(TAG, "Mailbox: set exceeds max size, ignoring");
+                            break;
+                        }
+                        if (needed > target.length)
+                        {
+                            target = Arrays.copyOf(target, needed);
+                        }
+                        Arrays.fill(target, offset, offset + setLen, value);
+                        if (mailboxAtomicActive)
+                        {
+                            mailboxPendingWrites = target;
+                        }
+                        else
+                        {
+                            mailbox  = target;
+                            didWrite = true;
+                        }
+                        Log.d(TAG, "Mailbox: set offset=" + offset
+                                + " len=" + setLen
+                                + " value=" + String.format("%02X", value & 0xFF));
+                    }
+                    break;
+
+                default:
+                    // Unknown tag — skip per spec
+                    break;
+            }
+
+            i = valOff + len; // advance to next TLV
+        }
+
+        // Persist changes if non-atomic writes occurred
+        if (didWrite && mailbox != null) saveMailbox(mailbox);
+
+        byte[] result = readOutput.toByteArray();
+        return (result.length > 0) ? result : null;
+    }
+
+    // -------------------------------------------------------------------------
+    // Mailbox persistence helpers
+    // -------------------------------------------------------------------------
+
+    private byte[] loadMailbox()
+    {
+        try
+        {
+            SharedPreferences prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+            String encoded = prefs.getString(PREF_MAILBOX_KEY, null);
+            if (encoded == null) return new byte[0];
+            return Base64.decode(encoded, Base64.DEFAULT);
+        }
+        catch (Exception e)
+        {
+            Log.e(TAG, "loadMailbox failed", e);
+            return new byte[0];
+        }
+    }
+
+    private void saveMailbox(byte[] data)
+    {
+        try
+        {
+            SharedPreferences prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+            prefs.edit()
+                 .putString(PREF_MAILBOX_KEY, Base64.encodeToString(data, Base64.DEFAULT))
+                 .apply();
+            Log.d(TAG, "Mailbox: saved " + data.length + " bytes");
+        }
+        catch (Exception e)
+        {
+            Log.e(TAG, "saveMailbox failed", e);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // ENVELOPE (INS C3) — Step-Up phase: accumulates DeviceRequest chunks
+    // CLA 0x90 = chained (more data follows), CLA 0x80 = last block
+    // Per Aliro §8.4 + ISO 18013-5 ENVELOPE command
+    // -------------------------------------------------------------------------
+
+    private byte[] handleEnvelope(byte[] apdu)
+    {
+        // ENVELOPE is valid after EXCHANGE_DONE or in subsequent ENVELOPE chains
+        if (state != State.EXCHANGE_DONE && envelopeBuffer == null)
+        {
+            Log.w(TAG, "ENVELOPE in wrong state: " + state);
+            return SW_CONDITIONS;
+        }
+        if (stepUpSK == null)
+        {
+            Log.e(TAG, "ENVELOPE: stepUpSK not available (AUTH1 not completed)");
+            return SW_CONDITIONS;
+        }
+
+        try
+        {
+            byte cla     = apdu[0];
+            boolean last = (cla & 0x10) == 0; // CLA 0x90 = chain, 0x80 = last
+
+            int dataOffset = getDataOffset(apdu);
+            int dataLen    = getDataLength(apdu);
+            if (dataOffset < 0 || dataLen <= 0) return SW_WRONG_LENGTH;
+
+            // Accumulate chunks
+            if (envelopeBuffer == null)
+            {
+                envelopeBuffer = Arrays.copyOfRange(apdu, dataOffset, dataOffset + dataLen);
+            }
+            else
+            {
+                byte[] combined = new byte[envelopeBuffer.length + dataLen];
+                System.arraycopy(envelopeBuffer, 0, combined, 0, envelopeBuffer.length);
+                System.arraycopy(apdu, dataOffset, combined, envelopeBuffer.length, dataLen);
+                envelopeBuffer = combined;
+            }
+
+            if (!last)
+            {
+                // More chunks coming — acknowledge with SW 9000, no data
+                Log.d(TAG, "ENVELOPE: received chunk (" + dataLen + " bytes), waiting for more");
+                return SW_OK;
+            }
+
+            // Last chunk received — envelopeBuffer contains the raw SessionData CBOR.
+            Log.d(TAG, "ENVELOPE: complete SessionData (" + envelopeBuffer.length + " bytes)");
+            byte[] sessionDataIn = envelopeBuffer;
+            envelopeBuffer = null;
+
+            // Per Aliro §8.4.3 + ISO 18013-5 §9.1.1.4/9.1.1.5:
+            // ENVELOPE carries SessionData CBOR: { "data": bstr(encrypted DeviceRequest) }
+            // Decrypt with StepUpSKDevice session keys derived from stepUpSK.
+            //
+            // Step 1: Derive step-up session keys from stepUpSK
+            //   SKDevice = HKDF(IKM=stepUpSK, salt=empty, info="SKDevice") [0..31]
+            //   SKReader = HKDF(IKM=stepUpSK, salt=empty, info="SKReader") [32..63]
+            byte[] stepUpSessionKeys = com.psia.pkoc.core.AliroCryptoProvider
+                    .deriveStepUpSessionKeys(stepUpSK);
+            if (stepUpSessionKeys == null)
+            {
+                Log.e(TAG, "ENVELOPE: step-up session key derivation failed");
+                return SW_ERROR;
+            }
+            byte[] suSKDevice = Arrays.copyOfRange(stepUpSessionKeys, 0,  32); // credential encrypts response
+            byte[] suSKReader = Arrays.copyOfRange(stepUpSessionKeys, 32, 64); // credential decrypts request
+
+            try
+            {
+                // Step 2: Unwrap SessionData and decrypt DeviceRequest
+                //   Reader encrypted with SKReader, IV=0x00000000_00000000_00000001
+                CBORObject sdIn  = CBORObject.DecodeFromBytes(sessionDataIn);
+                CBORObject dataIn = sdIn.get(CBORObject.FromObject("data"));
+                if (dataIn == null)
+                {
+                    Log.e(TAG, "ENVELOPE: SessionData missing 'data' field");
+                    return SW_ERROR;
+                }
+                byte[] encryptedRequest = dataIn.GetByteString();
+                // Decrypt with suSKReader (reader→credential, same IV as §8.3.1.9)
+                byte[] deviceRequest = com.psia.pkoc.core.AliroCryptoProvider
+                        .decryptReaderGcm(suSKReader, encryptedRequest);
+                if (deviceRequest == null)
+                {
+                    Log.e(TAG, "ENVELOPE: DeviceRequest AES-GCM authentication failed");
+                    return SW_ERROR;
+                }
+                Log.d(TAG, "ENVELOPE: DeviceRequest (" + deviceRequest.length + " bytes)");
+
+                // Step 3: Build DeviceResponse from stored Access Document
+                byte[] deviceResponse = buildDeviceResponse(deviceRequest);
+                if (deviceResponse == null)
+                {
+                    Log.e(TAG, "ENVELOPE: failed to build DeviceResponse");
+                    return SW_ERROR;
+                }
+
+                // Step 4: Encrypt DeviceResponse with suSKDevice and wrap in SessionData
+                //   Device encrypts with SKDevice, IV=0x00000000_00000001_00000001
+                byte[] encryptedResponse = com.psia.pkoc.core.AliroCryptoProvider
+                        .encryptDeviceGcm(suSKDevice, deviceResponse);
+                if (encryptedResponse == null)
+                {
+                    Log.e(TAG, "ENVELOPE: DeviceResponse encryption failed");
+                    return SW_ERROR;
+                }
+                CBORObject sdOut = CBORObject.NewOrderedMap();
+                sdOut.Add(CBORObject.FromObject("data"),
+                        CBORObject.FromObject(encryptedResponse));
+                byte[] sessionDataOut = sdOut.EncodeToBytes();
+                Log.d(TAG, "ENVELOPE: SessionData response (" + sessionDataOut.length + " bytes)");
+
+                // Step 5: Prepare chunked GET RESPONSE
+                pendingGetResponse    = sessionDataOut;
+                pendingGetResponseOff = 0;
+                return nextGetResponseChunk();
+            }
+            finally
+            {
+                Arrays.fill(suSKDevice, (byte)0);
+                Arrays.fill(suSKReader, (byte)0);
+                Arrays.fill(stepUpSessionKeys, (byte)0);
+            }
+        }
+        catch (Exception e)
+        {
+            Log.e(TAG, "ENVELOPE error", e);
+            envelopeBuffer = null;
+            return SW_ERROR;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // GET RESPONSE (INS C0) — returns next chunk of pending ENVELOPE response
+    // -------------------------------------------------------------------------
+
+    private byte[] handleGetResponse(byte[] apdu)
+    {
+        if (pendingGetResponse == null || pendingGetResponseOff >= pendingGetResponse.length)
+        {
+            Log.w(TAG, "GET RESPONSE: no pending data");
+            return SW_ERROR;
+        }
+        return nextGetResponseChunk();
+    }
+
+    /**
+     * Returns the next chunk of pendingGetResponse.
+     * If more data remains after this chunk, returns SW 61 xx (xx = bytes remaining, max 0xFF).
+     * If this is the last chunk, returns SW 9000.
+     */
+    private byte[] nextGetResponseChunk()
+    {
+        int remaining = pendingGetResponse.length - pendingGetResponseOff;
+        int chunkLen  = Math.min(remaining, GET_RESPONSE_CHUNK);
+        int leftAfter = remaining - chunkLen;
+
+        byte[] chunk  = new byte[chunkLen + 2];
+        System.arraycopy(pendingGetResponse, pendingGetResponseOff, chunk, 0, chunkLen);
+        pendingGetResponseOff += chunkLen;
+
+        if (leftAfter > 0)
+        {
+            // SW 61 xx: more data available
+            chunk[chunkLen]     = 0x61;
+            chunk[chunkLen + 1] = (byte) Math.min(leftAfter, 0xFF);
+            Log.d(TAG, "GET RESPONSE: sent " + chunkLen + " bytes, " + leftAfter + " remaining");
+        }
+        else
+        {
+            // Last chunk
+            chunk[chunkLen]     = (byte)0x90;
+            chunk[chunkLen + 1] = 0x00;
+            pendingGetResponse    = null;
+            pendingGetResponseOff = 0;
+            Log.d(TAG, "GET RESPONSE: sent final " + chunkLen + " bytes");
+        }
+        return chunk;
+    }
+
+    /**
+     * Build the DeviceResponse for a received DeviceRequest.
+     *
+     * Per Aliro §8.4.2 / ISO 18013-5:
+     *   - Parse the incoming DeviceRequest CBOR to extract the requested namespace
+     *     and element identifiers.
+     *   - Load the stored Access Document from AliroAccessDocument.
+     *   - If the requested element identifier matches the stored document's element
+     *     identifier, return the stored DeviceResponse bytes unchanged (it is already
+     *     a fully-formed DeviceResponse from generateTestDocument / importDocument).
+     *   - If no document is provisioned, or the element doesn't match, return an
+     *     empty DeviceResponse: { "1": "1.0", "3": 0 }.
+     *
+     * DeviceRequest CBOR structure (Table 8-21 key values):
+     *   map {
+     *     "1": "1.0"        (version)
+     *     "2": [            (docRequests — array)
+     *       map {
+     *         "1": map {    (itemsRequest)
+     *           "1": map {        (nameSpaces  — key "1" per Table 8-21)
+     *             "aliro-a": map { <elementId>: false, ... }
+     *           }
+     *           "5": "aliro-a"   (docType — key "5" per Table 8-21)
+     *         }
+     *       }
+     *     ]
+     *   }
+     * All map keys are CBOR text strings matching the abbreviated keys from Table 8-21.
+     */
+    private byte[] buildDeviceResponse(byte[] deviceRequest)
+    {
+        // Minimal empty DeviceResponse: { "1": "1.0", "3": 0 }
+        final byte[] EMPTY_RESPONSE = new byte[] {
+            (byte)0xA2,
+            0x61, 0x31,
+            0x63, 0x31, 0x2E, 0x30,
+            0x61, 0x33,
+            0x00
+        };
+
+        try
+        {
+            // ---- 1. Load stored Access Document ----
+            byte[] storedDoc = AliroAccessDocument.getDocumentBytes(this);
+            if (storedDoc == null || storedDoc.length == 0)
+            {
+                Log.d(TAG, "buildDeviceResponse: no Access Document provisioned — returning empty DeviceResponse");
+                return EMPTY_RESPONSE;
+            }
+            String storedElementId = AliroAccessDocument.getElementIdentifier(this);
+            Log.d(TAG, "buildDeviceResponse: stored element=" + storedElementId
+                    + ", doc bytes=" + storedDoc.length);
+
+            // ---- 2. Parse DeviceRequest CBOR to extract requested element identifiers ----
+            // We look for any element identifier in namespace "aliro-a".
+            // If the request cannot be parsed we fall back to returning the full doc
+            // (lenient behaviour — the reader presumably asked for our element).
+            boolean elementRequested = false;
+            try
+            {
+                CBORObject req = CBORObject.DecodeFromBytes(deviceRequest);
+                // key "2" → docRequests array
+                CBORObject docRequests = req.get(CBORObject.FromObject("2"));
+                if (docRequests != null && docRequests.getType() == com.upokecenter.cbor.CBORType.Array)
+                {
+                    for (int i = 0; i < docRequests.size(); i++)
+                    {
+                        CBORObject docReq = docRequests.get(i);
+                        // key "1" → itemsRequest map
+                        CBORObject itemsReq = docReq.get(CBORObject.FromObject("1"));
+                        if (itemsReq == null) continue;
+                        // key "1" → nameSpaces map (Table 8-21: nameSpaces = key "1")
+                        CBORObject nameSpaces = itemsReq.get(CBORObject.FromObject("1"));
+                        if (nameSpaces == null) continue;
+                        // look for namespace "aliro-a"
+                        CBORObject nsMap = nameSpaces.get(CBORObject.FromObject("aliro-a"));
+                        if (nsMap == null) continue;
+                        // iterate element identifiers in the namespace map
+                        for (CBORObject key : nsMap.getKeys())
+                        {
+                            String requestedId = key.AsString();
+                            Log.d(TAG, "buildDeviceResponse: reader requests element=" + requestedId);
+                            if (requestedId.equals(storedElementId))
+                            {
+                                elementRequested = true;
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception parseEx)
+            {
+                // DeviceRequest couldn't be parsed — treat as "all elements requested"
+                Log.w(TAG, "buildDeviceResponse: could not parse DeviceRequest, returning full doc", parseEx);
+                elementRequested = true;
+            }
+
+            if (!elementRequested)
+            {
+                Log.d(TAG, "buildDeviceResponse: requested element not in stored doc — returning empty DeviceResponse");
+                return EMPTY_RESPONSE;
+            }
+
+            // ---- 3. Return stored DeviceResponse (already fully formed CBOR) ----
+            Log.d(TAG, "buildDeviceResponse: returning stored DeviceResponse (" + storedDoc.length + " bytes)");
+            return storedDoc;
+        }
+        catch (Exception e)
+        {
+            Log.e(TAG, "buildDeviceResponse failed", e);
+            return EMPTY_RESPONSE;
         }
     }
 
@@ -689,9 +1287,21 @@ public class Aliro_HostApduService extends HostApduService
         selectedProtocol  = null;
         auth0Flag            = null;
         readerStaticPubKeyX  = null;
+        readerStaticPubKey   = null;
         // Zero session keys before nulling per section 8.3.3.1
-        if (skReader != null) { java.util.Arrays.fill(skReader, (byte)0); skReader = null; }
-        if (skDevice != null) { java.util.Arrays.fill(skDevice, (byte)0); skDevice = null; }
+        if (skReader  != null) { java.util.Arrays.fill(skReader,  (byte)0); skReader  = null; }
+        if (skDevice  != null) { java.util.Arrays.fill(skDevice,  (byte)0); skDevice  = null; }
+        if (stepUpSK  != null) { java.util.Arrays.fill(stepUpSK,  (byte)0); stepUpSK  = null; }
+        // Reset per-message counters
+        readerCounter = 1; // first EXCHANGE command uses 1
+        deviceCounter = 1; // AUTH1 response uses 1, EXCHANGE responses start at 2
+        // Reset mailbox atomic session state
+        mailboxAtomicActive  = false;
+        mailboxPendingWrites = null;
+        // Reset ENVELOPE / GET RESPONSE state
+        envelopeBuffer        = null;
+        pendingGetResponse    = null;
+        pendingGetResponseOff = 0;
     }
 
     private static byte[] toBytes32(java.math.BigInteger n)

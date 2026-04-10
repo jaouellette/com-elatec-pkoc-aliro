@@ -181,10 +181,13 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
         @Override
         public void onReceive(android.content.Context context, Intent intent)
         {
-            boolean granted = intent.getBooleanExtra(AliroBleReaderService.EXTRA_ACCESS_GRANTED, false);
-            boolean sigValid = intent.getBooleanExtra(AliroBleReaderService.EXTRA_SIG_VALID, false);
-            String credPubKeyHex = intent.getStringExtra(AliroBleReaderService.EXTRA_CREDENTIAL_PUB_KEY);
-            Log.d(TAG, "Aliro BLE result: granted=" + granted + " sigValid=" + sigValid);
+            boolean granted       = intent.getBooleanExtra(AliroBleReaderService.EXTRA_ACCESS_GRANTED, false);
+            boolean sigValid      = intent.getBooleanExtra(AliroBleReaderService.EXTRA_SIG_VALID, false);
+            String credPubKeyHex  = intent.getStringExtra(AliroBleReaderService.EXTRA_CREDENTIAL_PUB_KEY);
+            byte[] deviceResponse = intent.getByteArrayExtra(AliroBleReaderService.EXTRA_DEVICE_RESPONSE);
+            String stepUpElemId   = intent.getStringExtra(AliroBleReaderService.EXTRA_STEP_UP_ELEMENT_ID);
+            Log.d(TAG, "Aliro BLE result: granted=" + granted + " sigValid=" + sigValid
+                    + " stepUp=" + (deviceResponse != null ? deviceResponse.length + "B" : "none"));
             requireActivity().runOnUiThread(() ->
             {
                 if (!isAdded()) return;
@@ -193,12 +196,24 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                     // Stop accepting new connections while result is displayed
                     if (aliroBleService != null) aliroBleService.stopAliroBle();
 
-                    // Show the credential result screen — same as Aliro NFC
-                    readerImageView.setVisibility(View.GONE);
-                    keypadLayout.setVisibility(View.GONE);
+                    // Build connection type string — same format as Aliro NFC path
                     String connectionType = sigValid
                             ? "Aliro BLE — Signature Valid"
                             : "Aliro BLE — Signature INVALID";
+
+                    // Append step-up result if an Access Document was retrieved
+                    if (deviceResponse != null)
+                    {
+                        String stepUpResult = parseBleStepUpResult(deviceResponse, stepUpElemId);
+                        if (stepUpResult != null)
+                            connectionType += "\nStep-Up: " + stepUpResult;
+                        else
+                            connectionType += "\nStep-Up: Access Document received";
+                    }
+
+                    // Show the credential result screen — same as Aliro NFC
+                    readerImageView.setVisibility(View.GONE);
+                    keypadLayout.setVisibility(View.GONE);
                     displayPublicKeyInfo(credPubKeyHex, connectionType);
 
                     ToneGenerator toneGen = new ToneGenerator(AudioManager.STREAM_RING, 100);
@@ -1948,6 +1963,7 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
             // HKDF reader_group_identifier_key.x = reader's own static public key X
             // per section 8.3.1.13. Derived from the configured reader private key.
             // The credential extracts the same value from tag 0x85 in LOAD CERT.
+            // These MUST match — if not, AUTH1 decryption will fail with GCM tag mismatch.
             byte[] hkdfReaderPubKeyX = readerPubKeyX;
 
             // ------------------------------------------------------------------
@@ -2007,6 +2023,7 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
             // AUTH0 — before LOAD CERT — so AUTH1 is ready to fire with no delay.
             // keybuf[0..31]  = ExpeditedSKReader (encrypt EXCHANGE)
             // keybuf[32..63] = ExpeditedSKDevice (decrypt AUTH1 response)
+            // keybuf[64..95] = StepUpSK (for ENVELOPE session encryption)
             // ------------------------------------------------------------------
             byte[] readerSig = AliroCryptoProvider.computeReaderSignature(
                     readerPrivKey, readerIdBytes, udEphPubX, readerEphPubX, transactionId);
@@ -2024,7 +2041,7 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
             byte[] keybuf = AliroCryptoProvider.deriveKeys(
                     readerEphKP.getPrivate(),
                     udEphPub,
-                    64,
+                    96,
                     protocolVersion,
                     hkdfReaderPubKeyX,
                     readerIdBytes,
@@ -2041,8 +2058,9 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                 showAliroError("Key derivation failed.");
                 return;
             }
-            byte[] skReader = Arrays.copyOfRange(keybuf, 0, 32);
-            byte[] skDevice = Arrays.copyOfRange(keybuf, 32, 64);
+            byte[] skReader  = Arrays.copyOfRange(keybuf, 0,  32);
+            byte[] skDevice  = Arrays.copyOfRange(keybuf, 32, 64);
+            byte[] stepUpSK  = Arrays.copyOfRange(keybuf, 64, 96);
 
             // ------------------------------------------------------------------
             // LOAD CERT (optional) — sent after crypto is pre-computed so AUTH1
@@ -2087,11 +2105,21 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
             }
 
             // ------------------------------------------------------------------
-            // Decrypt AUTH1 response with SKDevice
+            // Per-message GCM counters (§8.3.1.6 / §8.3.1.8).
+            // device_counter: credential response counter, starts at 1 (AUTH1 uses 1).
+            // reader_counter: reader command counter, starts at 1 (first EXCHANGE uses 1).
+            // Both increment by 1 per message. Declared here so they are in scope
+            // for the EXCHANGE block below and any future multi-EXCHANGE extensions.
+            // ------------------------------------------------------------------
+            int deviceCounter = 1; // AUTH1 response was encrypted with device_counter=1
+            int readerCounter = 1; // First EXCHANGE command will use reader_counter=1
+
+            // ------------------------------------------------------------------
+            // Decrypt AUTH1 response with SKDevice, device_counter=1 (§8.3.1.7)
             // Encrypted payload = auth1Response minus final 2 SW bytes
             // ------------------------------------------------------------------
             byte[] encryptedPayload = Arrays.copyOfRange(auth1Response, 0, auth1Response.length - 2);
-            byte[] decrypted = AliroCryptoProvider.decryptDeviceGcm(skDevice, encryptedPayload);
+            byte[] decrypted = AliroCryptoProvider.decryptDeviceGcm(skDevice, encryptedPayload, deviceCounter++);
             if (decrypted == null)
             {
                 showAliroError("AUTH1 decryption failed.");
@@ -2128,8 +2156,9 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
             //   success=01, status=82 = "unknown/not available" (simulator doesn't
             //   have real access control, so we always grant and report unknown state)
             // ------------------------------------------------------------------
+            // Encrypt EXCHANGE command using reader_counter=1 (§8.3.1.8), then increment.
             byte[] exchangePayload = new byte[]{ (byte)0x97, 0x02, sigValid ? (byte)0x01 : 0x00, (byte)0x82 };
-            byte[] encryptedExchange = AliroCryptoProvider.encryptReaderGcm(skReader, exchangePayload);
+            byte[] encryptedExchange = AliroCryptoProvider.encryptReaderGcm(skReader, exchangePayload, readerCounter++);
             if (encryptedExchange == null)
             {
                 showAliroError("EXCHANGE encryption failed.");
@@ -2140,12 +2169,12 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
             byte[] exchangeResponse = isoDep.transceive(exchangeCmd);
             Log.d(TAG, "EXCHANGE response: " + Hex.toHexString(exchangeResponse));
 
-            // Decrypt and verify EXCHANGE response per §8.3.3.5.6
-            // Response should be encrypted 0x0002||0x00||0x00 (success)
+            // Decrypt and verify EXCHANGE response per §8.3.3.5.6.
+            // Decrypt using device_counter=2 (counter=1 was consumed by AUTH1), then increment.
             if (isSW9000(exchangeResponse) && exchangeResponse.length > 2)
             {
                 byte[] exchangeEncPayload = Arrays.copyOfRange(exchangeResponse, 0, exchangeResponse.length - 2);
-                byte[] exchangeDecrypted  = AliroCryptoProvider.decryptDeviceGcm(skDevice, exchangeEncPayload);
+                byte[] exchangeDecrypted  = AliroCryptoProvider.decryptDeviceGcm(skDevice, exchangeEncPayload, deviceCounter++);
                 if (exchangeDecrypted != null)
                 {
                     Log.d(TAG, "EXCHANGE response decrypted: " + Hex.toHexString(exchangeDecrypted));
@@ -2160,18 +2189,92 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
             }
 
             // ------------------------------------------------------------------
+            // Parse signaling_bitmap from decrypted AUTH1 payload
+            // Per Aliro §8.3.3.4.2 Table 8-11: tag 0x5E, 2 bytes big-endian, mandatory.
+            //   Bit0: Access Document available (gate Step-Up entirely)
+            //   Bit2: Step-up AID SELECT required before ENVELOPE (NFC only, §10.2)
+            // ------------------------------------------------------------------
+            int signalingBitmap = 0x0000;
+            for (int si = 0; si < decrypted.length - 3; si++)
+            {
+                if ((decrypted[si] & 0xFF) == 0x5E && (decrypted[si + 1] & 0xFF) == 0x02)
+                {
+                    signalingBitmap = ((decrypted[si + 2] & 0xFF) << 8) | (decrypted[si + 3] & 0xFF);
+                    Log.d(TAG, "AUTH1: signaling_bitmap=0x" + String.format("%04X", signalingBitmap));
+                    break;
+                }
+            }
+            boolean accessDocAvailable   = (signalingBitmap & 0x0001) != 0; // Bit0
+            boolean stepupSelectRequired = (signalingBitmap & 0x0004) != 0; // Bit2 (NFC only)
+
+            // ------------------------------------------------------------------
+            // Step-Up phase (optional) — send ENVELOPE with DeviceRequest if
+            // a Step-Up element identifier is configured AND Bit0 signals doc available.
+            // Per Aliro §8.4 + §10.2 + ISO 18013-5 §9.1.1.4/9.1.1.5.
+            // ------------------------------------------------------------------
+            String stepUpResult = null;
+            SharedPreferences stepUpPrefs = requireActivity().getPreferences(Context.MODE_PRIVATE);
+            String stepUpElementId = stepUpPrefs.getString(AliroPreferences.STEP_UP_ELEMENT_ID, "");
+            if (!stepUpElementId.isEmpty() && !accessDocAvailable)
+            {
+                Log.d(TAG, "Step-Up: skipped — signaling_bitmap Bit0 not set (no Access Document)");
+            }
+            if (!stepUpElementId.isEmpty() && accessDocAvailable)
+            {
+                // If Bit2 set: send step-up AID SELECT before ENVELOPE (§10.2, Table 10-3)
+                // Step-up AID: A000000909ACCE5502
+                if (stepupSelectRequired)
+                {
+                    Log.d(TAG, "Step-Up: sending step-up AID SELECT (signaling_bitmap Bit2)");
+                    byte[] stepUpSelectApdu = new byte[]{
+                        0x00, (byte)0xA4, 0x04, 0x00,
+                        0x09,
+                        (byte)0xA0, 0x00, 0x00, 0x09, 0x09, (byte)0xAC, (byte)0xCE, 0x55, 0x02,
+                        0x00
+                    };
+                    byte[] selectResp = isoDep.transceive(stepUpSelectApdu);
+                    if (selectResp == null || selectResp.length < 2
+                            || selectResp[selectResp.length - 2] != (byte)0x90
+                            || selectResp[selectResp.length - 1] != 0x00)
+                    {
+                        Log.w(TAG, "Step-Up: AID SELECT failed — skipping Step-Up");
+                        stepUpElementId = ""; // skip ENVELOPE
+                    }
+                    else
+                    {
+                        Log.d(TAG, "Step-Up: AID SELECT OK");
+                    }
+                }
+            }
+            if (!stepUpElementId.isEmpty() && accessDocAvailable)
+            {
+                Log.d(TAG, "Step-Up: requesting element '" + stepUpElementId + "'");
+                try
+                {
+                    stepUpResult = runAliroStepUp(isoDep, stepUpSK, stepUpElementId, stepUpPrefs);
+                }
+                catch (Exception e)
+                {
+                    Log.w(TAG, "Step-Up failed (non-fatal): " + e.getMessage());
+                    stepUpResult = "Step-Up failed: " + e.getMessage();
+                }
+            }
+
+            // ------------------------------------------------------------------
             // Destroy all session-bound keys per section 10.2 and 8.3.3.1
             // ------------------------------------------------------------------
-            java.util.Arrays.fill(skReader, (byte)0);
-            java.util.Arrays.fill(skDevice, (byte)0);
-            java.util.Arrays.fill(keybuf, (byte)0);
+            java.util.Arrays.fill(skReader,  (byte)0);
+            java.util.Arrays.fill(skDevice,  (byte)0);
+            java.util.Arrays.fill(stepUpSK,  (byte)0);
+            java.util.Arrays.fill(keybuf,    (byte)0);
             Log.d(TAG, "Aliro session keys destroyed");
 
             // ------------------------------------------------------------------
             // Show result on UI
             // ------------------------------------------------------------------
-            final boolean finalSigValid = sigValid;
-            final byte[] finalCredPubKey = credentialPubKey;
+            final boolean finalSigValid    = sigValid;
+            final byte[]  finalCredPubKey  = credentialPubKey;
+            final String  finalStepUpResult = stepUpResult;
             requireActivity().runOnUiThread(() ->
             {
                 readerImageView.setVisibility(View.GONE);
@@ -2181,6 +2284,8 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                 String connectionType = finalSigValid
                         ? "Aliro — Signature Valid"
                         : "Aliro — Signature INVALID";
+                if (finalStepUpResult != null)
+                    connectionType += "\nStep-Up: " + finalStepUpResult;
                 displayPublicKeyInfo(pk, connectionType);
 
                 ToneGenerator toneGen = new ToneGenerator(AudioManager.STREAM_RING, 100);
@@ -2439,6 +2544,412 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
     }
 
     /** Show a toast error for Aliro failures */
+    // -------------------------------------------------------------------------
+    // Aliro Step-Up phase — ENVELOPE/GET RESPONSE + DeviceResponse processing
+    // Per Aliro §8.4: transfers Access Document from credential to reader.
+    // Returns a short summary string for display, or null if nothing useful returned.
+    // -------------------------------------------------------------------------
+
+    @SuppressWarnings("NewApi")
+    private String runAliroStepUp(android.nfc.tech.IsoDep isoDep,
+                                   byte[] stepUpSK,
+                                   String elementId,
+                                   SharedPreferences prefs)
+            throws java.io.IOException
+    {
+        // 1. Derive session keys per §8.4.3 / ISO 18013-5 §9.1.1.5
+        //    SKDevice[0..31], SKReader[32..63]
+        byte[] sessionKeys = AliroCryptoProvider.deriveStepUpSessionKeys(stepUpSK);
+        if (sessionKeys == null)
+        {
+            Log.e(TAG, "Step-Up: session key derivation failed");
+            return null;
+        }
+        byte[] suSKDevice = Arrays.copyOfRange(sessionKeys, 0,  32);
+        byte[] suSKReader = Arrays.copyOfRange(sessionKeys, 32, 64);
+
+        try
+        {
+            // 2. Build DeviceRequest CBOR per Aliro §8.4.2 + Table 8-21
+            //
+            // Per ISO 18013-5 §8.3.2.1.2.1 (referenced by Aliro §8.4.2):
+            // itemsRequest is an INLINE embedded CBOR map — NOT a bstr wrapper.
+            // Table 8-21 key mapping (integers encoded as text strings):
+            //   "1" = nameSpaces, "5" = docType
+            //
+            // Structure:
+            // { "1": "1.0",
+            //   "2": [ { "1": { "5": "aliro-a",
+            //                   "1": { "aliro-a": { <elementId>: false } } } } ] }
+            com.upokecenter.cbor.CBORObject nameSpaceMap = com.upokecenter.cbor.CBORObject.NewOrderedMap();
+            com.upokecenter.cbor.CBORObject elemMap      = com.upokecenter.cbor.CBORObject.NewOrderedMap();
+            // intentToRetain = false per ISO 18013-5 §8.3.2.1.2.1
+            elemMap.Add(com.upokecenter.cbor.CBORObject.FromObject(elementId),
+                        com.upokecenter.cbor.CBORObject.False);
+            nameSpaceMap.Add(com.upokecenter.cbor.CBORObject.FromObject("aliro-a"), elemMap);
+
+            // itemsRequest is an inline map (NOT bstr-wrapped) per ISO 18013-5
+            com.upokecenter.cbor.CBORObject itemsRequest = com.upokecenter.cbor.CBORObject.NewOrderedMap();
+            itemsRequest.Add(com.upokecenter.cbor.CBORObject.FromObject("5"),
+                    com.upokecenter.cbor.CBORObject.FromObject("aliro-a")); // docType
+            itemsRequest.Add(com.upokecenter.cbor.CBORObject.FromObject("1"), nameSpaceMap); // nameSpaces
+
+            com.upokecenter.cbor.CBORObject docRequest = com.upokecenter.cbor.CBORObject.NewOrderedMap();
+            // key "1" = itemsRequest (inline map, not bstr)
+            docRequest.Add(com.upokecenter.cbor.CBORObject.FromObject("1"), itemsRequest);
+
+            com.upokecenter.cbor.CBORObject deviceRequest = com.upokecenter.cbor.CBORObject.NewOrderedMap();
+            deviceRequest.Add(com.upokecenter.cbor.CBORObject.FromObject("1"),
+                    com.upokecenter.cbor.CBORObject.FromObject("1.0"));
+            com.upokecenter.cbor.CBORObject docRequests = com.upokecenter.cbor.CBORObject.NewArray();
+            docRequests.Add(docRequest);
+            deviceRequest.Add(com.upokecenter.cbor.CBORObject.FromObject("2"), docRequests);
+
+            byte[] deviceRequestBytes = deviceRequest.EncodeToBytes();
+            Log.d(TAG, "Step-Up: DeviceRequest CBOR (" + deviceRequestBytes.length + " bytes)");
+
+            // 3. Encrypt DeviceRequest into SessionData per Aliro §8.4.3 + ISO 18013-5 §9.1.1.4
+            //
+            // Per §8.4.3 the reader encrypts with StepUpSKReader using the same AES-GCM
+            // procedure as §8.3.1.8 (reader command encryption):
+            //   IV = 0x0000000000000000 || reader_counter (counter=1, big-endian 4 bytes)
+            //
+            // SessionData CBOR: { "data": bstr(ciphertext+tag) }
+            byte[] encryptedRequest = AliroCryptoProvider.encryptReaderGcm(suSKReader, deviceRequestBytes);
+            if (encryptedRequest == null)
+            {
+                Log.e(TAG, "Step-Up: failed to encrypt DeviceRequest");
+                return null;
+            }
+
+            // Build SessionData CBOR: { "data": bstr }
+            com.upokecenter.cbor.CBORObject sessionDataOut = com.upokecenter.cbor.CBORObject.NewOrderedMap();
+            sessionDataOut.Add(com.upokecenter.cbor.CBORObject.FromObject("data"),
+                    com.upokecenter.cbor.CBORObject.FromObject(encryptedRequest));
+            byte[] sessionDataBytes = sessionDataOut.EncodeToBytes();
+            Log.d(TAG, "Step-Up: SessionData ENVELOPE payload (" + sessionDataBytes.length + " bytes)");
+
+            // 4. Send ENVELOPE (CLA=0x80, INS=0xC3) containing encrypted SessionData
+            byte[] envelopeCmd = buildEnvelopeCommand(sessionDataBytes);
+            Log.d(TAG, "Step-Up: sending ENVELOPE");
+            byte[] envelopeResp = isoDep.transceive(envelopeCmd);
+
+            // 5. Collect full response, handling GET RESPONSE (SW 61 xx)
+            java.io.ByteArrayOutputStream responseAcc = new java.io.ByteArrayOutputStream();
+            byte[] currentResp = envelopeResp;
+            while (currentResp != null && currentResp.length >= 2)
+            {
+                byte sw1 = currentResp[currentResp.length - 2];
+                byte sw2 = currentResp[currentResp.length - 1];
+                if (currentResp.length > 2)
+                    responseAcc.write(currentResp, 0, currentResp.length - 2);
+
+                if (sw1 == 0x61)
+                {
+                    byte[] getResp = new byte[]{ 0x00, (byte)0xC0, 0x00, 0x00, sw2 };
+                    currentResp = isoDep.transceive(getResp);
+                }
+                else if (sw1 == (byte)0x90 && sw2 == 0x00)
+                {
+                    break;
+                }
+                else
+                {
+                    Log.w(TAG, "Step-Up: unexpected SW " + String.format("%02X%02X", sw1, sw2));
+                    return "SW=" + String.format("%02X%02X", sw1, sw2);
+                }
+            }
+
+            byte[] rawResponse = responseAcc.toByteArray();
+            Log.d(TAG, "Step-Up: raw SessionData response (" + rawResponse.length + " bytes): "
+                    + org.bouncycastle.util.encoders.Hex.toHexString(rawResponse));
+
+            if (rawResponse.length == 0)
+            {
+                Log.d(TAG, "Step-Up: empty response");
+                return null;
+            }
+
+            // 6. Unwrap SessionData response and decrypt with StepUpSKDevice
+            //    per Aliro §8.4.3 + ISO 18013-5 §9.1.1.5
+            //    Device encrypts with IV = 0x0000000000000001 || device_counter (counter=1)
+            com.upokecenter.cbor.CBORObject sessionDataIn =
+                    com.upokecenter.cbor.CBORObject.DecodeFromBytes(rawResponse);
+            com.upokecenter.cbor.CBORObject dataField =
+                    sessionDataIn.get(com.upokecenter.cbor.CBORObject.FromObject("data"));
+            if (dataField == null)
+            {
+                Log.e(TAG, "Step-Up: SessionData response missing 'data' field");
+                return null;
+            }
+            byte[] encryptedResponse = dataField.GetByteString();
+            byte[] deviceResponseBytes = AliroCryptoProvider.decryptDeviceGcm(suSKDevice, encryptedResponse);
+            if (deviceResponseBytes == null)
+            {
+                Log.e(TAG, "Step-Up: DeviceResponse AES-GCM authentication failed");
+                return null;
+            }
+            Log.d(TAG, "Step-Up: DeviceResponse (" + deviceResponseBytes.length + " bytes): "
+                    + org.bouncycastle.util.encoders.Hex.toHexString(deviceResponseBytes));
+
+            // 7. Parse DeviceResponse CBOR per Aliro Table 8-22
+            com.upokecenter.cbor.CBORObject deviceResponse =
+                    com.upokecenter.cbor.CBORObject.DecodeFromBytes(deviceResponseBytes);
+
+            com.upokecenter.cbor.CBORObject docs = deviceResponse.get(
+                    com.upokecenter.cbor.CBORObject.FromObject("2"));
+            if (docs == null || docs.size() == 0)
+            {
+                Log.d(TAG, "Step-Up: no documents in DeviceResponse");
+                return null;
+            }
+
+            // 6. Extract first document's IssuerAuth + IssuerSignedItems
+            com.upokecenter.cbor.CBORObject firstDoc   = docs.get(0);
+            com.upokecenter.cbor.CBORObject iSigned    = firstDoc.get(
+                    com.upokecenter.cbor.CBORObject.FromObject("1"));
+            com.upokecenter.cbor.CBORObject iAuth      = iSigned.get(
+                    com.upokecenter.cbor.CBORObject.FromObject("2"));
+            com.upokecenter.cbor.CBORObject nameSpaces = iSigned.get(
+                    com.upokecenter.cbor.CBORObject.FromObject("1"));
+
+            // 7. Verify COSE_Sign1 signature if issuer pub key is configured
+            boolean docVerified = false;
+            String issuerKeyHex = prefs.getString(AliroPreferences.STEP_UP_ISSUER_PUB_KEY, "");
+            if (!issuerKeyHex.isEmpty() && iAuth != null)
+            {
+                docVerified = verifyCoseSign1(iAuth, issuerKeyHex);
+                Log.d(TAG, "Step-Up: COSE_Sign1 verification = " + docVerified);
+            }
+            else
+            {
+                Log.d(TAG, "Step-Up: no issuer key configured, skipping signature verification");
+            }
+
+            // 8. Extract AccessData element value for display
+            String accessSummary = extractAccessDataSummary(nameSpaces, elementId);
+
+            String result = (issuerKeyHex.isEmpty() ? "(sig not verified)" :
+                    (docVerified ? "Signature Valid" : "Signature INVALID"));
+            if (accessSummary != null) result += " | " + accessSummary;
+            return result;
+        }
+        finally
+        {
+            // Zero session keys
+            java.util.Arrays.fill(suSKDevice, (byte)0);
+            java.util.Arrays.fill(suSKReader, (byte)0);
+            java.util.Arrays.fill(sessionKeys, (byte)0);
+        }
+    }
+
+    /** Build ENVELOPE command (single chunk — data must be ≤ 255 bytes) */
+    /**
+     * Parse a decrypted DeviceResponse (received over BLE ENVELOPE) and return a
+     * human-readable step-up result string matching the NFC path format.
+     * Returns null if parsing fails (caller falls back to generic message).
+     */
+    private String parseBleStepUpResult(byte[] deviceResponseBytes, String elementId)
+    {
+        try
+        {
+            SharedPreferences prefs = requireActivity().getPreferences(Context.MODE_PRIVATE);
+            String issuerKeyHex = prefs.getString(AliroPreferences.STEP_UP_ISSUER_PUB_KEY, "");
+
+            com.upokecenter.cbor.CBORObject deviceResponse =
+                    com.upokecenter.cbor.CBORObject.DecodeFromBytes(deviceResponseBytes);
+
+            // Key "2" = documents array (Aliro Table 8-22)
+            com.upokecenter.cbor.CBORObject docs = deviceResponse.get(
+                    com.upokecenter.cbor.CBORObject.FromObject("2"));
+            if (docs == null || docs.size() == 0)
+            {
+                Log.d(TAG, "BLE Step-Up: no documents in DeviceResponse");
+                return null;
+            }
+
+            com.upokecenter.cbor.CBORObject firstDoc = docs.get(0);
+            com.upokecenter.cbor.CBORObject iSigned  = firstDoc.get(
+                    com.upokecenter.cbor.CBORObject.FromObject("1"));
+            if (iSigned == null) return null;
+
+            com.upokecenter.cbor.CBORObject iAuth      = iSigned.get(
+                    com.upokecenter.cbor.CBORObject.FromObject("2"));
+            com.upokecenter.cbor.CBORObject nameSpaces = iSigned.get(
+                    com.upokecenter.cbor.CBORObject.FromObject("1"));
+
+            // Verify COSE_Sign1 if issuer key configured
+            boolean docVerified = false;
+            if (!issuerKeyHex.isEmpty() && iAuth != null)
+            {
+                docVerified = verifyCoseSign1(iAuth, issuerKeyHex);
+                Log.d(TAG, "BLE Step-Up: COSE_Sign1 verification = " + docVerified);
+            }
+            else
+            {
+                Log.d(TAG, "BLE Step-Up: no issuer key configured, skipping sig verification");
+            }
+
+            String accessSummary = extractAccessDataSummary(nameSpaces, elementId);
+
+            String result = (issuerKeyHex.isEmpty() ? "(sig not verified)"
+                    : (docVerified ? "Signature Valid" : "Signature INVALID"));
+            if (accessSummary != null) result += " | " + accessSummary;
+            return result;
+        }
+        catch (Exception e)
+        {
+            Log.w(TAG, "parseBleStepUpResult failed: " + e.getMessage());
+            return null;
+        }
+    }
+
+        private static byte[] buildEnvelopeCommand(byte[] data)
+    {
+        // CLA=80 INS=C3 P1=00 P2=00 Lc=<len> <data>
+        byte[] cmd = new byte[5 + data.length];
+        cmd[0] = (byte)0x80;
+        cmd[1] = (byte)0xC3;
+        cmd[2] = 0x00;
+        cmd[3] = 0x00;
+        cmd[4] = (byte) data.length;
+        System.arraycopy(data, 0, cmd, 5, data.length);
+        return cmd;
+    }
+
+    /**
+     * Verify COSE_Sign1 over the IssuerAuth using the configured issuer public key.
+     * IssuerAuth = [ protected_header_bytes, unprotected_header, payload_bytes, signature ]
+     */
+    private boolean verifyCoseSign1(com.upokecenter.cbor.CBORObject coseSign1, String issuerKeyHex)
+    {
+        try
+        {
+            // Extract components
+            byte[] protectedHeaderBytes = coseSign1.get(0).GetByteString();
+            byte[] payloadBytes         = coseSign1.get(2).GetByteString();
+            byte[] rawSig               = coseSign1.get(3).GetByteString();
+
+            // Build Sig_Structure: ["Signature1", protected, external_aad="", payload]
+            com.upokecenter.cbor.CBORObject sigStruct = com.upokecenter.cbor.CBORObject.NewArray();
+            sigStruct.Add(com.upokecenter.cbor.CBORObject.FromObject("Signature1"));
+            sigStruct.Add(com.upokecenter.cbor.CBORObject.FromObject(protectedHeaderBytes));
+            sigStruct.Add(com.upokecenter.cbor.CBORObject.FromObject(new byte[0]));
+            sigStruct.Add(com.upokecenter.cbor.CBORObject.FromObject(payloadBytes));
+            byte[] toBeSigned = sigStruct.EncodeToBytes();
+
+            // Decode issuer public key — use standard JCA (no explicit provider, Android resolves EC natively)
+            byte[] issuerPubBytes = org.bouncycastle.util.encoders.Hex.decode(issuerKeyHex);
+            java.security.spec.ECPoint point = new java.security.spec.ECPoint(
+                    new java.math.BigInteger(1, Arrays.copyOfRange(issuerPubBytes, 1, 33)),
+                    new java.math.BigInteger(1, Arrays.copyOfRange(issuerPubBytes, 33, 65)));
+            java.security.AlgorithmParameters ap =
+                    java.security.AlgorithmParameters.getInstance("EC");
+            ap.init(new java.security.spec.ECGenParameterSpec("secp256r1"));
+            java.security.spec.ECParameterSpec ecParams =
+                    ap.getParameterSpec(java.security.spec.ECParameterSpec.class);
+            java.security.spec.ECPublicKeySpec pubSpec =
+                    new java.security.spec.ECPublicKeySpec(point, ecParams);
+            java.security.PublicKey issuerPubKey =
+                    java.security.KeyFactory.getInstance("EC").generatePublic(pubSpec);
+
+            // Convert raw R||S to DER
+            byte[] r = Arrays.copyOfRange(rawSig, 0, 32);
+            byte[] s = Arrays.copyOfRange(rawSig, 32, 64);
+            byte[] derSig = rawToDer(r, s);
+
+            java.security.Signature verifier = java.security.Signature.getInstance("SHA256withECDSA");
+            verifier.initVerify(issuerPubKey);
+            verifier.update(toBeSigned);
+            return verifier.verify(derSig);
+        }
+        catch (Exception e)
+        {
+            Log.e(TAG, "verifyCoseSign1 failed", e);
+            return false;
+        }
+    }
+
+    /** Convert raw 32-byte R + 32-byte S to DER-encoded ECDSA signature */
+    private static byte[] rawToDer(byte[] r, byte[] s)
+    {
+        // Strip leading zeros, add 0x00 padding if high bit set
+        byte[] rPad = padIfNeeded(r);
+        byte[] sPad = padIfNeeded(s);
+        int len = 2 + rPad.length + 2 + sPad.length;
+        byte[] der = new byte[2 + len];
+        int i = 0;
+        der[i++] = 0x30;
+        der[i++] = (byte) len;
+        der[i++] = 0x02;
+        der[i++] = (byte) rPad.length;
+        System.arraycopy(rPad, 0, der, i, rPad.length); i += rPad.length;
+        der[i++] = 0x02;
+        der[i++] = (byte) sPad.length;
+        System.arraycopy(sPad, 0, der, i, sPad.length);
+        return der;
+    }
+
+    private static byte[] padIfNeeded(byte[] b)
+    {
+        // Remove leading zeros
+        int start = 0;
+        while (start < b.length - 1 && b[start] == 0) start++;
+        byte[] trimmed = Arrays.copyOfRange(b, start, b.length);
+        // Pad with 0x00 if high bit set (DER positive integer requirement)
+        if ((trimmed[0] & 0x80) != 0)
+        {
+            byte[] padded = new byte[trimmed.length + 1];
+            System.arraycopy(trimmed, 0, padded, 1, trimmed.length);
+            return padded;
+        }
+        return trimmed;
+    }
+
+    /**
+     * Extract a human-readable summary from the AccessData element in the DeviceResponse.
+     * Looks for the requested elementId in namespace "aliro-a".
+     */
+    private String extractAccessDataSummary(com.upokecenter.cbor.CBORObject nameSpaces,
+                                             String elementId)
+    {
+        try
+        {
+            if (nameSpaces == null) return null;
+            com.upokecenter.cbor.CBORObject items = nameSpaces.get(
+                    com.upokecenter.cbor.CBORObject.FromObject("aliro-a"));
+            if (items == null || items.size() == 0) return null;
+
+            for (int i = 0; i < items.size(); i++)
+            {
+                // Each item is a bstr containing an IssuerSignedItem CBOR map
+                byte[] itemBytes = items.get(i).GetByteString();
+                com.upokecenter.cbor.CBORObject item =
+                        com.upokecenter.cbor.CBORObject.DecodeFromBytes(itemBytes);
+                com.upokecenter.cbor.CBORObject eid =
+                        item.get(com.upokecenter.cbor.CBORObject.FromObject("3"));
+                if (eid != null && elementId.equals(eid.AsString()))
+                {
+                    com.upokecenter.cbor.CBORObject val =
+                            item.get(com.upokecenter.cbor.CBORObject.FromObject("4"));
+                    if (val != null)
+                    {
+                        // AccessData map: key "0" = version
+                        com.upokecenter.cbor.CBORObject version =
+                                val.get(com.upokecenter.cbor.CBORObject.FromObject(0));
+                        return "element='" + elementId + "' version="
+                                + (version != null ? version.AsInt32() : "?");
+                    }
+                }
+            }
+        }
+        catch (Exception e)
+        {
+            Log.w(TAG, "extractAccessDataSummary failed: " + e.getMessage());
+        }
+        return null;
+    }
+
     private void showAliroCredentialRejectDialog(String sw)
     {
         Log.e(TAG, "Aliro AUTH1 rejected by credential: SW=" + sw);

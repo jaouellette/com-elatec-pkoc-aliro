@@ -131,6 +131,82 @@
             android:maxLines="4"
             android:layout_marginBottom="32dp" />
 
+        <!-- Step-Up divider -->
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:background="@color/colorTextSecondary"
+            android:layout_marginBottom="16dp"
+            android:layout_marginTop="8dp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Step-Up Configuration (optional)"
+            android:textSize="15sp"
+            android:textStyle="bold"
+            android:textColor="@color/colorTextPrimary"
+            android:layout_marginBottom="8dp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Configure the Step-Up flow to request Access Document data elements from the credential after authentication."
+            android:textSize="13sp"
+            android:textColor="@color/colorTextSecondary"
+            android:layout_marginBottom="16dp" />
+
+        <!-- Step-Up Element Identifier -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Step-Up Element Identifier"
+            android:textSize="14sp"
+            android:textStyle="bold"
+            android:textColor="@color/colorTextPrimary"
+            android:layout_marginBottom="4dp" />
+
+        <EditText
+            android:id="@+id/editStepUpElementId"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="e.g. access"
+            android:inputType="textNoSuggestions"
+            android:fontFamily="monospace"
+            android:textSize="13sp"
+            android:maxLines="1"
+            android:layout_marginBottom="20dp" />
+
+        <!-- Step-Up Issuer Public Key -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Step-Up Issuer Public Key (65 bytes / 130 hex chars)"
+            android:textSize="14sp"
+            android:textStyle="bold"
+            android:textColor="@color/colorTextPrimary"
+            android:layout_marginBottom="4dp" />
+
+        <EditText
+            android:id="@+id/editStepUpIssuerPubKey"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="04... (leave blank to skip COSE_Sign1 verification)"
+            android:inputType="textNoSuggestions"
+            android:fontFamily="monospace"
+            android:textSize="13sp"
+            android:maxLines="3"
+            android:layout_marginBottom="32dp" />
+
+        <Button
+            android:id="@+id/btnScanIssuerKeyQr"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Scan QR Code"
+            android:backgroundTint="@color/colorPrimaryDark"
+            android:textColor="@android:color/white"
+            android:layout_marginBottom="32dp" />
+
         <!-- Save button -->
         <Button
             android:id="@+id/btnSaveAliroConfig"

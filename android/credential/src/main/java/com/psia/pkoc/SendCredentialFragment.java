@@ -123,9 +123,14 @@ public class SendCredentialFragment extends Fragment
                         binding.btnAliroBle.setText("Aliro BLE");
                         binding.btnAliroBle.setOnClickListener(v -> startAliroBle());
                     }
-                    // Clear the list so stale Aliro entries don't linger
+                    // Clear the entire list (Aliro + any stale PKOC entries) and
+                    // restart PKOC scan if AutoDiscover is on, so the user starts fresh
+                    if (_IsScanning) setIsScanning(false);
                     if (mBTArrayAdapter != null) { mBTArrayAdapter.clear(); mBTArrayAdapter.notifyDataSetChanged(); }
                     aliroDeviceAddresses.clear();
+                    android.content.SharedPreferences prefs2 = requireActivity().getPreferences(android.content.Context.MODE_PRIVATE);
+                    if (prefs2.getBoolean(PKOC_Preferences.AutoDiscoverDevices, false) && isAdded())
+                        setIsScanning(true);
                 }, 3000);
             });
         }
@@ -276,10 +281,17 @@ public class SendCredentialFragment extends Fragment
                 return;
         }
 
-        if (value && IsConnecting)
+        if (value)
         {
-            connectedGatt.disconnect();
+            // Starting a new scan — tear down any stale GATT connection and reset state
+            // so the new scan starts clean (mirrors Aliro BLE connectToDevice guard)
             IsConnecting = false;
+            if (connectedGatt != null)
+            {
+                try { connectedGatt.disconnect(); connectedGatt.close(); }
+                catch (Exception ignored) {}
+                connectedGatt = null;
+            }
         }
 
         if (_IsScanning)
@@ -650,18 +662,24 @@ public class SendCredentialFragment extends Fragment
                 }
                 binding.statusText.setVisibility(View.VISIBLE);
 
-                // Restore list after 3 seconds
+                // Restore list after 3 seconds — clear list first, then restart scan if AutoDiscover
+                // (mirrors Aliro BLE behaviour: list is always empty when buttons reappear)
                 binding.readerIcon.postDelayed(() ->
                 {
                     if (!isAdded()) return;
                     binding.readerIcon.setImageResource(R.drawable.ic_reader_idle);
                     binding.statusText.setVisibility(View.INVISIBLE);
+
+                    // Stop scanning and wipe the list before making it visible
+                    if (_IsScanning) setIsScanning(false);
+                    if (mBTArrayAdapter != null) { mBTArrayAdapter.clear(); mBTArrayAdapter.notifyDataSetChanged(); }
+
                     restoreButtonUI();
 
                     SharedPreferences sharedPref2 = requireActivity().getPreferences(Context.MODE_PRIVATE);
                     boolean AutoDiscover = sharedPref2.getBoolean(PKOC_Preferences.AutoDiscoverDevices, false);
                     if (AutoDiscover && isAdded())
-                        setIsScanning(true);
+                        setIsScanning(true);  // setIsScanning(true) also clears the adapter before scanning
                 }, 3000);
 
                 if (msg.what == ReaderUnlockStatus.Unrecognized.ordinal())
@@ -840,6 +858,13 @@ public class SendCredentialFragment extends Fragment
                 {
                     NavController navController = Navigation.findNavController(requireActivity(), R.id.nav_host_fragment_content_main);
                     navController.navigate(R.id.action_sendCredentialFragment_to_scanReaderQrFragment);
+                    return true;
+                }
+
+                if (menuItem.getItemId() == R.id.action_aliro_config)
+                {
+                    NavController navController = Navigation.findNavController(requireActivity(), R.id.nav_host_fragment_content_main);
+                    navController.navigate(R.id.action_sendCredentialFragment_to_credentialAliroConfigFragment);
                     return true;
                 }
 

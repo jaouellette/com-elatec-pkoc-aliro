@@ -24,5 +24,19 @@ public class AliroPreferences
      */
     public static final String READER_CERTIFICATE = "aliro_reader_certificate";
 
+    /**
+     * DataElementIdentifier to request in the Step-Up phase DeviceRequest.
+     * e.g. "access", "administrator", "floor1".
+     * Empty string means Step-Up is disabled.
+     */
+    public static final String STEP_UP_ELEMENT_ID = "aliro_step_up_element_id";
+
+    /**
+     * 65-byte issuer public key (130 hex chars) for verifying the credential's
+     * Access Document COSE_Sign1 signature. Optional — if blank, signature
+     * verification is skipped (document contents still displayed).
+     */
+    public static final String STEP_UP_ISSUER_PUB_KEY = "aliro_step_up_issuer_pub_key";
+
     private AliroPreferences() {}
 }

@@ -1,0 +1,578 @@
+package com.psia.pkoc.core;
+
+import android.content.Context;
+import android.content.SharedPreferences;
+import android.util.Base64;
+import android.util.Log;
+
+import com.upokecenter.cbor.CBORObject;
+
+import org.bouncycastle.util.encoders.Hex;
+
+import java.security.KeyPair;
+import java.security.MessageDigest;
+import java.security.PrivateKey;
+import java.security.Signature;
+import java.security.interfaces.ECPublicKey;
+import java.time.Instant;
+import java.util.Arrays;
+
+/**
+ * AliroAccessDocument — CBOR Access Document builder, parser, and verifier.
+ *
+ * Implements Aliro 1.0 §7 (Access Document) and §8.4 (Step-Up phase).
+ *
+ * Supports two modes:
+ *   1. Self-generated test document — generates issuer keypair on-device, self-signs a
+ *      minimal AccessData element. Good for testing Step-Up flow without a real issuer.
+ *   2. Imported document — accepts a Base64-encoded CBOR blob from an external issuer.
+ *
+ * CBOR structure per Aliro §7.2 (ISO 18013-5 §9.1.2 with Aliro modifications):
+ *
+ * Access Document (DocType "aliro-a"):
+ *   issuerSigned:
+ *     nameSpaces ("aliro-a"):
+ *       [IssuerSignedItem, ...]
+ *     IssuerAuth:  COSE_Sign1 [ header, nil, MobileSecurityObject, signature ]
+ *       MobileSecurityObject:
+ *         "1": version ("1.0")
+ *         "2": digestAlgorithm ("SHA-256")
+ *         "3": valueDigests { "aliro-a": { digestID -> SHA-256(IssuerSignedItem) } }
+ *         "4": deviceKeyInfo { "1": COSE_Key of credential pub key }
+ *         "5": docType ("aliro-a")
+ *         "6": validityInfo { "1": signed, "2": validFrom, "3": validUntil }
+ *         "7": timeVerificationRequired (false)
+ *
+ * IssuerSignedItem (per Table 7-2):
+ *   "1": digestID (uint)
+ *   "2": random (bstr, 16 bytes)
+ *   "3": elementIdentifier (tstr)
+ *   "4": elementValue (AccessData map)
+ *
+ * AccessData (per §7.3):
+ *   0: version (uint = 1)
+ *   (other fields optional for minimal test document)
+ *
+ * Storage: stored as Base64-encoded CBOR in SharedPreferences under key "aliro_access_doc".
+ * The issuer public key (for reader-side verification) is stored separately under
+ * "aliro_access_doc_issuer_pub_key" as 65-byte uncompressed hex.
+ */
+public class AliroAccessDocument
+{
+    private static final String TAG = "AliroAccessDocument";
+
+    // SharedPreferences keys
+    public static final String PREFS_NAME         = "AliroCredentialConfig";
+    public static final String KEY_ACCESS_DOC     = "aliro_access_doc";           // Base64 CBOR
+    public static final String KEY_ISSUER_PUB_KEY = "aliro_access_doc_issuer_pub_key"; // hex
+    public static final String KEY_ELEMENT_ID     = "aliro_access_doc_element_id"; // string
+    public static final String KEY_DOC_MODE       = "aliro_access_doc_mode";      // "test" or "imported"
+    public static final String KEY_DOC_VALID_FROM = "aliro_access_doc_valid_from"; // ISO-8601
+    public static final String KEY_DOC_VALID_UNTIL= "aliro_access_doc_valid_until";// ISO-8601
+
+    // Aliro doc type and namespace constants
+    public static final String DOCTYPE_ACCESS      = "aliro-a";
+    public static final String NAMESPACE_ACCESS    = "aliro-a";
+
+    // -------------------------------------------------------------------------
+
+    // =========================================================================
+    // Public API
+    // =========================================================================
+
+    /**
+     * Generate a self-signed test Access Document.
+     *
+     * Creates a fresh P-256 issuer keypair, builds a minimal AccessData element
+     * with the given element identifier, signs it with COSE_Sign1/ES256, and
+     * stores the document in SharedPreferences.
+     *
+     * @param context          Application context
+     * @param credPubKeyBytes  65-byte uncompressed credential public key
+     * @param elementIdentifier  DataElementIdentifier (e.g. "access", "administrator", "floor1")
+     * @param validDays        Number of days the document should be valid (e.g. 365)
+     * @return Summary string for display, or null on failure
+     */
+    public static String generateTestDocument(Context context,
+                                               byte[] credPubKeyBytes,
+                                               String elementIdentifier,
+                                               int validDays)
+    {
+        try
+        {
+            // 1. Generate issuer keypair
+            // Use AliroCryptoProvider.generateEphemeralKeypair() which already handles
+            // the correct provider selection for Android.
+            KeyPair issuerKP = AliroCryptoProvider.generateEphemeralKeypair();
+            if (issuerKP == null) return null;
+            ECPublicKey issuerPub = (ECPublicKey) issuerKP.getPublic();
+            byte[] issuerPubBytes = uncompressedPoint(issuerPub);
+
+            // 2. Build AccessData CBOR per §7.3
+            //    Minimal: { 0: 1 }  (version=1, no access rules)
+            CBORObject accessData = CBORObject.NewOrderedMap();
+            accessData.Add(CBORObject.FromObject(0), CBORObject.FromObject(1)); // version=1
+
+            // 3. Build IssuerSignedItem per Table 7-2
+            byte[] random = AliroCryptoProvider.generateRandom(16);
+            int digestId = 0;
+            CBORObject issuerSignedItem = buildIssuerSignedItem(
+                    digestId, random, elementIdentifier, accessData);
+
+            // 4. Compute digest of IssuerSignedItem bstr
+            byte[] itemBytes = issuerSignedItem.EncodeToBytes();
+            byte[] digest    = sha256(itemBytes);
+
+            // 5. Build MobileSecurityObject per §7.2 + Table 7-1
+            Instant now    = Instant.now();
+            Instant until  = now.plusSeconds((long) validDays * 86400);
+            CBORObject mso  = buildMSO(credPubKeyBytes, elementIdentifier,
+                                       digestId, digest, now, until);
+
+            // 6. COSE_Sign1 over MobileSecurityObject
+            byte[] msoBytes  = mso.EncodeToBytes();
+            byte[] signature = coseSign1(issuerKP.getPrivate(), msoBytes);
+            if (signature == null) return null;
+
+            // 7. Build IssuerAuth = COSE_Sign1 array
+            CBORObject issuerAuth = buildCoseSign1(
+                    issuerPubBytes, msoBytes, signature);
+
+            // 8. Build nameSpaces map: { "aliro-a": [bstr(IssuerSignedItem)] }
+            CBORObject nameSpaces = CBORObject.NewOrderedMap();
+            CBORObject itemsArray = CBORObject.NewArray();
+            itemsArray.Add(CBORObject.FromObject(itemBytes));
+            nameSpaces.Add(CBORObject.FromObject(NAMESPACE_ACCESS), itemsArray);
+
+            // 9. Build issuerSigned: { "1": nameSpaces, "2": IssuerAuth }
+            //    Key "1" = nameSpaces, key "2" = IssuerAuth per Table 8-22
+            CBORObject issuerSigned = CBORObject.NewOrderedMap();
+            issuerSigned.Add(CBORObject.FromObject("1"), nameSpaces);
+            issuerSigned.Add(CBORObject.FromObject("2"), issuerAuth);
+
+            // 10. Build full document: { "5": docType, "1": issuerSigned }
+            CBORObject document = CBORObject.NewOrderedMap();
+            document.Add(CBORObject.FromObject("5"), CBORObject.FromObject(DOCTYPE_ACCESS));
+            document.Add(CBORObject.FromObject("1"), issuerSigned);
+
+            // 11. Wrap in DeviceResponse: { "1": "1.0", "2": [document], "3": 0 }
+            CBORObject docResponse = CBORObject.NewOrderedMap();
+            docResponse.Add(CBORObject.FromObject("1"), CBORObject.FromObject("1.0"));
+            CBORObject docs = CBORObject.NewArray();
+            docs.Add(document);
+            docResponse.Add(CBORObject.FromObject("2"), docs);
+            docResponse.Add(CBORObject.FromObject("3"), CBORObject.FromObject(0));
+
+            // 12. Store
+            byte[] cborBytes = docResponse.EncodeToBytes();
+            String b64       = Base64.encodeToString(cborBytes, Base64.DEFAULT);
+            String issuerHex = Hex.toHexString(issuerPubBytes);
+
+            SharedPreferences.Editor editor = context
+                    .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit();
+            editor.putString(KEY_ACCESS_DOC,      b64);
+            editor.putString(KEY_ISSUER_PUB_KEY,  issuerHex);
+            editor.putString(KEY_ELEMENT_ID,      elementIdentifier);
+            editor.putString(KEY_DOC_MODE,        "test");
+            editor.putString(KEY_DOC_VALID_FROM,  now.toString());
+            editor.putString(KEY_DOC_VALID_UNTIL, until.toString());
+            editor.apply();
+
+            String summary = "Test document generated.\n"
+                    + "Element: " + elementIdentifier + "\n"
+                    + "Valid until: " + until.toString().substring(0, 10) + "\n"
+                    + "Issuer key: " + issuerHex.substring(0, 16) + "...\n"
+                    + "Size: " + cborBytes.length + " bytes";
+            Log.d(TAG, "Generated test Access Document: " + cborBytes.length + " bytes");
+            return summary;
+        }
+        catch (Exception e)
+        {
+            Log.e(TAG, "generateTestDocument failed", e);
+            return null;
+        }
+    }
+
+    /**
+     * Import a pre-built Access Document from a Base64-encoded CBOR blob.
+     * Validates basic CBOR structure before storing.
+     *
+     * @param context      Application context
+     * @param base64Cbor   Base64-encoded CBOR DeviceResponse
+     * @param issuerPubHex 130-char hex of issuer public key (for reader verification)
+     * @return Summary string, or null on failure
+     */
+    public static String importDocument(Context context,
+                                         String base64Cbor,
+                                         String issuerPubHex)
+    {
+        try
+        {
+            byte[] cborBytes = Base64.decode(base64Cbor.trim(), Base64.DEFAULT);
+
+            // Basic validation: must parse as CBOR map
+            CBORObject doc = CBORObject.DecodeFromBytes(cborBytes);
+            if (doc.getType() != com.upokecenter.cbor.CBORType.Map)
+            {
+                return null;
+            }
+
+            // Extract element identifier from first IssuerSignedItem if possible
+            String elementId = extractElementId(doc);
+            String validUntil = extractValidUntil(doc);
+
+            SharedPreferences.Editor editor = context
+                    .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit();
+            editor.putString(KEY_ACCESS_DOC,      base64Cbor.trim());
+            editor.putString(KEY_ISSUER_PUB_KEY,  issuerPubHex != null ? issuerPubHex.toLowerCase().trim() : "");
+            editor.putString(KEY_ELEMENT_ID,      elementId != null ? elementId : "access");
+            editor.putString(KEY_DOC_MODE,        "imported");
+            editor.putString(KEY_DOC_VALID_FROM,  "");
+            editor.putString(KEY_DOC_VALID_UNTIL, validUntil != null ? validUntil : "");
+            editor.apply();
+
+            String summary = "Document imported.\n"
+                    + "Element: " + (elementId != null ? elementId : "(unknown)") + "\n"
+                    + "Valid until: " + (validUntil != null ? validUntil : "(unknown)") + "\n"
+                    + "Size: " + cborBytes.length + " bytes";
+            Log.d(TAG, "Imported Access Document: " + cborBytes.length + " bytes");
+            return summary;
+        }
+        catch (Exception e)
+        {
+            Log.e(TAG, "importDocument failed", e);
+            return null;
+        }
+    }
+
+    /**
+     * Clear the stored Access Document.
+     */
+    public static void clearDocument(Context context)
+    {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+               .edit()
+               .remove(KEY_ACCESS_DOC)
+               .remove(KEY_ISSUER_PUB_KEY)
+               .remove(KEY_ELEMENT_ID)
+               .remove(KEY_DOC_MODE)
+               .remove(KEY_DOC_VALID_FROM)
+               .remove(KEY_DOC_VALID_UNTIL)
+               .apply();
+        Log.d(TAG, "Access Document cleared");
+    }
+
+    /**
+     * Check whether an Access Document is currently stored.
+     */
+    public static boolean hasDocument(Context context)
+    {
+        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                      .contains(KEY_ACCESS_DOC);
+    }
+
+    /**
+     * Get the stored Access Document CBOR bytes, or null if none.
+     */
+    public static byte[] getDocumentBytes(Context context)
+    {
+        String b64 = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                            .getString(KEY_ACCESS_DOC, null);
+        if (b64 == null) return null;
+        try { return Base64.decode(b64, Base64.DEFAULT); }
+        catch (Exception e) { return null; }
+    }
+
+    /**
+     * Get the stored element identifier (DataElementIdentifier) for the DeviceRequest.
+     */
+    public static String getElementIdentifier(Context context)
+    {
+        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                      .getString(KEY_ELEMENT_ID, "access");
+    }
+
+    /**
+     * Get the stored issuer public key as 65-byte uncompressed bytes, or null if none.
+     */
+    public static byte[] getIssuerPublicKeyBytes(Context context)
+    {
+        String hex = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                            .getString(KEY_ISSUER_PUB_KEY, null);
+        if (hex == null || hex.isEmpty()) return null;
+        try { return Hex.decode(hex); }
+        catch (Exception e) { return null; }
+    }
+
+    // =========================================================================
+    // CBOR building helpers
+    // =========================================================================
+
+    /**
+     * Build IssuerSignedItem per Table 7-2:
+     *   { "1": digestID, "2": random(bstr), "3": elementIdentifier, "4": elementValue }
+     */
+    private static CBORObject buildIssuerSignedItem(int digestId, byte[] random,
+                                                     String elementIdentifier,
+                                                     CBORObject elementValue)
+    {
+        CBORObject item = CBORObject.NewOrderedMap();
+        item.Add(CBORObject.FromObject("1"), CBORObject.FromObject(digestId));
+        item.Add(CBORObject.FromObject("2"), CBORObject.FromObject(random));
+        item.Add(CBORObject.FromObject("3"), CBORObject.FromObject(elementIdentifier));
+        item.Add(CBORObject.FromObject("4"), elementValue);
+        return item;
+    }
+
+    /**
+     * Build MobileSecurityObject per §7.2 + Table 7-1.
+     * Keys are remapped integers-as-text-strings per Table 7-1.
+     */
+    private static CBORObject buildMSO(byte[] credPubKeyBytes,
+                                        String elementIdentifier,
+                                        int digestId, byte[] digest,
+                                        Instant validFrom, Instant validUntil)
+    {
+        CBORObject mso = CBORObject.NewOrderedMap();
+
+        // "1" = version
+        mso.Add(CBORObject.FromObject("1"), CBORObject.FromObject("1.0"));
+
+        // "2" = digestAlgorithm
+        mso.Add(CBORObject.FromObject("2"), CBORObject.FromObject("SHA-256"));
+
+        // "3" = valueDigests: { namespace: { digestID: digest_bytes } }
+        CBORObject digestMap = CBORObject.NewOrderedMap();
+        digestMap.Add(CBORObject.FromObject(digestId), CBORObject.FromObject(digest));
+        CBORObject valueDigests = CBORObject.NewOrderedMap();
+        valueDigests.Add(CBORObject.FromObject(NAMESPACE_ACCESS), digestMap);
+        mso.Add(CBORObject.FromObject("3"), valueDigests);
+
+        // "4" = deviceKeyInfo: { "1": COSE_Key }
+        CBORObject coseKey = buildCoseEcKey(credPubKeyBytes);
+        CBORObject deviceKeyInfo = CBORObject.NewOrderedMap();
+        deviceKeyInfo.Add(CBORObject.FromObject("1"), coseKey);
+        mso.Add(CBORObject.FromObject("4"), deviceKeyInfo);
+
+        // "5" = docType
+        mso.Add(CBORObject.FromObject("5"), CBORObject.FromObject(DOCTYPE_ACCESS));
+
+        // "6" = validityInfo: { "1": signed, "2": validFrom, "3": validUntil }
+        CBORObject validity = CBORObject.NewOrderedMap();
+        validity.Add(CBORObject.FromObject("1"),
+                CBORObject.FromObject(validFrom.toString()));
+        validity.Add(CBORObject.FromObject("2"),
+                CBORObject.FromObject(validFrom.toString()));
+        validity.Add(CBORObject.FromObject("3"),
+                CBORObject.FromObject(validUntil.toString()));
+        mso.Add(CBORObject.FromObject("6"), validity);
+
+        // "7" = timeVerificationRequired (false for test docs)
+        mso.Add(CBORObject.FromObject("7"), CBORObject.False);
+
+        return mso;
+    }
+
+    /**
+     * Build a COSE_Key for a P-256 public key per RFC 8152.
+     * kty=2 (EC2), crv=1 (P-256), x=..., y=...
+     */
+    private static CBORObject buildCoseEcKey(byte[] uncompressed65)
+    {
+        byte[] x = Arrays.copyOfRange(uncompressed65, 1, 33);
+        byte[] y = Arrays.copyOfRange(uncompressed65, 33, 65);
+        CBORObject key = CBORObject.NewOrderedMap();
+        key.Add(CBORObject.FromObject(1), CBORObject.FromObject(2));  // kty = EC2
+        key.Add(CBORObject.FromObject(-1), CBORObject.FromObject(1)); // crv = P-256
+        key.Add(CBORObject.FromObject(-2), CBORObject.FromObject(x)); // x
+        key.Add(CBORObject.FromObject(-3), CBORObject.FromObject(y)); // y
+        return key;
+    }
+
+    /**
+     * Build COSE_Sign1 array: [protected_header, unprotected_header, payload, signature]
+     * Protected header: { 1: -7 }  (alg = ES256)
+     * Unprotected header: { 4: kid }  where kid = first 8 bytes of SHA-256("key-identifier" || 0x04 || issuerPubKey)
+     */
+    private static CBORObject buildCoseSign1(byte[] issuerPubBytes,
+                                              byte[] msoBytes,
+                                              byte[] signature)
+    {
+        // Protected header: alg = -7 (ES256)
+        CBORObject protectedHeader = CBORObject.NewOrderedMap();
+        protectedHeader.Add(CBORObject.FromObject(1), CBORObject.FromObject(-7));
+        byte[] protectedBytes = protectedHeader.EncodeToBytes();
+
+        // Unprotected header: kid per §7.2.1
+        byte[] kid = computeKid(issuerPubBytes);
+        CBORObject unprotectedHeader = CBORObject.NewOrderedMap();
+        if (kid != null)
+        {
+            unprotectedHeader.Add(CBORObject.FromObject(4), CBORObject.FromObject(kid));
+        }
+
+        CBORObject coseSign1 = CBORObject.NewArray();
+        coseSign1.Add(CBORObject.FromObject(protectedBytes));
+        coseSign1.Add(unprotectedHeader);
+        coseSign1.Add(CBORObject.FromObject(msoBytes)); // payload (embedded)
+        coseSign1.Add(CBORObject.FromObject(signature));
+        return coseSign1;
+    }
+
+    /**
+     * Sign MobileSecurityObject bytes with ECDSA SHA-256 (ES256).
+     * COSE_Sign1 Sig_Structure: ["Signature1", protected_header, external_aad, payload]
+     * Returns raw 64-byte R||S signature.
+     */
+    private static byte[] coseSign1(PrivateKey issuerPrivKey, byte[] msoBytes)
+    {
+        try
+        {
+            // Build protected header bytes
+            CBORObject protectedHeader = CBORObject.NewOrderedMap();
+            protectedHeader.Add(CBORObject.FromObject(1), CBORObject.FromObject(-7));
+            byte[] protectedBytes = protectedHeader.EncodeToBytes();
+
+            // Sig_Structure = ["Signature1", bstr(protected), bstr(external_aad=""), bstr(payload)]
+            CBORObject sigStructure = CBORObject.NewArray();
+            sigStructure.Add(CBORObject.FromObject("Signature1"));
+            sigStructure.Add(CBORObject.FromObject(protectedBytes));
+            sigStructure.Add(CBORObject.FromObject(new byte[0])); // empty external_aad
+            sigStructure.Add(CBORObject.FromObject(msoBytes));
+
+            byte[] toBeSigned = sigStructure.EncodeToBytes();
+
+            // Sign with ECDSA SHA-256 — no provider specified, Android resolves correctly
+            Signature sig = Signature.getInstance("SHA256withECDSA");
+            sig.initSign(issuerPrivKey);
+            sig.update(toBeSigned);
+            byte[] derSig = sig.sign();
+
+            // Convert DER to raw 64-byte R||S
+            return derToRaw64(derSig);
+        }
+        catch (Exception e)
+        {
+            Log.e(TAG, "coseSign1 failed", e);
+            return null;
+        }
+    }
+
+    // =========================================================================
+    // Extraction helpers (for import validation + summary)
+    // =========================================================================
+
+    private static String extractElementId(CBORObject doc)
+    {
+        try
+        {
+            // doc["2"]["1"]["aliro-a"][0] → IssuerSignedItem → ["3"] = elementIdentifier
+            CBORObject docs      = doc.get(CBORObject.FromObject("2"));
+            if (docs == null || docs.size() == 0) return null;
+            CBORObject firstDoc  = docs.get(0);
+            CBORObject iSigned   = firstDoc.get(CBORObject.FromObject("1"));
+            CBORObject ns        = iSigned.get(CBORObject.FromObject("1"));
+            CBORObject items     = ns.get(CBORObject.FromObject(NAMESPACE_ACCESS));
+            if (items == null || items.size() == 0) return null;
+            byte[] itemBytes     = items.get(0).GetByteString();
+            CBORObject item      = CBORObject.DecodeFromBytes(itemBytes);
+            CBORObject eid       = item.get(CBORObject.FromObject("3"));
+            return eid != null ? eid.AsString() : null;
+        }
+        catch (Exception e) { return null; }
+    }
+
+    private static String extractValidUntil(CBORObject doc)
+    {
+        try
+        {
+            CBORObject docs     = doc.get(CBORObject.FromObject("2"));
+            if (docs == null || docs.size() == 0) return null;
+            CBORObject firstDoc = docs.get(0);
+            CBORObject iSigned  = firstDoc.get(CBORObject.FromObject("1"));
+            CBORObject iAuth    = iSigned.get(CBORObject.FromObject("2"));
+            // IssuerAuth[2] = payload (MobileSecurityObject bytes)
+            byte[] msoBytes     = iAuth.get(2).GetByteString();
+            CBORObject mso      = CBORObject.DecodeFromBytes(msoBytes);
+            CBORObject validity = mso.get(CBORObject.FromObject("6"));
+            CBORObject until    = validity.get(CBORObject.FromObject("3"));
+            return until != null ? until.AsString() : null;
+        }
+        catch (Exception e) { return null; }
+    }
+
+    // =========================================================================
+    // Crypto helpers
+    // =========================================================================
+
+    private static byte[] sha256(byte[] data) throws Exception
+    {
+        return MessageDigest.getInstance("SHA-256").digest(data);
+    }
+
+    /**
+     * Compute kid per §7.2.1:
+     * first 8 bytes of SHA-256("key-identifier" || 0x04 || IssuerKey_PubK.x || IssuerKey_PubK.y)
+     */
+    private static byte[] computeKid(byte[] issuerPubUncompressed65)
+    {
+        try
+        {
+            byte[] prefix = "key-identifier".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            byte[] input  = new byte[prefix.length + issuerPubUncompressed65.length];
+            System.arraycopy(prefix, 0, input, 0, prefix.length);
+            System.arraycopy(issuerPubUncompressed65, 0, input, prefix.length,
+                    issuerPubUncompressed65.length);
+            byte[] hash = sha256(input);
+            return Arrays.copyOfRange(hash, 0, 8);
+        }
+        catch (Exception e) { return null; }
+    }
+
+    /** Convert Java ECPublicKey to 65-byte uncompressed point */
+    private static byte[] uncompressedPoint(ECPublicKey pub)
+    {
+        byte[] x   = toBytes32(pub.getW().getAffineX());
+        byte[] y   = toBytes32(pub.getW().getAffineY());
+        byte[] out = new byte[65];
+        out[0] = 0x04;
+        System.arraycopy(x, 0, out, 1,  32);
+        System.arraycopy(y, 0, out, 33, 32);
+        return out;
+    }
+
+    private static byte[] toBytes32(java.math.BigInteger n)
+    {
+        byte[] raw = n.toByteArray();
+        byte[] out = new byte[32];
+        if (raw.length <= 32)
+            System.arraycopy(raw, 0, out, 32 - raw.length, raw.length);
+        else
+            System.arraycopy(raw, raw.length - 32, out, 0, 32);
+        return out;
+    }
+
+    /**
+     * Convert DER ECDSA signature to raw 64-byte R||S.
+     */
+    private static byte[] derToRaw64(byte[] der)
+    {
+        int rTotalLen = der[3] & 0xFF;
+        int rOff      = 4;
+        int rLen      = rTotalLen;
+        if (der[rOff] == 0x00) { rOff++; rLen--; }
+        int sStart    = 4 + rTotalLen + 2;
+        int sTotalLen = der[4 + rTotalLen + 1] & 0xFF;
+        int sOff      = sStart;
+        int sLen      = sTotalLen;
+        if (der[sOff] == 0x00) { sOff++; sLen--; }
+        byte[] out    = new byte[64];
+        int rPad = 32 - rLen;
+        if (rPad > 0) Arrays.fill(out, 0, rPad, (byte) 0);
+        System.arraycopy(der, rOff, out, rPad, rLen);
+        int sPad = 32 - sLen;
+        if (sPad > 0) Arrays.fill(out, 32, 32 + sPad, (byte) 0);
+        System.arraycopy(der, sOff, out, 32 + sPad, sLen);
+        return out;
+    }
+}

@@ -1,6 +1,8 @@
 package com.pkoc.readersimulator;
 
+import android.app.Activity;
 import android.content.Context;
+import android.content.Intent;
 import android.content.SharedPreferences;
 import android.os.Bundle;
 import android.text.TextUtils;
@@ -11,9 +13,14 @@ import android.widget.Button;
 import android.widget.EditText;
 import android.widget.TextView;
 
+import androidx.activity.result.ActivityResultLauncher;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.fragment.app.Fragment;
+
+import com.journeyapps.barcodescanner.ScanContract;
+import com.journeyapps.barcodescanner.ScanIntentResult;
+import com.journeyapps.barcodescanner.ScanOptions;
 
 /**
  * Fragment for configuring Aliro reader parameters.
@@ -26,7 +33,12 @@ public class AliroConfigFragment extends Fragment
     private EditText editReaderId;
     private EditText editReaderIssuerPublicKey;
     private EditText editReaderCertificate;
+    private EditText editStepUpElementId;
+    private EditText editStepUpIssuerPubKey;
     private TextView txtStatus;
+
+    private final ActivityResultLauncher<ScanOptions> qrScanLauncher =
+            registerForActivityResult(new ScanContract(), this::onQrScanResult);
 
     @Nullable
     @Override
@@ -46,12 +58,16 @@ public class AliroConfigFragment extends Fragment
         editReaderId            = view.findViewById(R.id.editReaderId);
         editReaderIssuerPublicKey = view.findViewById(R.id.editReaderIssuerPublicKey);
         editReaderCertificate   = view.findViewById(R.id.editReaderCertificate);
+        editStepUpElementId     = view.findViewById(R.id.editStepUpElementId);
+        editStepUpIssuerPubKey  = view.findViewById(R.id.editStepUpIssuerPubKey);
         txtStatus               = view.findViewById(R.id.txtAliroConfigStatus);
         Button btnSave          = view.findViewById(R.id.btnSaveAliroConfig);
+        Button btnScanQr        = view.findViewById(R.id.btnScanIssuerKeyQr);
 
         loadFromPreferences();
 
         btnSave.setOnClickListener(v -> saveToPreferences());
+        btnScanQr.setOnClickListener(v -> launchQrScanner());
     }
 
     // -------------------------------------------------------------------------
@@ -69,14 +85,20 @@ public class AliroConfigFragment extends Fragment
                 prefs.getString(AliroPreferences.READER_ISSUER_PUBLIC_KEY, ""));
         editReaderCertificate.setText(
                 prefs.getString(AliroPreferences.READER_CERTIFICATE, ""));
+        editStepUpElementId.setText(
+                prefs.getString(AliroPreferences.STEP_UP_ELEMENT_ID, ""));
+        editStepUpIssuerPubKey.setText(
+                prefs.getString(AliroPreferences.STEP_UP_ISSUER_PUB_KEY, ""));
     }
 
     private void saveToPreferences()
     {
-        String privateKey = editReaderPrivateKey.getText().toString().trim().toLowerCase();
-        String readerId   = editReaderId.getText().toString().trim().toLowerCase();
-        String issuerKey  = editReaderIssuerPublicKey.getText().toString().trim().toLowerCase();
-        String cert       = editReaderCertificate.getText().toString().trim().toLowerCase();
+        String privateKey      = editReaderPrivateKey.getText().toString().trim().toLowerCase();
+        String readerId        = editReaderId.getText().toString().trim().toLowerCase();
+        String issuerKey       = editReaderIssuerPublicKey.getText().toString().trim().toLowerCase();
+        String cert            = editReaderCertificate.getText().toString().trim().toLowerCase();
+        String stepUpElementId = editStepUpElementId.getText().toString().trim();
+        String stepUpIssuerKey = editStepUpIssuerPubKey.getText().toString().trim().toLowerCase();
 
         // Validate required fields
         if (!isValidHex(privateKey, 64))
@@ -113,13 +135,44 @@ public class AliroConfigFragment extends Fragment
         SharedPreferences.Editor editor = requireActivity()
                 .getPreferences(Context.MODE_PRIVATE)
                 .edit();
-        editor.putString(AliroPreferences.READER_PRIVATE_KEY, privateKey);
-        editor.putString(AliroPreferences.READER_ID, readerId);
+        editor.putString(AliroPreferences.READER_PRIVATE_KEY,    privateKey);
+        editor.putString(AliroPreferences.READER_ID,             readerId);
         editor.putString(AliroPreferences.READER_ISSUER_PUBLIC_KEY, issuerKey);
-        editor.putString(AliroPreferences.READER_CERTIFICATE, cert);
+        editor.putString(AliroPreferences.READER_CERTIFICATE,    cert);
+        editor.putString(AliroPreferences.STEP_UP_ELEMENT_ID,    stepUpElementId);
+        editor.putString(AliroPreferences.STEP_UP_ISSUER_PUB_KEY, stepUpIssuerKey);
         editor.apply();
 
         showStatus("Saved.", true);
+    }
+
+    // -------------------------------------------------------------------------
+    // QR scanner
+    // -------------------------------------------------------------------------
+
+    private void launchQrScanner()
+    {
+        ScanOptions options = new ScanOptions();
+        options.setDesiredBarcodeFormats(ScanOptions.QR_CODE);
+        options.setPrompt("Scan the issuer key QR from the credential device");
+        options.setBeepEnabled(false);
+        options.setOrientationLocked(false);
+        qrScanLauncher.launch(options);
+    }
+
+    private void onQrScanResult(ScanIntentResult result)
+    {
+        if (result.getContents() == null) return;   // cancelled
+        String scanned = result.getContents().trim().toLowerCase();
+        if (scanned.length() == 130 && scanned.matches("[0-9a-f]+"))
+        {
+            editStepUpIssuerPubKey.setText(scanned);
+            showStatus("Issuer key scanned — tap Save to apply.", true);
+        }
+        else
+        {
+            showStatus("QR scan did not contain a valid 65-byte EC public key.", false);
+        }
     }
 
     private void showStatus(String message, boolean success)

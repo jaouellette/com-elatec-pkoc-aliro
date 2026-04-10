@@ -2,6 +2,7 @@
 agp = "8.13.2"
 annotationsApi = "6.0.53"
 bcpkixJdk15to18 = "1.83"
+cbor            = "4.5.2"
 conscryptAndroid = "2.5.3"
 core = "3.5.4"
 grpc = "1.79.0"
@@ -23,6 +24,7 @@ zxingAndroidEmbedded = "4.3.0"
 [libraries]
 annotations-api = { module = "org.apache.tomcat:annotations-api", version.ref = "annotationsApi" }
 bcpkix-jdk15to18 = { module = "org.bouncycastle:bcpkix-jdk15to18", version.ref = "bcpkixJdk15to18" }
+cbor             = { module = "com.upokecenter:cbor", version.ref = "cbor" }
 bcprov-jdk15to18 = { module = "org.bouncycastle:bcprov-jdk15to18", version.ref = "bcpkixJdk15to18" }
 conscrypt-android = { module = "org.conscrypt:conscrypt-android", version.ref = "conscryptAndroid" }
 core = { module = "com.google.zxing:core", version.ref = "core" }

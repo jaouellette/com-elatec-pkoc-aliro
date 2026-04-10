@@ -12,7 +12,7 @@ android {
 
     defaultConfig {
         applicationId = "com.pkoc.readersimulator"
-        minSdk = 24
+        minSdk = 29
         targetSdk = 36
         versionCode = 1
         versionName = "3.5"
@@ -75,7 +75,10 @@ dependencies {
     implementation(libs.constraintlayout)
     implementation(libs.bcpkix.jdk15to18)
     implementation(libs.bcprov.jdk15to18)
+    implementation(libs.cbor)                 // CBOR encoding for Aliro Step-Up
     implementation("androidx.constraintlayout:constraintlayout:2.1.4")
+    implementation(libs.zxing.android.embedded) // QR code scanning for issuer key import
+    implementation(libs.core)                   // ZXing core (QR generation)
     testImplementation(libs.robolectric)
     testImplementation(libs.junit)
     androidTestImplementation(libs.ext.junit)

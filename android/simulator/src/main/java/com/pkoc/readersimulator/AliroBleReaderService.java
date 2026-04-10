@@ -32,6 +32,8 @@ import androidx.annotation.RequiresApi;
 import com.psia.pkoc.core.AliroBleMessage;
 import com.psia.pkoc.core.AliroCryptoProvider;
 
+import com.upokecenter.cbor.CBORObject;
+
 import org.bouncycastle.util.encoders.Hex;
 
 import java.io.IOException;
@@ -67,10 +69,12 @@ public class AliroBleReaderService extends Service
 
     // Broadcast action for result
     public static final String ACTION_BLE_RESULT = "com.pkoc.readersimulator.ALIRO_BLE_RESULT";
-    public static final String EXTRA_ACCESS_GRANTED = "accessGranted";
-    public static final String EXTRA_STATUS_MESSAGE = "statusMessage";
-    public static final String EXTRA_CREDENTIAL_PUB_KEY = "credentialPubKey";
-    public static final String EXTRA_SIG_VALID = "sigValid";
+    public static final String EXTRA_ACCESS_GRANTED      = "accessGranted";
+    public static final String EXTRA_STATUS_MESSAGE      = "statusMessage";
+    public static final String EXTRA_CREDENTIAL_PUB_KEY  = "credentialPubKey";
+    public static final String EXTRA_SIG_VALID           = "sigValid";
+    public static final String EXTRA_DEVICE_RESPONSE     = "deviceResponse";
+    public static final String EXTRA_STEP_UP_ELEMENT_ID  = "stepUpElementId";
 
     // Proprietary TLV from SELECT response (used in key derivation)
     private static final byte[] PROPRIETARY_TLV = {
@@ -441,6 +445,11 @@ public class AliroBleReaderService extends Service
         byte[] skReader = null;
         byte[] skDevice = null;
         byte[] bleSK = null;
+        byte[] stepUpSK = null;
+        int readerCounter = 1;
+        int deviceCounter = 1;
+        byte[] finalDeviceResponse  = null;  // populated if ENVELOPE succeeds
+        String finalStepUpElementId = null;  // element ID requested
 
         try
         {
@@ -583,9 +592,10 @@ public class AliroBleReaderService extends Service
                 broadcastResult(false, "Key derivation failed");
                 return;
             }
-            skReader = Arrays.copyOfRange(keybuf, 0, 32);
-            skDevice = Arrays.copyOfRange(keybuf, 32, 64);
-            bleSK    = Arrays.copyOfRange(keybuf, 96, 128);
+            skReader  = Arrays.copyOfRange(keybuf, 0, 32);
+            skDevice  = Arrays.copyOfRange(keybuf, 32, 64);
+            stepUpSK  = Arrays.copyOfRange(keybuf, 64, 96);
+            bleSK     = Arrays.copyOfRange(keybuf, 96, 128);
 
             // ------------------------------------------------------------------
             // Step 4 (optional): LOAD CERT
@@ -627,7 +637,7 @@ public class AliroBleReaderService extends Service
             {
                 encPayload = Arrays.copyOfRange(auth1RspApdu, 0, auth1RspApdu.length - 2);
             }
-            byte[] decrypted = AliroCryptoProvider.decryptDeviceGcm(skDevice, encPayload);
+            byte[] decrypted = AliroCryptoProvider.decryptDeviceGcm(skDevice, encPayload, deviceCounter++);
             if (decrypted == null)
             {
                 broadcastResult(false, "AUTH1 decryption failed");
@@ -635,7 +645,21 @@ public class AliroBleReaderService extends Service
             }
             Log.d(TAG, "AUTH1 decrypted: " + Hex.toHexString(decrypted));
 
-            // Parse: 5A 41 <cred pub key 65> 9E 40 <sig 64>
+            // Parse signaling_bitmap (tag 0x5E 0x02) from AUTH1 response
+            int signalingBits = 0;
+            for (int si = 0; si < decrypted.length - 3; si++)
+            {
+                if ((decrypted[si] & 0xFF) == 0x5E && (decrypted[si + 1] & 0xFF) == 0x02)
+                {
+                    signalingBits = ((decrypted[si + 2] & 0xFF) << 8) | (decrypted[si + 3] & 0xFF);
+                    Log.d(TAG, "signaling_bitmap=0x" + Integer.toHexString(signalingBits));
+                    break;
+                }
+            }
+            // CRITICAL: Over BLE, Bit2 MUST be ignored per spec Table 8-11
+            boolean stepUpRequested = (signalingBits & 0x0001) != 0; // Bit0=Access Document available
+
+            // Parse: 5A 41 <cred pub key 65> 9E 40 <sig 64> [5E 02 <hi> <lo>]
             if (decrypted.length < 131 || decrypted[0] != 0x5A || decrypted[1] != 0x41)
             {
                 broadcastResult(false, "AUTH1 response format invalid");
@@ -656,7 +680,7 @@ public class AliroBleReaderService extends Service
             // Step 7: Send EXCHANGE
             // ------------------------------------------------------------------
             byte[] exchangePayload = { (byte)0x97, 0x02, sigValid ? (byte)0x01 : 0x00, (byte)0x82 };
-            byte[] encExchange = AliroCryptoProvider.encryptReaderGcm(skReader, exchangePayload);
+            byte[] encExchange = AliroCryptoProvider.encryptReaderGcm(skReader, exchangePayload, readerCounter++);
             if (encExchange != null)
             {
                 byte[] exchangeApdu = buildExchangeCommand(encExchange);
@@ -668,6 +692,104 @@ public class AliroBleReaderService extends Service
                 byte[] exchangeRspMsg = readAliroMessage(in);
                 byte[] exchangeRspApdu = AliroBleMessage.extractPayload(exchangeRspMsg);
                 Log.d(TAG, "EXCHANGE response: " + Hex.toHexString(exchangeRspApdu));
+
+                // Decrypt EXCHANGE response with counter
+                byte[] encExchangeRsp = exchangeRspApdu;
+                if (exchangeRspApdu.length >= 2 &&
+                    exchangeRspApdu[exchangeRspApdu.length - 2] == (byte)0x90 &&
+                    exchangeRspApdu[exchangeRspApdu.length - 1] == 0x00)
+                {
+                    encExchangeRsp = Arrays.copyOfRange(exchangeRspApdu, 0, exchangeRspApdu.length - 2);
+                }
+                byte[] decExchangeRsp = AliroCryptoProvider.decryptDeviceGcm(skDevice, encExchangeRsp, deviceCounter++);
+                if (decExchangeRsp != null)
+                {
+                    Log.d(TAG, "EXCHANGE response decrypted: " + Hex.toHexString(decExchangeRsp));
+                }
+            }
+
+            // ------------------------------------------------------------------
+            // Step 7b: ENVELOPE (Step-Up) if credential signaled Access Document
+            // ------------------------------------------------------------------
+            if (stepUpRequested && stepUpSK != null)
+            {
+                String stepUpElementId = prefs.getString(AliroPreferences.STEP_UP_ELEMENT_ID, "");
+                if (!stepUpElementId.isEmpty())
+                {
+                    byte[] suKeys = AliroCryptoProvider.deriveStepUpSessionKeys(stepUpSK);
+                    if (suKeys != null)
+                    {
+                        byte[] suSKDevice = Arrays.copyOfRange(suKeys, 0, 32);
+                        byte[] suSKReader = Arrays.copyOfRange(suKeys, 32, 64);
+
+                        // Build DeviceRequest CBOR (Table 8-21)
+                        CBORObject nameSpaces = CBORObject.NewMap();
+                        CBORObject elemMap = CBORObject.NewMap();
+                        elemMap.Add(stepUpElementId, CBORObject.True);
+                        nameSpaces.Add("aliro-a", elemMap);
+
+                        CBORObject itemsReq = CBORObject.NewMap();
+                        itemsReq.Add("1", nameSpaces);   // key "1" = nameSpaces
+                        itemsReq.Add("5", "aliro-a");    // key "5" = docType
+
+                        CBORObject docReq = CBORObject.NewMap();
+                        docReq.Add("1", itemsReq);       // key "1" = itemsRequest
+
+                        CBORObject docRequests = CBORObject.NewArray();
+                        docRequests.Add(docReq);
+
+                        CBORObject deviceRequest = CBORObject.NewMap();
+                        deviceRequest.Add("2", docRequests); // key "2" = docRequests
+
+                        byte[] deviceRequestBytes = deviceRequest.EncodeToBytes();
+
+                        // Encrypt DeviceRequest with suSKReader (counter=1)
+                        byte[] encDeviceRequest = AliroCryptoProvider.encryptReaderGcm(suSKReader, deviceRequestBytes, 1);
+
+                        // Wrap in SessionData CBOR: {"data": bstr(ciphertext)}
+                        CBORObject sessionData = CBORObject.NewMap();
+                        sessionData.Add("data", encDeviceRequest);
+                        byte[] envelopeData = sessionData.EncodeToBytes();
+
+                        // Build ENVELOPE APDU (INS=0xC3)
+                        byte[] envelopeApdu = buildEnvelopeCommand(envelopeData);
+                        byte[] envelopeMsg = AliroBleMessage.build(
+                                AliroBleMessage.PROTOCOL_AP, AliroBleMessage.AP_RQ, envelopeApdu);
+                        out.write(envelopeMsg);
+                        out.flush();
+                        Log.d(TAG, "Sent ENVELOPE AP_RQ (DeviceRequest)");
+
+                        // Read ENVELOPE response
+                        byte[] envelopeRspMsg = readAliroMessage(in);
+                        byte[] envelopeRspApdu = AliroBleMessage.extractPayload(envelopeRspMsg);
+                        Log.d(TAG, "ENVELOPE response: " + Hex.toHexString(envelopeRspApdu));
+
+                        // Strip SW if present
+                        if (envelopeRspApdu.length >= 2 &&
+                            envelopeRspApdu[envelopeRspApdu.length - 2] == (byte)0x90 &&
+                            envelopeRspApdu[envelopeRspApdu.length - 1] == 0x00)
+                        {
+                            envelopeRspApdu = Arrays.copyOfRange(envelopeRspApdu, 0, envelopeRspApdu.length - 2);
+                        }
+
+                        // Parse SessionData CBOR, decrypt DeviceResponse
+                        CBORObject rspSessionData = CBORObject.DecodeFromBytes(envelopeRspApdu);
+                        byte[] encDeviceResponse = rspSessionData.get("data").GetByteString();
+                        byte[] deviceResponse = AliroCryptoProvider.decryptDeviceGcm(suSKDevice, encDeviceResponse, 1);
+                        if (deviceResponse != null)
+                        {
+                            Log.d(TAG, "DeviceResponse received (" + deviceResponse.length + " bytes): "
+                                    + Hex.toHexString(deviceResponse));
+                            finalDeviceResponse  = deviceResponse;
+                            finalStepUpElementId = stepUpElementId;
+                        }
+
+                        // Zero step-up keys
+                        Arrays.fill(suSKDevice, (byte)0);
+                        Arrays.fill(suSKReader, (byte)0);
+                        Arrays.fill(suKeys, (byte)0);
+                    }
+                }
             }
 
             // ------------------------------------------------------------------
@@ -734,7 +856,8 @@ public class AliroBleReaderService extends Service
                         int action = rkePlain[2] & 0xFF;
                         Log.d(TAG, "RKE action: " + action + " (0=secure, 1=unsecure)");
                     }
-                    broadcastResult(true, "BLE Access Granted", finalCredPubKey, finalSigValid);
+                    broadcastResult(true, "BLE Access Granted", finalCredPubKey, finalSigValid,
+                            finalDeviceResponse, finalStepUpElementId);
                 }
                 else
                 {
@@ -761,9 +884,10 @@ public class AliroBleReaderService extends Service
         finally
         {
             // Zero session keys
-            if (skReader != null) Arrays.fill(skReader, (byte)0);
-            if (skDevice != null) Arrays.fill(skDevice, (byte)0);
-            if (bleSK != null)    Arrays.fill(bleSK, (byte)0);
+            if (skReader != null)  Arrays.fill(skReader, (byte)0);
+            if (skDevice != null)  Arrays.fill(skDevice, (byte)0);
+            if (bleSK != null)     Arrays.fill(bleSK, (byte)0);
+            if (stepUpSK != null)  Arrays.fill(stepUpSK, (byte)0);
 
             try { socket.close(); }
             catch (Exception ignored) {}
@@ -871,6 +995,31 @@ public class AliroBleReaderService extends Service
         return cmd;
     }
 
+    private byte[] buildEnvelopeCommand(byte[] data)
+    {
+        // INS=0xC3, extended length if data > 255
+        boolean extended = data.length > 255;
+        int headerSize = 4 + (extended ? 3 : 1);
+        byte[] cmd = new byte[headerSize + data.length + (extended ? 2 : 1)];
+        cmd[0] = (byte)0x80; cmd[1] = (byte)0xC3; cmd[2] = 0x00; cmd[3] = 0x00;
+        int idx = 4;
+        if (extended)
+        {
+            cmd[idx++] = 0x00;
+            cmd[idx++] = (byte)(data.length >> 8);
+            cmd[idx++] = (byte)(data.length & 0xFF);
+        }
+        else
+        {
+            cmd[idx++] = (byte) data.length;
+        }
+        System.arraycopy(data, 0, cmd, idx, data.length);
+        // Le
+        cmd[idx + data.length] = 0x00;
+        if (extended) cmd[idx + data.length + 1] = 0x00;
+        return cmd;
+    }
+
     // -------------------------------------------------------------------------
     // EC key helpers (same as HomeFragment)
     // -------------------------------------------------------------------------
@@ -932,6 +1081,13 @@ public class AliroBleReaderService extends Service
     private void broadcastResult(boolean accessGranted, String message,
                                   byte[] credentialPubKey, boolean sigValid)
     {
+        broadcastResult(accessGranted, message, credentialPubKey, sigValid, null, null);
+    }
+
+    private void broadcastResult(boolean accessGranted, String message,
+                                  byte[] credentialPubKey, boolean sigValid,
+                                  byte[] deviceResponse, String stepUpElementId)
+    {
         Intent intent = new Intent(ACTION_BLE_RESULT);
         intent.setPackage(getPackageName());
         intent.putExtra(EXTRA_ACCESS_GRANTED, accessGranted);
@@ -942,7 +1098,16 @@ public class AliroBleReaderService extends Service
             intent.putExtra(EXTRA_CREDENTIAL_PUB_KEY,
                     org.bouncycastle.util.encoders.Hex.toHexString(credentialPubKey));
         }
+        if (deviceResponse != null)
+        {
+            intent.putExtra(EXTRA_DEVICE_RESPONSE, deviceResponse);
+        }
+        if (stepUpElementId != null)
+        {
+            intent.putExtra(EXTRA_STEP_UP_ELEMENT_ID, stepUpElementId);
+        }
         sendBroadcast(intent);
-        Log.d(TAG, "Broadcast: accessGranted=" + accessGranted + " msg=" + message);
+        Log.d(TAG, "Broadcast: accessGranted=" + accessGranted + " msg=" + message
+                + (deviceResponse != null ? " deviceResponse=" + deviceResponse.length + "B" : ""));
     }
 }
