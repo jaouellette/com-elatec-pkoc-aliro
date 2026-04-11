@@ -143,6 +143,7 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
 
     private ImageView readerImageView;
     private LinearLayout keypadLayout;
+    private boolean keypadPositioned = false;
 
     private TextView pinDisplay;
     private boolean isDisplayingResult = false;
@@ -288,34 +289,23 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
 
         readerImageView = view.findViewById(R.id.readerImageView);
         keypadLayout = view.findViewById(R.id.keypadLayout);
+        keypadPositioned = false;
 
-
-        readerImage.post(() -> {
-            int imageTop = readerImage.getTop();
-            int imageHeight = readerImage.getHeight();
-            int screenHeight = view.getHeight();
-
-            // LED indicators sit at ~18% down the reader image
-            // Keypad starts just below them at ~25% into the image
-            float keypadTopFraction = 0.36f;
-            float keypadBottomFraction = 0.94f;
-
-            int keypadTop = imageTop + (int)(imageHeight * keypadTopFraction);
-            int keypadBottom = imageTop + (int)(imageHeight * keypadBottomFraction);
-
-            androidx.constraintlayout.widget.ConstraintLayout.LayoutParams params =
-                    (androidx.constraintlayout.widget.ConstraintLayout.LayoutParams)
-                            keypadLayout.getLayoutParams();
-
-            // Remove guideline constraints and use absolute top margin instead
-            params.topToTop = androidx.constraintlayout.widget.ConstraintLayout.LayoutParams.PARENT_ID;
-            params.bottomToBottom = androidx.constraintlayout.widget.ConstraintLayout.LayoutParams.PARENT_ID;
-            params.topMargin = keypadTop;
-            params.bottomMargin = screenHeight - keypadBottom;
-            params.height = 0; // stretch between margins
-
-            keypadLayout.setLayoutParams(params);
-        });
+        // Position the keypad overlay once the reader image has been measured.
+        // Using OnGlobalLayoutListener instead of post() guarantees the image
+        // has valid dimensions — post() can fire before layout is complete
+        // when the fragment view is recreated after navigating back.
+        readerImage.getViewTreeObserver().addOnGlobalLayoutListener(
+                new android.view.ViewTreeObserver.OnGlobalLayoutListener() {
+                    @Override
+                    public void onGlobalLayout() {
+                        positionKeypad(readerImage, view);
+                        // Remove after first successful positioning to avoid
+                        // re-running on every subsequent layout pass.
+                        readerImage.getViewTreeObserver()
+                                .removeOnGlobalLayoutListener(this);
+                    }
+                });
 
         // Set up keypad PIN display and click listeners
         pinDisplay = view.findViewById(R.id.pinDisplay);
@@ -386,6 +376,14 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
         super.onResume();
         // Clear any stale keypad input when returning from another fragment
         if (pinDisplay != null) pinDisplay.setText("");
+
+        // Re-position keypad if it hasn't been positioned yet (can happen
+        // when returning from another fragment and the OnGlobalLayoutListener
+        // from onViewCreated already fired before layout was ready).
+        // Also handles rotation / config changes.
+        if (!keypadPositioned && readerImageView != null && getView() != null) {
+            readerImageView.post(() -> positionKeypad(readerImageView, getView()));
+        }
 
         nfcAdapter = NfcAdapter.getDefaultAdapter(requireContext());
         if (nfcAdapter == null)
@@ -814,6 +812,45 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
         keypadLayout.setVisibility(View.VISIBLE);
         rdrButton.setText(R.string.show_reader_details);
         rdrButton.setOnClickListener(v -> showRdrDetails());
+    }
+
+    /**
+     * Position the keypad overlay to align with the reader image.
+     * Computes absolute top/bottom margins from the image's measured
+     * dimensions so the keypad sits over the physical keypad area of
+     * the reader graphic.  Safe to call multiple times — skips the
+     * work when the image has not been laid out yet (height == 0).
+     */
+    private void positionKeypad(View readerImage, View rootView) {
+        if (readerImage == null || keypadLayout == null || rootView == null) return;
+
+        int imageTop = readerImage.getTop();
+        int imageHeight = readerImage.getHeight();
+        int screenHeight = rootView.getHeight();
+
+        // Guard: if layout hasn't happened yet, don't set bogus margins
+        if (imageHeight == 0 || screenHeight == 0) return;
+
+        // LED indicators sit at ~18% down the reader image
+        // Keypad starts just below them at ~36% into the image
+        float keypadTopFraction = 0.36f;
+        float keypadBottomFraction = 0.94f;
+
+        int keypadTop = imageTop + (int)(imageHeight * keypadTopFraction);
+        int keypadBottom = imageTop + (int)(imageHeight * keypadBottomFraction);
+
+        androidx.constraintlayout.widget.ConstraintLayout.LayoutParams params =
+                (androidx.constraintlayout.widget.ConstraintLayout.LayoutParams)
+                        keypadLayout.getLayoutParams();
+
+        params.topToTop = androidx.constraintlayout.widget.ConstraintLayout.LayoutParams.PARENT_ID;
+        params.bottomToBottom = androidx.constraintlayout.widget.ConstraintLayout.LayoutParams.PARENT_ID;
+        params.topMargin = keypadTop;
+        params.bottomMargin = screenHeight - keypadBottom;
+        params.height = 0; // stretch between margins
+
+        keypadLayout.setLayoutParams(params);
+        keypadPositioned = true;
     }
 
     // Helper method to apply background, text color, font size, and bold attribute to a specific range of text
@@ -1344,7 +1381,7 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                         }
                         else if (deviceModel.connectionType == PKOC_ConnectionType.Uncompressed)
                         {
-                            connectionTypeText = "Connection Type: Normal Flow";
+                            connectionTypeText = "(PKOC - BLE) Connection Type: Normal Flow";
                         }
                         displayPublicKeyInfo(publicKeyHex, connectionTypeText);
                     });
@@ -1850,7 +1887,7 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                         keypadLayout.setVisibility(View.GONE);
                         String pk = Hex.toHexString(publicKey);
                         Log.d("NFC", "PKOC Public Key: " + pk);
-                        displayPublicKeyInfo(pk, "Connection Type: Normal Flow (PKOC)");
+                        displayPublicKeyInfo(pk, "(PKOC - NFC) Connection Type: Normal Flow");
                     });
                 }
                 else
@@ -2158,6 +2195,24 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
             Log.d(TAG, "Aliro credential signature valid: " + sigValid);
 
             // ------------------------------------------------------------------
+            // Parse signaling_bitmap from decrypted AUTH1 payload
+            // Per Aliro §8.3.3.4.2 Table 8-11: tag 0x5E, 2 bytes big-endian.
+            //   Bit0: Access Document available (gates Step-Up ENVELOPE)
+            //   Bit2: Step-up AID SELECT required before ENVELOPE (NFC, §10.2)
+            // ------------------------------------------------------------------
+            int signalingBitmap = 0x0000;
+            for (int si = 0; si < decrypted.length - 3; si++)
+            {
+                if ((decrypted[si] & 0xFF) == 0x5E && (decrypted[si + 1] & 0xFF) == 0x02)
+                {
+                    signalingBitmap = ((decrypted[si + 2] & 0xFF) << 8) | (decrypted[si + 3] & 0xFF);
+                    Log.d(TAG, "AUTH1: signaling_bitmap=0x" + String.format("%04X", signalingBitmap));
+                    break;
+                }
+            }
+            boolean accessDocAvailable = (signalingBitmap & 0x0001) != 0; // Bit0
+
+            // ------------------------------------------------------------------
             // Send EXCHANGE with access decision + optional mailbox operations
             // Per Table 8-15: 0xBA (mailbox) comes BEFORE 0x97 (access decision)
             // ------------------------------------------------------------------
@@ -2236,123 +2291,122 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                 Log.d(TAG, "Mailbox BA TLV: " + Hex.toHexString(mailboxBA));
             }
 
-            // Build EXCHANGE plaintext: [0xBA mailbox (if any)] + 0x97 access decision
+            // ------------------------------------------------------------------
+            // Determine whether step-up will follow this EXCHANGE.
+            // If step-up is needed, we must NOT include tag 0x97 (reader status)
+            // in this EXCHANGE — 0x97 signals end-of-transaction and the credential
+            // MAY close the NFC link after receiving it (per §8.3.3.5).
+            // Instead: send EXCHANGE with mailbox only, then ENVELOPE for step-up,
+            // then a final EXCHANGE with 0x97 to close the transaction.
+            // ------------------------------------------------------------------
+            SharedPreferences stepUpPrefs = requireActivity().getPreferences(Context.MODE_PRIVATE);
+            String stepUpElementId = stepUpPrefs.getString(AliroPreferences.STEP_UP_ELEMENT_ID, "");
+            boolean willDoStepUp = !stepUpElementId.isEmpty() && accessDocAvailable;
+
             byte[] statusTlv = new byte[]{ (byte)0x97, 0x02, sigValid ? (byte)0x01 : 0x00, (byte)0x82 };
             byte[] exchangePayload;
-            if (mailboxBA != null)
+            if (willDoStepUp && mailboxBA != null)
             {
+                // Mailbox only — no 0x97 yet (step-up will follow)
+                exchangePayload = mailboxBA;
+            }
+            else if (willDoStepUp)
+            {
+                // No mailbox, but step-up is coming — skip this EXCHANGE entirely,
+                // go straight to step-up, and send 0x97 in the post-step-up EXCHANGE.
+                exchangePayload = null;
+            }
+            else if (mailboxBA != null)
+            {
+                // Mailbox + 0x97 (no step-up)
                 exchangePayload = new byte[mailboxBA.length + statusTlv.length];
                 System.arraycopy(mailboxBA, 0, exchangePayload, 0, mailboxBA.length);
                 System.arraycopy(statusTlv, 0, exchangePayload, mailboxBA.length, statusTlv.length);
             }
             else
             {
+                // Just 0x97 (no mailbox, no step-up)
                 exchangePayload = statusTlv;
             }
 
-            // Encrypt EXCHANGE command using reader_counter=1 (§8.3.1.8), then increment.
-            byte[] encryptedExchange = AliroCryptoProvider.encryptReaderGcm(skReader, exchangePayload, readerCounter++);
-            if (encryptedExchange == null)
+            // Send pre-step-up EXCHANGE (mailbox only, or mailbox+0x97 if no step-up)
+            if (exchangePayload != null)
             {
-                showAliroError("EXCHANGE encryption failed.");
-                return;
-            }
-            byte[] exchangeCmd = buildExchangeCommand(encryptedExchange);
-            Log.d(TAG, "EXCHANGE command: " + Hex.toHexString(exchangeCmd));
-            byte[] exchangeResponse = isoDep.transceive(exchangeCmd);
-            Log.d(TAG, "EXCHANGE response: " + Hex.toHexString(exchangeResponse));
-
-            // Decrypt and verify EXCHANGE response per §8.3.3.5.6.
-            // Decrypt using device_counter=2 (counter=1 was consumed by AUTH1), then increment.
-            if (isSW9000(exchangeResponse) && exchangeResponse.length > 2)
-            {
-                byte[] exchangeEncPayload = Arrays.copyOfRange(exchangeResponse, 0, exchangeResponse.length - 2);
-                byte[] exchangeDecrypted  = AliroCryptoProvider.decryptDeviceGcm(skDevice, exchangeEncPayload, deviceCounter++);
-                if (exchangeDecrypted != null)
+                byte[] encryptedExchange = AliroCryptoProvider.encryptReaderGcm(skReader, exchangePayload, readerCounter++);
+                if (encryptedExchange == null)
                 {
-                    Log.d(TAG, "EXCHANGE response decrypted: " + Hex.toHexString(exchangeDecrypted));
+                    showAliroError("EXCHANGE encryption failed.");
+                    return;
+                }
+                byte[] exchangeCmd = buildExchangeCommand(encryptedExchange);
+                Log.d(TAG, "EXCHANGE command: " + Hex.toHexString(exchangeCmd));
+                byte[] exchangeResponse = isoDep.transceive(exchangeCmd);
+                Log.d(TAG, "EXCHANGE response: " + Hex.toHexString(exchangeResponse));
 
-                    // Mailbox read data comes BEFORE the status bytes (0x00 0x02 0x00 0x00)
-                    if (mailboxEnabled && "read".equals(mailboxOp) && mailboxReadLen > 0)
+                // Decrypt and verify EXCHANGE response per §8.3.3.5.6.
+                if (isSW9000(exchangeResponse) && exchangeResponse.length > 2)
+                {
+                    byte[] exchangeEncPayload = Arrays.copyOfRange(exchangeResponse, 0, exchangeResponse.length - 2);
+                    byte[] exchangeDecrypted  = AliroCryptoProvider.decryptDeviceGcm(skDevice, exchangeEncPayload, deviceCounter++);
+                    if (exchangeDecrypted != null)
                     {
-                        if (exchangeDecrypted.length > 4)
+                        Log.d(TAG, "EXCHANGE response decrypted: " + Hex.toHexString(exchangeDecrypted));
+
+                        // Mailbox read data comes BEFORE the status bytes (0x00 0x02 0x00 0x00)
+                        if (mailboxEnabled && "read".equals(mailboxOp) && mailboxReadLen > 0)
                         {
-                            int readDataLen = exchangeDecrypted.length - 4;
-                            if (readDataLen > 0)
+                            if (exchangeDecrypted.length > 4)
                             {
-                                byte[] mailboxReadData = Arrays.copyOfRange(exchangeDecrypted, 0, readDataLen);
-                                mailboxResultHex = "Read " + readDataLen + "B: " + Hex.toHexString(mailboxReadData);
-                                Log.d(TAG, "Mailbox READ response (" + readDataLen + " bytes): "
-                                        + Hex.toHexString(mailboxReadData));
+                                int readDataLen = exchangeDecrypted.length - 4;
+                                if (readDataLen > 0)
+                                {
+                                    byte[] mailboxReadData = Arrays.copyOfRange(exchangeDecrypted, 0, readDataLen);
+                                    mailboxResultHex = "Read " + readDataLen + "B: " + Hex.toHexString(mailboxReadData);
+                                    Log.d(TAG, "Mailbox READ response (" + readDataLen + " bytes): "
+                                            + Hex.toHexString(mailboxReadData));
+                                }
+                                else
+                                {
+                                    mailboxResultHex = "Read — empty (mailbox may not be initialized)";
+                                    Log.d(TAG, "Mailbox READ: no data returned (response has no read bytes)");
+                                }
                             }
                             else
                             {
                                 mailboxResultHex = "Read — empty (mailbox may not be initialized)";
-                                Log.d(TAG, "Mailbox READ: no data returned (response has no read bytes)");
+                                Log.d(TAG, "Mailbox READ: no data returned (response only has status bytes)");
                             }
                         }
-                        else
+
+                        if (mailboxEnabled && ("write".equals(mailboxOp) || "set".equals(mailboxOp)))
                         {
-                            mailboxResultHex = "Read — empty (mailbox may not be initialized)";
-                            Log.d(TAG, "Mailbox READ: no data returned (response only has status bytes)");
+                            mailboxResultHex = mailboxOp.toUpperCase() + " OK";
+                            Log.d(TAG, "Mailbox " + mailboxOp + " accepted by credential");
+                        }
+
+                        int statusStart = exchangeDecrypted.length - 4;
+                        if (statusStart >= 0
+                                && exchangeDecrypted[statusStart] == 0x00
+                                && exchangeDecrypted[statusStart + 1] == 0x02
+                                && exchangeDecrypted[statusStart + 2] == 0x00
+                                && exchangeDecrypted[statusStart + 3] == 0x00)
+                        {
+                            Log.d(TAG, "EXCHANGE: credential confirmed success");
                         }
                     }
-
-                    // If operation was write or set and credential accepted, note it
-                    if (mailboxEnabled && ("write".equals(mailboxOp) || "set".equals(mailboxOp)))
-                    {
-                        mailboxResultHex = mailboxOp.toUpperCase() + " OK";
-                        Log.d(TAG, "Mailbox " + mailboxOp + " accepted by credential");
-                    }
-
-                    // Check status bytes at end
-                    int statusStart = exchangeDecrypted.length - 4;
-                    if (statusStart >= 0
-                            && exchangeDecrypted[statusStart] == 0x00
-                            && exchangeDecrypted[statusStart + 1] == 0x02
-                            && exchangeDecrypted[statusStart + 2] == 0x00
-                            && exchangeDecrypted[statusStart + 3] == 0x00)
-                    {
-                        Log.d(TAG, "EXCHANGE: credential confirmed success");
-                    }
                 }
             }
-
-            // ------------------------------------------------------------------
-            // Parse signaling_bitmap from decrypted AUTH1 payload
-            // Per Aliro §8.3.3.4.2 Table 8-11: tag 0x5E, 2 bytes big-endian, mandatory.
-            //   Bit0: Access Document available (gate Step-Up entirely)
-            //   Bit2: Step-up AID SELECT required before ENVELOPE (NFC only, §10.2)
-            // ------------------------------------------------------------------
-            int signalingBitmap = 0x0000;
-            for (int si = 0; si < decrypted.length - 3; si++)
-            {
-                if ((decrypted[si] & 0xFF) == 0x5E && (decrypted[si + 1] & 0xFF) == 0x02)
-                {
-                    signalingBitmap = ((decrypted[si + 2] & 0xFF) << 8) | (decrypted[si + 3] & 0xFF);
-                    Log.d(TAG, "AUTH1: signaling_bitmap=0x" + String.format("%04X", signalingBitmap));
-                    break;
-                }
-            }
-            boolean accessDocAvailable   = (signalingBitmap & 0x0001) != 0; // Bit0
-            boolean stepupSelectRequired = (signalingBitmap & 0x0004) != 0; // Bit2 (NFC only)
 
             // ------------------------------------------------------------------
             // Step-Up phase (optional) — send ENVELOPE with DeviceRequest if
-            // a Step-Up element identifier is configured AND Bit0 signals doc available.
+            // configured AND Bit0 signals doc available.
             // Per Aliro §8.4 + §10.2 + ISO 18013-5 §9.1.1.4/9.1.1.5.
             // ------------------------------------------------------------------
             String stepUpResult = null;
-            SharedPreferences stepUpPrefs = requireActivity().getPreferences(Context.MODE_PRIVATE);
-            String stepUpElementId = stepUpPrefs.getString(AliroPreferences.STEP_UP_ELEMENT_ID, "");
-            if (!stepUpElementId.isEmpty() && !accessDocAvailable)
-            {
-                Log.d(TAG, "Step-Up: skipped — signaling_bitmap Bit0 not set (no Access Document)");
-            }
-            if (!stepUpElementId.isEmpty() && accessDocAvailable)
+            boolean stepupSelectRequired = (signalingBitmap & 0x0004) != 0; // Bit2 (NFC only)
+            if (willDoStepUp)
             {
                 // If Bit2 set: send step-up AID SELECT before ENVELOPE (§10.2, Table 10-3)
-                // Step-up AID: A000000909ACCE5502
                 if (stepupSelectRequired)
                 {
                     Log.d(TAG, "Step-Up: sending step-up AID SELECT (signaling_bitmap Bit2)");
@@ -2368,7 +2422,7 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                             || selectResp[selectResp.length - 1] != 0x00)
                     {
                         Log.w(TAG, "Step-Up: AID SELECT failed — skipping Step-Up");
-                        stepUpElementId = ""; // skip ENVELOPE
+                        willDoStepUp = false;
                     }
                     else
                     {
@@ -2376,7 +2430,7 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                     }
                 }
             }
-            if (!stepUpElementId.isEmpty() && accessDocAvailable)
+            if (willDoStepUp)
             {
                 Log.d(TAG, "Step-Up: requesting element '" + stepUpElementId + "'");
                 try
@@ -2388,6 +2442,29 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                     Log.w(TAG, "Step-Up failed (non-fatal): " + e.getMessage());
                     stepUpResult = "Step-Up failed: " + e.getMessage();
                 }
+
+                // Send final EXCHANGE with 0x97 (reader status) to close the transaction
+                // This must come AFTER step-up because 0x97 signals end-of-transaction.
+                Log.d(TAG, "Sending final EXCHANGE with 0x97 (post step-up)");
+                byte[] finalEncrypted = AliroCryptoProvider.encryptReaderGcm(skReader, statusTlv, readerCounter++);
+                if (finalEncrypted != null)
+                {
+                    byte[] finalCmd = buildExchangeCommand(finalEncrypted);
+                    byte[] finalResp = isoDep.transceive(finalCmd);
+                    Log.d(TAG, "Final EXCHANGE response: " + Hex.toHexString(finalResp));
+                    // Decrypt response (increment deviceCounter)
+                    if (isSW9000(finalResp) && finalResp.length > 2)
+                    {
+                        byte[] finalEnc = Arrays.copyOfRange(finalResp, 0, finalResp.length - 2);
+                        byte[] finalDec = AliroCryptoProvider.decryptDeviceGcm(skDevice, finalEnc, deviceCounter++);
+                        if (finalDec != null)
+                            Log.d(TAG, "Final EXCHANGE decrypted: " + Hex.toHexString(finalDec));
+                    }
+                }
+            }
+            else if (!stepUpElementId.isEmpty() && !accessDocAvailable)
+            {
+                Log.d(TAG, "Step-Up: skipped — signaling_bitmap Bit0 not set (no Access Document)");
             }
 
             // ------------------------------------------------------------------

@@ -668,36 +668,40 @@ public class AliroBleCredentialService extends Service
                     Log.d(TAG, "Sent EXCHANGE response");
                 }
 
-                // Check if step-up ENVELOPE is needed (Bit0 = Access Document available)
-                boolean stepUpNeeded = (signalingBits & 0x0001) != 0;
-                if (stepUpNeeded && stepUpSK != null)
+                // Read next message — could be:
+                //   a) ENVELOPE (step-up, if reader requests Access Document)
+                //   b) Reader Status Completed (normal completion)
+                //   c) Another EXCHANGE (multiple mailbox operations)
+                exchangeMsg = readAliroMessage(in);
+                exchangeHeader = AliroBleMessage.parseHeader(exchangeMsg);
+                exchangePayload = AliroBleMessage.extractPayload(exchangeMsg);
+
+                // Handle step-up ENVELOPE if the reader sends one
+                // The reader only sends ENVELOPE if it is configured for step-up,
+                // regardless of the signaling_bitmap Bit0 value.
+                if (exchangeHeader != null &&
+                    exchangeHeader[0] == AliroBleMessage.PROTOCOL_AP &&
+                    exchangeHeader[1] == AliroBleMessage.AP_RQ &&
+                    exchangePayload != null && exchangePayload.length >= 2 &&
+                    exchangePayload[1] == (byte)0xC3 &&
+                    stepUpSK != null)
                 {
-                    byte[] envelopeMsg = readAliroMessage(in);
-                    byte[] envelopeApdu = AliroBleMessage.extractPayload(envelopeMsg);
-                    if (envelopeApdu != null && envelopeApdu.length >= 2 && envelopeApdu[1] == (byte)0xC3)
+                    Log.d(TAG, "Received ENVELOPE (step-up)");
+                    byte[] envelopeResponse = handleEnvelopeBle(exchangePayload);
+                    if (envelopeResponse != null)
                     {
-                        byte[] envelopeResponse = handleEnvelopeBle(envelopeApdu);
-                        if (envelopeResponse != null)
-                        {
-                            byte[] envelopeRspMsg = AliroBleMessage.build(
-                                    AliroBleMessage.PROTOCOL_AP, AliroBleMessage.AP_RS, envelopeResponse);
-                            out.write(envelopeRspMsg);
-                            out.flush();
-                            Log.d(TAG, "Sent ENVELOPE response (Access Document)");
-                        }
+                        byte[] envelopeRspMsg = AliroBleMessage.build(
+                                AliroBleMessage.PROTOCOL_AP, AliroBleMessage.AP_RS, envelopeResponse);
+                        out.write(envelopeRspMsg);
+                        out.flush();
+                        Log.d(TAG, "Sent ENVELOPE response (Access Document)");
                     }
-                    // Read next message (should be Reader Status Completed)
+                    // Read Reader Status Completed after ENVELOPE
                     exchangeMsg = readAliroMessage(in);
                     exchangeHeader = AliroBleMessage.parseHeader(exchangeMsg);
                     exchangePayload = AliroBleMessage.extractPayload(exchangeMsg);
                 }
-                else
-                {
-                    // Read Reader Status Completed directly
-                    exchangeMsg = readAliroMessage(in);
-                    exchangeHeader = AliroBleMessage.parseHeader(exchangeMsg);
-                    exchangePayload = AliroBleMessage.extractPayload(exchangeMsg);
-                }
+                // else: exchangeMsg already holds Reader Status Completed — fall through
             }
 
             // ------------------------------------------------------------------
@@ -1118,6 +1122,14 @@ public class AliroBleCredentialService extends Service
 
             switch (tag)
             {
+                case 0xBA: // Mailbox container TLV (constructed) — step inside
+                    // Per Table 8-15, 0xBA wraps the mailbox operation TLVs.
+                    // Skip the BA + length header; the inner tags (0x8C, 0x87,
+                    // 0x8A, 0x95) will be processed by subsequent loop iterations.
+                    Log.d(TAG, "Mailbox: entering BA container (" + len + " bytes)");
+                    i = valOff; // enter the container — do NOT skip past it
+                    continue;   // re-enter the while loop at the first inner tag
+
                 case 0x8C: // Atomic session control
                     if (len == 1)
                     {

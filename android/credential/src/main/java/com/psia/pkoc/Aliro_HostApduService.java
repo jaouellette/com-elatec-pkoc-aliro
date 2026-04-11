@@ -687,6 +687,15 @@ public class Aliro_HostApduService extends HostApduService
 
             switch (tag)
             {
+                case 0xBA: // Mailbox container TLV (constructed) — step inside
+                    // Per Table 8-15, 0xBA wraps the mailbox operation TLVs.
+                    // Skip the BA + length header; the inner tags (0x8C, 0x87,
+                    // 0x8A, 0x95) will be processed by subsequent loop iterations
+                    // because we only advance i by 2 (into the container content).
+                    Log.d(TAG, "Mailbox: entering BA container (" + len + " bytes)");
+                    i = valOff; // enter the container — do NOT skip past it
+                    continue;   // re-enter the while loop at the first inner tag
+
                 case 0x8C: // Atomic session control
                     if (len == 1)
                     {

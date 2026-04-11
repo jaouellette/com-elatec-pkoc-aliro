@@ -135,27 +135,43 @@ public class AliroBleReaderService extends Service
     @SuppressLint("MissingPermission")
     public void startAliroBle()
     {
-        if (running)
+        // If a previous accept thread is still alive and blocking on accept(),
+        // the L2CAP infrastructure is already listening — nothing to do.
+        if (running && acceptThread != null && acceptThread.isAlive())
         {
-            Log.w(TAG, "Already running");
+            Log.d(TAG, "Already running — accept thread alive");
             return;
         }
+
+        // Previous accept thread died (server socket consumed / IO error) or
+        // was never started.  Re-create the L2CAP server socket so a fresh
+        // accept() can succeed, but keep GATT + advertising up.
         running = true;
 
         try
         {
-            // Step 1: Open L2CAP server socket (only once — SPSM must stay stable)
-            if (l2capServerSocket == null)
+            // Step 1: (Re-)open L2CAP server socket.
+            // Android may consume the server socket after the first accepted
+            // connection, so we must create a new one each time the accept
+            // thread needs to be restarted.
+            if (l2capServerSocket != null)
             {
-                l2capServerSocket = bluetoothAdapter.listenUsingInsecureL2capChannel();
-                spsm = l2capServerSocket.getPsm();
-                Log.d(TAG, "L2CAP server socket opened, SPSM=" + spsm);
+                try { l2capServerSocket.close(); } catch (Exception ignored) {}
             }
+            l2capServerSocket = bluetoothAdapter.listenUsingInsecureL2capChannel();
+            spsm = l2capServerSocket.getPsm();
+            Log.d(TAG, "L2CAP server socket opened, SPSM=" + spsm);
 
             // Step 2: Start GATT server (only once — keeps SPSM characteristic value stable)
             if (gattServer == null)
             {
                 startGattServer();
+            }
+            else
+            {
+                // GATT server already running — update the SPSM characteristic
+                // value in case the new server socket got a different PSM.
+                updateSpsmCharacteristic();
             }
 
             // Step 3: Start advertising (only once)
@@ -185,6 +201,7 @@ public class AliroBleReaderService extends Service
                         break;
                     }
                 }
+                Log.d(TAG, "Accept thread exiting");
             }, "AliroBleAccept");
             acceptThread.start();
         }
@@ -279,6 +296,32 @@ public class AliroBleReaderService extends Service
 
         gattServer.addService(service);
         Log.d(TAG, "GATT server started with Aliro FFF2 service");
+    }
+
+    /**
+     * Update the SPSM value in the already-running GATT service.
+     * Called when the L2CAP server socket is re-created (new PSM) but the
+     * GATT server is kept alive between connections.
+     */
+    @SuppressLint("MissingPermission")
+    private void updateSpsmCharacteristic()
+    {
+        if (gattServer == null) return;
+        BluetoothGattService service = gattServer.getService(SERVICE_UUID);
+        if (service == null) return;
+        BluetoothGattCharacteristic spsmChar = service.getCharacteristic(CHAR_SPSM_UUID);
+        if (spsmChar == null) return;
+
+        byte[] spsmVal = new byte[] {
+            (byte)((spsm >> 8) & 0xFF), (byte)(spsm & 0xFF),
+            0x02,
+            0x01, 0x00,
+            0x01,
+            0x00
+        };
+        spsmChar.setValue(spsmVal);
+        Log.d(TAG, "Updated SPSM characteristic to " + spsm
+                + " (" + org.bouncycastle.util.encoders.Hex.toHexString(spsmVal) + ")");
     }
 
     private final BluetoothGattServerCallback gattCallback = new BluetoothGattServerCallback()

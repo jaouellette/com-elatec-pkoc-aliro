@@ -260,6 +260,14 @@ public class AliroConfigFragment extends Fragment
         if (scanned.length() == 130 && scanned.matches("[0-9a-f]+"))
         {
             editStepUpIssuerPubKey.setText(scanned);
+            // Auto-populate Step-Up Element ID if empty — the Aliro spec
+            // default element identifier is "access" (see §7.2.5, Table 7-7).
+            // Without this, the reader won't request the Access Document even
+            // though the credential signals one is available (Bit0=1).
+            if (editStepUpElementId.getText().toString().trim().isEmpty())
+            {
+                editStepUpElementId.setText("access");
+            }
             showStatus("Issuer key scanned — tap Save to apply.", true);
         }
         else
