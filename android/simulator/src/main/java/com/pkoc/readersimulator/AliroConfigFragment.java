@@ -45,7 +45,9 @@ public class AliroConfigFragment extends Fragment
     private CheckBox chkMailboxEnabled;
     private Spinner  spinnerMailboxOperation;
     private EditText editMailboxOffset;
-    private EditText editMailboxLength;
+    private Spinner  spinnerMailboxLength;
+    private static final String[] MAILBOX_LENGTH_OPTIONS = { "64", "128", "256", "512", "1024" };
+    private static final String[] MAILBOX_LENGTH_LABELS  = { "64 bytes", "128 bytes", "256 bytes", "512 bytes", "1024 bytes" };
     private TextView lblMailboxLength;
     private EditText editMailboxData;
     private TextView lblMailboxData;
@@ -84,7 +86,11 @@ public class AliroConfigFragment extends Fragment
         chkMailboxEnabled       = view.findViewById(R.id.chkMailboxEnabled);
         spinnerMailboxOperation = view.findViewById(R.id.spinnerMailboxOperation);
         editMailboxOffset       = view.findViewById(R.id.editMailboxOffset);
-        editMailboxLength       = view.findViewById(R.id.editMailboxLength);
+        spinnerMailboxLength    = view.findViewById(R.id.spinnerMailboxLength);
+        android.widget.ArrayAdapter<String> mailboxLenAdapter = new android.widget.ArrayAdapter<>(
+                requireContext(), android.R.layout.simple_spinner_item, MAILBOX_LENGTH_LABELS);
+        mailboxLenAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        spinnerMailboxLength.setAdapter(mailboxLenAdapter);
         lblMailboxLength        = view.findViewById(R.id.lblMailboxLength);
         editMailboxData         = view.findViewById(R.id.editMailboxData);
         lblMailboxData          = view.findViewById(R.id.lblMailboxData);
@@ -120,7 +126,7 @@ public class AliroConfigFragment extends Fragment
         boolean isRead  = "read".equals(op);
 
         lblMailboxLength.setVisibility(isRead || isSet ? View.VISIBLE : View.GONE);
-        editMailboxLength.setVisibility(isRead || isSet ? View.VISIBLE : View.GONE);
+        spinnerMailboxLength.setVisibility(isRead || isSet ? View.VISIBLE : View.GONE);
         lblMailboxData.setVisibility(isWrite ? View.VISIBLE : View.GONE);
         editMailboxData.setVisibility(isWrite ? View.VISIBLE : View.GONE);
         lblMailboxSetValue.setVisibility(isSet ? View.VISIBLE : View.GONE);
@@ -160,7 +166,17 @@ public class AliroConfigFragment extends Fragment
             }
         }
         editMailboxOffset.setText(prefs.getString(AliroPreferences.MAILBOX_OFFSET, "0"));
-        editMailboxLength.setText(prefs.getString(AliroPreferences.MAILBOX_LENGTH, "16"));
+        // Restore mailbox length spinner to saved position
+        String savedLen = prefs.getString(AliroPreferences.MAILBOX_LENGTH, "256");
+        spinnerMailboxLength.setSelection(2); // default: 256 bytes
+        for (int i = 0; i < MAILBOX_LENGTH_OPTIONS.length; i++)
+        {
+            if (MAILBOX_LENGTH_OPTIONS[i].equals(savedLen))
+            {
+                spinnerMailboxLength.setSelection(i);
+                break;
+            }
+        }
         editMailboxData.setText(prefs.getString(AliroPreferences.MAILBOX_DATA, ""));
         editMailboxSetValue.setText(prefs.getString(AliroPreferences.MAILBOX_SET_VALUE, "00"));
         chkMailboxAtomic.setChecked(prefs.getBoolean(AliroPreferences.MAILBOX_ATOMIC, false));
@@ -226,7 +242,7 @@ public class AliroConfigFragment extends Fragment
         editor.putString(AliroPreferences.MAILBOX_OFFSET,
                 editMailboxOffset.getText().toString().trim());
         editor.putString(AliroPreferences.MAILBOX_LENGTH,
-                editMailboxLength.getText().toString().trim());
+                MAILBOX_LENGTH_OPTIONS[spinnerMailboxLength.getSelectedItemPosition()]);
         editor.putString(AliroPreferences.MAILBOX_DATA,
                 editMailboxData.getText().toString().trim());
         editor.putString(AliroPreferences.MAILBOX_SET_VALUE,

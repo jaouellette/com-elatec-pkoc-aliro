@@ -210,7 +210,10 @@ public class SendCredentialFragment extends Fragment
             }
 
             binding.readerIcon.setImageResource(R.drawable.ic_reader_success);
-            binding.statusText.setText(getString(R.string.credential_sent));
+            // Determine transport from the intent action or default to NFC
+            boolean isAliro = intent.getBooleanExtra("aliro", false);
+            String transport = isAliro ? "Aliro NFC" : "PKOC NFC";
+            binding.statusText.setText(transport + ": " + getString(R.string.credential_sent));
             binding.statusText.setVisibility(View.VISIBLE);
 
             binding.readerIcon.postDelayed(() ->
@@ -648,17 +651,17 @@ public class SendCredentialFragment extends Fragment
                 if (pkocGranted)
                 {
                     binding.readerIcon.setImageResource(R.drawable.ic_reader_success);
-                    binding.statusText.setText(getString(R.string.credential_sent));
+                    binding.statusText.setText("PKOC BLE: " + getString(R.string.credential_sent));
                 }
                 else if (pkocUnknown)
                 {
                     binding.readerIcon.setImageResource(R.drawable.ic_reader_success);
-                    binding.statusText.setText("Credential Sent");
+                    binding.statusText.setText("PKOC BLE: " + getString(R.string.credential_sent));
                 }
                 else
                 {
                     binding.readerIcon.setImageResource(R.drawable.ic_reader_error);
-                    binding.statusText.setText("Access Denied");
+                    binding.statusText.setText("PKOC BLE: Access Denied");
                 }
                 binding.statusText.setVisibility(View.VISIBLE);
 

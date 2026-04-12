@@ -261,7 +261,7 @@
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="Offset (decimal, 0-based)"
+            android:text="Offset (bytes, 0-based)"
             android:textSize="14sp"
             android:textStyle="bold"
             android:textColor="@color/colorTextPrimary"
@@ -271,7 +271,7 @@
             android:id="@+id/editMailboxOffset"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:hint="0"
+            android:hint="0 (bytes)"
             android:inputType="number"
             android:textSize="13sp"
             android:layout_marginBottom="12dp" />
@@ -281,19 +281,16 @@
             android:id="@+id/lblMailboxLength"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="Length (decimal)"
+            android:text="Read Length (bytes)"
             android:textSize="14sp"
             android:textStyle="bold"
             android:textColor="@color/colorTextPrimary"
             android:layout_marginBottom="4dp" />
 
-        <EditText
-            android:id="@+id/editMailboxLength"
+        <Spinner
+            android:id="@+id/spinnerMailboxLength"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:hint="16"
-            android:inputType="number"
-            android:textSize="13sp"
             android:layout_marginBottom="12dp" />
 
         <!-- Data (for write) -->

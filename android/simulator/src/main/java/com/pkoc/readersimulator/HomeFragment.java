@@ -76,6 +76,7 @@ import com.psia.pkoc.core.TLVProvider;
 import com.psia.pkoc.core.UuidConverters;
 import com.psia.pkoc.core.transactions.NfcNormalFlowTransaction;
 import com.psia.pkoc.core.AliroCryptoProvider;
+import com.psia.pkoc.core.AliroMailbox;
 import java.security.KeyPair;
 import java.security.interfaces.ECPublicKey;
 
@@ -199,22 +200,45 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                     // Stop accepting new connections while result is displayed
                     if (aliroBleService != null) aliroBleService.stopAliroBle();
 
-                    // Build connection type string — same format as Aliro NFC path
-                    String connectionType = sigValid
-                            ? "Aliro BLE — Signature Valid"
-                            : "Aliro BLE — Signature INVALID";
+                    // Build connection type string — formatted via shared helper
+                    // (initial value will be overwritten by formatAliroConnectionType below)
+                    String connectionType = "";
 
-                    // Append step-up result if an Access Document was retrieved
+                    // Parse step-up result from device response bytes
+                    String bleStepUpResult = null;
                     if (deviceResponse != null)
                     {
-                        String stepUpResult = parseBleStepUpResult(deviceResponse, stepUpElemId);
-                        if (stepUpResult != null)
-                            connectionType += "\nStep-Up: " + stepUpResult;
-                        else
-                            connectionType += "\nStep-Up: Access Document received";
+                        bleStepUpResult = parseBleStepUpResult(deviceResponse, stepUpElemId);
+                        if (bleStepUpResult == null)
+                            bleStepUpResult = "Access Document received";
                     }
+
+                    // Parse mailbox: if it looks like raw hex (not already parsed), decode it
+                    String bleMailboxParsed = null;
                     if (mailboxResult != null)
-                        connectionType += "\nMailbox: " + mailboxResult;
+                    {
+                        if (mailboxResult.matches("[0-9A-Fa-f]+") && mailboxResult.length() >= 4)
+                        {
+                            try
+                            {
+                                byte[] mailboxBytes = org.bouncycastle.util.encoders.Hex.decode(mailboxResult);
+                                if (mailboxBytes.length > 0 && (mailboxBytes[0] & 0xFF) == 0x60)
+                                    bleMailboxParsed = AliroMailbox.parseMailboxToString(mailboxBytes, mailboxBytes.length);
+                                else
+                                    bleMailboxParsed = mailboxResult;
+                            }
+                            catch (Exception ignored)
+                            {
+                                bleMailboxParsed = mailboxResult;
+                            }
+                        }
+                        else
+                        {
+                            bleMailboxParsed = mailboxResult;
+                        }
+                    }
+
+                    connectionType = formatAliroConnectionType("BLE", sigValid, bleStepUpResult, bleMailboxParsed);
 
                     // Show the credential result screen — same as Aliro NFC
                     readerImageView.setVisibility(View.GONE);
@@ -1374,14 +1398,18 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                         keypadLayout.setVisibility(View.GONE);
 
                         String publicKeyHex = Hex.toHexString(pubKey).toUpperCase();
-                        String connectionTypeText = "Connection Type: Unknown";
+                        String connectionTypeText;
                         if (deviceModel.connectionType == PKOC_ConnectionType.ECHDE_Full)
                         {
-                            connectionTypeText = "Connection Type: ECDHE Perfect Secrecy Mode";
+                            connectionTypeText = "PKOC BLE — ECDHE Perfect Secrecy";
                         }
                         else if (deviceModel.connectionType == PKOC_ConnectionType.Uncompressed)
                         {
-                            connectionTypeText = "(PKOC - BLE) Connection Type: Normal Flow";
+                            connectionTypeText = "PKOC BLE — Normal Flow";
+                        }
+                        else
+                        {
+                            connectionTypeText = "PKOC BLE — Unknown Flow";
                         }
                         displayPublicKeyInfo(publicKeyHex, connectionTypeText);
                     });
@@ -1624,11 +1652,82 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
             // Use SpannableStringBuilder to build the final text
             SpannableStringBuilder formattedText = new SpannableStringBuilder();
 
-            SpannableString connectionTypeSpannable = new SpannableString(connectionTypeText + "\n\n");
-            connectionTypeSpannable.setSpan(new StyleSpan(Typeface.BOLD), 0, connectionTypeText.length(), Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
-            connectionTypeSpannable.setSpan(new ForegroundColorSpan(Color.BLACK), 0, connectionTypeText.length(), Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
-            connectionTypeSpannable.setSpan(new AbsoluteSizeSpan(16, true), 0, connectionTypeText.length(), Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
-            formattedText.append(connectionTypeSpannable);
+            // Render connectionTypeText with smart formatting:
+            // - If it contains Aliro section headers (ALL-CAPS lines like "ACCESS DOCUMENT"),
+            //   apply bold+large only to the first line (transport + sig status), bold to
+            //   section headers, and normal weight to data lines.
+            // - For all other cases (PKOC), render as a single bold block (legacy behaviour).
+            boolean hasAliroSections = connectionTypeText.contains("\nACCESS DOCUMENT")
+                    || connectionTypeText.contains("\nMAILBOX");
+
+            if (hasAliroSections)
+            {
+                String[] ctLines = connectionTypeText.split("\n", -1);
+                SpannableStringBuilder ctSb = new SpannableStringBuilder();
+
+                for (int li = 0; li < ctLines.length; li++)
+                {
+                    String line = ctLines[li];
+                    String lineWithNl = (li < ctLines.length - 1) ? line + "\n" : line;
+
+                    // Determine style for this line.
+                    // A section header is a non-indented line whose first word is
+                    // all uppercase letters (e.g. "ACCESS DOCUMENT", "MAILBOX (256 bytes)").
+                    boolean isFirstLine  = (li == 0);
+                    String trimmed = line.trim();
+                    boolean isSectionHdr = !trimmed.isEmpty()
+                            && !line.startsWith(" ")  // not indented
+                            && Character.isUpperCase(trimmed.charAt(0))
+                            && trimmed.length() > 1
+                            && !isFirstLine
+                            // first word must be all-uppercase
+                            && trimmed.split("[^A-Za-z]")[0].equals(
+                                    trimmed.split("[^A-Za-z]")[0].toUpperCase());
+
+                    SpannableString ls = new SpannableString(lineWithNl);
+                    int len = lineWithNl.length();
+
+                    if (isFirstLine)
+                    {
+                        ls.setSpan(new StyleSpan(Typeface.BOLD), 0, len,
+                                Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+                        ls.setSpan(new AbsoluteSizeSpan(16, true), 0, len,
+                                Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+                        ls.setSpan(new ForegroundColorSpan(Color.BLACK), 0, len,
+                                Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+                    }
+                    else if (isSectionHdr)
+                    {
+                        ls.setSpan(new StyleSpan(Typeface.BOLD), 0, len,
+                                Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+                        ls.setSpan(new AbsoluteSizeSpan(13, true), 0, len,
+                                Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+                        ls.setSpan(new ForegroundColorSpan(Color.BLACK), 0, len,
+                                Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+                    }
+                    else
+                    {
+                        ls.setSpan(new StyleSpan(Typeface.NORMAL), 0, len,
+                                Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+                        ls.setSpan(new AbsoluteSizeSpan(13, true), 0, len,
+                                Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+                        ls.setSpan(new ForegroundColorSpan(Color.BLACK), 0, len,
+                                Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+                    }
+                    ctSb.append(ls);
+                }
+                ctSb.append("\n\n");
+                formattedText.append(ctSb);
+            }
+            else
+            {
+                // Legacy path: render entire connectionTypeText as one bold block
+                SpannableString connectionTypeSpannable = new SpannableString(connectionTypeText + "\n\n");
+                connectionTypeSpannable.setSpan(new StyleSpan(Typeface.BOLD), 0, connectionTypeText.length(), Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+                connectionTypeSpannable.setSpan(new ForegroundColorSpan(Color.BLACK), 0, connectionTypeText.length(), Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+                connectionTypeSpannable.setSpan(new AbsoluteSizeSpan(16, true), 0, connectionTypeText.length(), Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+                formattedText.append(connectionTypeSpannable);
+            }
 
             // Apply bold style to the "Public Key:" text with black color and size 14
             SpannableString publicKeyHeader = new SpannableString("Public Key: \n");
@@ -1887,7 +1986,7 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                         keypadLayout.setVisibility(View.GONE);
                         String pk = Hex.toHexString(publicKey);
                         Log.d("NFC", "PKOC Public Key: " + pk);
-                        displayPublicKeyInfo(pk, "(PKOC - NFC) Connection Type: Normal Flow");
+                        displayPublicKeyInfo(pk, "PKOC NFC — Normal Flow");
                     });
                 }
                 else
@@ -2361,7 +2460,17 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                                 if (readDataLen > 0)
                                 {
                                     byte[] mailboxReadData = Arrays.copyOfRange(exchangeDecrypted, 0, readDataLen);
-                                    mailboxResultHex = "Read " + readDataLen + "B: " + Hex.toHexString(mailboxReadData);
+                                    // Parse §18 TLV if data starts with 0x60, else fall back to hex
+                                    if (readDataLen > 0 && (mailboxReadData[0] & 0xFF) == 0x60)
+                                    {
+                                        mailboxResultHex = AliroMailbox.parseMailboxToString(
+                                                mailboxReadData, readDataLen);
+                                    }
+                                    else
+                                    {
+                                        mailboxResultHex = "Read " + readDataLen + "B: "
+                                                + Hex.toHexString(mailboxReadData);
+                                    }
                                     Log.d(TAG, "Mailbox READ response (" + readDataLen + " bytes): "
                                             + Hex.toHexString(mailboxReadData));
                                 }
@@ -2489,13 +2598,8 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                 keypadLayout.setVisibility(View.GONE);
                 String pk = Hex.toHexString(finalCredPubKey);
                 Log.d(TAG, "Aliro credential public key: " + pk);
-                String connectionType = finalSigValid
-                        ? "Aliro — Signature Valid"
-                        : "Aliro — Signature INVALID";
-                if (finalStepUpResult != null)
-                    connectionType += "\nStep-Up: " + finalStepUpResult;
-                if (finalMailboxResult != null)
-                    connectionType += "\nMailbox: " + finalMailboxResult;
+                String connectionType = formatAliroConnectionType(
+                        "NFC", finalSigValid, finalStepUpResult, finalMailboxResult);
                 displayPublicKeyInfo(pk, connectionType);
 
                 ToneGenerator toneGen = new ToneGenerator(AudioManager.STREAM_RING, 100);
@@ -2939,10 +3043,13 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
             // 8. Extract AccessData element value for display
             String accessSummary = extractAccessDataSummary(nameSpaces, elementId);
 
-            String result = (issuerKeyHex.isEmpty() ? "(sig not verified)" :
-                    (docVerified ? "Signature Valid" : "Signature INVALID"));
-            if (accessSummary != null) result += " | " + accessSummary;
-            return result;
+            // Build result: sig status on first line, then access summary
+            String sigStatus = (issuerKeyHex.isEmpty() ? "(sig not verified)"
+                    : (docVerified ? "Signature Valid" : "Signature INVALID"));
+            StringBuilder result = new StringBuilder(sigStatus);
+            if (accessSummary != null)
+                result.append("\n").append(accessSummary);
+            return result.toString();
         }
         finally
         {
@@ -3002,10 +3109,12 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
 
             String accessSummary = extractAccessDataSummary(nameSpaces, elementId);
 
-            String result = (issuerKeyHex.isEmpty() ? "(sig not verified)"
+            String sigStatus = (issuerKeyHex.isEmpty() ? "(sig not verified)"
                     : (docVerified ? "Signature Valid" : "Signature INVALID"));
-            if (accessSummary != null) result += " | " + accessSummary;
-            return result;
+            StringBuilder result = new StringBuilder(sigStatus);
+            if (accessSummary != null)
+                result.append("\n").append(accessSummary);
+            return result.toString();
         }
         catch (Exception e)
         {
@@ -3118,7 +3227,18 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
 
     /**
      * Extract a human-readable summary from the AccessData element in the DeviceResponse.
-     * Looks for the requested elementId in namespace "aliro-a".
+     *
+     * Parses the full AccessData map per Aliro 1.0 §7.3:
+     *   0 = version, 1 = id (bstr), 2 = AccessRules array, 3 = Schedules array
+     *
+     * AccessRule (§7.3.3): { 0: capabilities(uint), 1: allowScheduleIds(uint) }
+     *   capability bitmask: bit0=Secure, bit1=Unsecure, bit3=Momentary_Unsecure
+     *
+     * Schedule (§7.3.4): { 0: startPeriod, 1: endPeriod, 2: recurrenceRule[], 3: flags }
+     *   recurrenceRule: [durationSeconds, dayMask, pattern, interval, ordinal]
+     *   dayMask bits: 0=Mon,1=Tue,2=Wed,3=Thu,4=Fri,5=Sat,6=Sun
+     *
+     * Returns null if parsing fails (caller shows a generic result).
      */
     private String extractAccessDataSummary(com.upokecenter.cbor.CBORObject nameSpaces,
                                              String elementId)
@@ -3132,25 +3252,100 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
 
             for (int i = 0; i < items.size(); i++)
             {
-                // Each item is a bstr containing an IssuerSignedItem CBOR map
+                // Each item is a bstr wrapping an IssuerSignedItem CBOR map
                 byte[] itemBytes = items.get(i).GetByteString();
                 com.upokecenter.cbor.CBORObject item =
                         com.upokecenter.cbor.CBORObject.DecodeFromBytes(itemBytes);
                 com.upokecenter.cbor.CBORObject eid =
                         item.get(com.upokecenter.cbor.CBORObject.FromObject("3"));
-                if (eid != null && elementId.equals(eid.AsString()))
+                if (eid == null || !elementId.equals(eid.AsString())) continue;
+
+                com.upokecenter.cbor.CBORObject val =
+                        item.get(com.upokecenter.cbor.CBORObject.FromObject("4"));
+                if (val == null) return null;
+
+                // ---- version (key 0) ----
+                com.upokecenter.cbor.CBORObject versionObj =
+                        val.get(com.upokecenter.cbor.CBORObject.FromObject(0));
+                int version = (versionObj != null) ? versionObj.AsInt32Value() : -1;
+
+                StringBuilder sb = new StringBuilder();
+
+                // ---- employee ID (key 1, optional bstr) ----
+                com.upokecenter.cbor.CBORObject idObj =
+                        val.get(com.upokecenter.cbor.CBORObject.FromObject(1));
+                if (idObj != null && idObj.getType() ==
+                        com.upokecenter.cbor.CBORType.ByteString)
                 {
-                    com.upokecenter.cbor.CBORObject val =
-                            item.get(com.upokecenter.cbor.CBORObject.FromObject("4"));
-                    if (val != null)
+                    try
                     {
-                        // AccessData map: key "0" = version
-                        com.upokecenter.cbor.CBORObject version =
-                                val.get(com.upokecenter.cbor.CBORObject.FromObject(0));
-                        return "element='" + elementId + "' version="
-                                + (version != null ? version.AsInt32() : "?");
+                        String empId = new String(idObj.GetByteString(),
+                                java.nio.charset.StandardCharsets.UTF_8);
+                        sb.append("  Employee ID:    ").append(empId).append("\n");
+                    }
+                    catch (Exception ignored) {}
+                }
+
+                sb.append("  Element:        ").append(elementId)
+                  .append(" (v").append(version).append(")\n");
+
+                // ---- AccessRules (key 2, optional array) ----
+                com.upokecenter.cbor.CBORObject rulesArr =
+                        val.get(com.upokecenter.cbor.CBORObject.FromObject(2));
+
+                // Collect schedules now so rules can reference them
+                com.upokecenter.cbor.CBORObject schedsArr =
+                        val.get(com.upokecenter.cbor.CBORObject.FromObject(3));
+
+                if (rulesArr != null && rulesArr.getType() ==
+                        com.upokecenter.cbor.CBORType.Array)
+                {
+                    int numRules = rulesArr.size();
+                    sb.append("  Access Rules:   ").append(numRules).append("\n");
+                    for (int r = 0; r < numRules; r++)
+                    {
+                        com.upokecenter.cbor.CBORObject rule = rulesArr.get(r);
+                        com.upokecenter.cbor.CBORObject capObj =
+                                rule.get(com.upokecenter.cbor.CBORObject.FromObject(0));
+                        com.upokecenter.cbor.CBORObject schedIdsObj =
+                                rule.get(com.upokecenter.cbor.CBORObject.FromObject(1));
+
+                        String capStr = (capObj != null)
+                                ? decodeCapabilities(capObj.AsInt32Value()) : "";
+                        sb.append("    Rule ").append(r + 1).append(":  ")
+                          .append(capStr).append("\n");
+
+                        // Attach associated schedules
+                        if (schedIdsObj != null && schedsArr != null
+                                && schedsArr.getType() == com.upokecenter.cbor.CBORType.Array)
+                        {
+                            // schedIdsObj may be a single int or an array
+                            java.util.List<Integer> schedIds = new java.util.ArrayList<>();
+                            if (schedIdsObj.getType() == com.upokecenter.cbor.CBORType.Array)
+                            {
+                                for (int si = 0; si < schedIdsObj.size(); si++)
+                                    schedIds.add(schedIdsObj.get(si).AsInt32Value());
+                            }
+                            else
+                            {
+                                schedIds.add(schedIdsObj.AsInt32Value());
+                            }
+                            for (int sid : schedIds)
+                            {
+                                if (sid < schedsArr.size())
+                                {
+                                    String schedStr = decodeScheduleSummary(
+                                            schedsArr.get(sid), sid);
+                                    if (schedStr != null)
+                                        sb.append("             Schedule: ")
+                                          .append(schedStr).append("\n");
+                                }
+                            }
+                        }
                     }
                 }
+
+                return sb.toString().trim();
             }
         }
         catch (Exception e)
@@ -3158,6 +3353,131 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
             Log.w(TAG, "extractAccessDataSummary failed: " + e.getMessage());
         }
         return null;
+    }
+
+    /**
+     * Decode capabilities bitmask (§7.3.3 Table 7-7) to a human-readable label string.
+     * bit0=Secure, bit1=Unsecure, bit3=Momentary_Unsecure
+     */
+    private static String decodeCapabilities(int cap)
+    {
+        if (cap == 0) return "None";
+        java.util.List<String> parts = new java.util.ArrayList<>();
+        if ((cap & 0x01) != 0) parts.add("Secure");
+        if ((cap & 0x02) != 0) parts.add("Unsecure");
+        if ((cap & 0x08) != 0) parts.add("Momentary Unsecure");
+        int unknown = cap & ~0x0B;
+        if (unknown != 0) parts.add(String.format("0x%02X", unknown));
+        StringBuilder sb = new StringBuilder();
+        for (int idx = 0; idx < parts.size(); idx++)
+        {
+            if (idx > 0) sb.append(", ");
+            sb.append(parts.get(idx));
+        }
+        return sb.toString();
+    }
+
+    /**
+     * Decode a Schedule CBOR map (§7.3.4) to a human-readable string.
+     * recurrenceRule: [durationSeconds, dayMask, pattern, interval, ordinal]
+     * dayMask bits: 0=Mon 1=Tue 2=Wed 3=Thu 4=Fri 5=Sat 6=Sun
+     *
+     * Example output: "Mon-Fri (12 hours)" or "Sat-Sun (8 hours)"
+     */
+    private static String decodeScheduleSummary(com.upokecenter.cbor.CBORObject sched, int index)
+    {
+        try
+        {
+            com.upokecenter.cbor.CBORObject recRule =
+                    sched.get(com.upokecenter.cbor.CBORObject.FromObject(2));
+            if (recRule == null || recRule.size() < 2) return null;
+
+            int durationSec = recRule.get(0).AsInt32Value();
+            int dayMask     = recRule.get(1).AsInt32Value();
+
+            // Build day-of-week string — try to compress consecutive runs
+            final String[] DAY_FULL  = { "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun" };
+            java.util.List<String> activeDays = new java.util.ArrayList<>();
+            for (int d = 0; d < 7; d++)
+                if ((dayMask & (1 << d)) != 0) activeDays.add(DAY_FULL[d]);
+
+            String daysStr;
+            if (activeDays.isEmpty())
+            {
+                daysStr = "(no days)";
+            }
+            else if (activeDays.size() == 7)
+            {
+                daysStr = "Every day";
+            }
+            else if (activeDays.size() == 1)
+            {
+                daysStr = activeDays.get(0);
+            }
+            else
+            {
+                // Show first-last if consecutive, otherwise comma-separated
+                daysStr = activeDays.get(0) + "-" + activeDays.get(activeDays.size() - 1);
+            }
+
+            // Duration: show hours + minutes
+            int hours   = durationSec / 3600;
+            int minutes = (durationSec % 3600) / 60;
+            String durStr;
+            if (minutes == 0)
+                durStr = hours + (hours == 1 ? " hour" : " hours");
+            else
+                durStr = hours + "h " + minutes + "m";
+
+            return daysStr + " (" + durStr + ")";
+        }
+        catch (Exception e) { return null; }
+    }
+
+    /**
+     * Build a cleanly formatted multi-line connectionType string for Aliro result display.
+     *
+     * The first line is the transport + signature status (used as bold title).
+     * Subsequent section headers ("ACCESS DOCUMENT", "MAILBOX") are ALL-CAPS so
+     * displayPublicKeyInfo() can detect and style them.
+     *
+     * @param transport     "NFC" or "BLE"
+     * @param sigValid      whether the credential signature was verified
+     * @param stepUpResult  parsed step-up result string, or null
+     * @param mailboxResult parsed mailbox string, or null
+     * @return formatted string ready for displayPublicKeyInfo()
+     */
+    private static String formatAliroConnectionType(String transport,
+                                                     boolean sigValid,
+                                                     String stepUpResult,
+                                                     String mailboxResult)
+    {
+        StringBuilder sb = new StringBuilder();
+        sb.append("Aliro ").append(transport).append(" — ")
+          .append(sigValid ? "Signature Valid" : "Signature INVALID");
+
+        if (stepUpResult != null)
+        {
+            sb.append("\n\nACCESS DOCUMENT\n");
+            // Each line of stepUpResult is already indented with leading spaces
+            // (produced by extractAccessDataSummary). Append as-is.
+            for (String line : stepUpResult.split("\n", -1))
+            {
+                sb.append(line).append("\n");
+            }
+        }
+
+        if (mailboxResult != null)
+        {
+            sb.append("\nMAILBOX (").append(AliroMailbox.MAILBOX_SIZE).append(" bytes)\n");
+            for (String line : mailboxResult.split("\n", -1))
+            {
+                sb.append(line).append("\n");
+            }
+        }
+
+        // Trim trailing whitespace but keep the content intact
+        return sb.toString().trim();
     }
 
     private void showAliroCredentialRejectDialog(String sw)

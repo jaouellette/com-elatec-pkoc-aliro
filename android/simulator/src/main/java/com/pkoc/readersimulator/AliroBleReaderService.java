@@ -31,6 +31,7 @@ import androidx.annotation.RequiresApi;
 
 import com.psia.pkoc.core.AliroBleMessage;
 import com.psia.pkoc.core.AliroCryptoProvider;
+import com.psia.pkoc.core.AliroMailbox;
 
 import com.upokecenter.cbor.CBORObject;
 
@@ -871,7 +872,12 @@ public class AliroBleReaderService extends Service
                             if (readDataLen > 0)
                             {
                                 byte[] mailboxReadData = Arrays.copyOfRange(decExchangeRsp, 0, readDataLen);
-                                finalMailboxResult = "Read " + readDataLen + "B: " + Hex.toHexString(mailboxReadData);
+                                // Parse mailbox using the shared §18 TLV parser for
+                                // human-readable display (same as NFC path)
+                                if (mailboxReadData.length > 0 && (mailboxReadData[0] & 0xFF) == 0x60)
+                                    finalMailboxResult = AliroMailbox.parseMailboxToString(mailboxReadData, readDataLen);
+                                else
+                                    finalMailboxResult = "Read " + readDataLen + "B: " + Hex.toHexString(mailboxReadData);
                                 Log.d(TAG, "Mailbox READ response (" + readDataLen + " bytes): "
                                         + Hex.toHexString(mailboxReadData));
                             }

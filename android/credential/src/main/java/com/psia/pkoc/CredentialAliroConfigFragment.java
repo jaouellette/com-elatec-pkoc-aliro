@@ -32,6 +32,7 @@ import androidx.annotation.Nullable;
 import androidx.fragment.app.Fragment;
 
 import com.psia.pkoc.core.AliroAccessDocument;
+import com.psia.pkoc.core.AliroMailbox;
 
 import java.security.KeyStore;
 import java.security.interfaces.ECPublicKey;
@@ -42,15 +43,20 @@ import java.util.concurrent.Executors;
  * Credential-side Aliro configuration screen.
  *
  * Allows the user to:
- *   1. Generate a self-signed test Access Document (for Step-Up flow testing)
- *   2. Import a pre-built Access Document from Base64 CBOR + issuer public key
- *   3. View the current document status (mode, element ID, expiry)
- *   4. Clear the stored document
+ *   1. Generate a self-signed test Access Document (minimal, for Step-Up flow testing)
+ *   2. Load a realistic sample Access Document (employee badge with schedules + rules)
+ *   3. Import a pre-built Access Document from Base64 CBOR + issuer public key
+ *   4. View the current document status (mode, element ID, expiry)
+ *   5. Clear the stored document
+ *   6. Initialize mailbox with all-zero bytes (selected size)
+ *   7. Load a realistic sample mailbox (ELATEC §18 TLV with reader config + door status)
+ *   8. Clear the mailbox
  */
 public class CredentialAliroConfigFragment extends Fragment
 {
     private TextView    txtDocumentStatus;
     private Button      btnGenerateTest;
+    private Button      btnLoadSampleDoc;
     private Button      btnImport;
     private Button      btnClear;
     private Button      btnCopyIssuerKey;
@@ -65,11 +71,13 @@ public class CredentialAliroConfigFragment extends Fragment
     private TextView    txtMailboxHexDump;
     private Spinner     spinnerMailboxSize;
     private Button      btnInitMailbox;
+    private Button      btnLoadSampleMailbox;
     private Button      btnClearMailbox;
 
     private static final String MAILBOX_PREFS_NAME = "AliroMailbox";
     private static final String MAILBOX_PREF_KEY   = "mailbox";
-    private static final String[] MAILBOX_SIZES = { "64", "128", "256", "512", "1024" };
+    private static final String[] MAILBOX_SIZES       = { "64", "128", "256", "512", "1024" };
+    private static final String[] MAILBOX_SIZE_LABELS  = { "64 bytes", "128 bytes", "256 bytes", "512 bytes", "1024 bytes" };
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
     private final Handler         uiHandler = new Handler(Looper.getMainLooper());
@@ -90,6 +98,7 @@ public class CredentialAliroConfigFragment extends Fragment
 
         txtDocumentStatus  = view.findViewById(R.id.txtAccessDocStatus);
         btnGenerateTest    = view.findViewById(R.id.btnGenerateTestDoc);
+        btnLoadSampleDoc   = view.findViewById(R.id.btnLoadSampleDoc);
         btnImport          = view.findViewById(R.id.btnImportDoc);
         btnClear           = view.findViewById(R.id.btnClearDoc);
         btnCopyIssuerKey   = view.findViewById(R.id.btnCopyIssuerKey);
@@ -100,14 +109,15 @@ public class CredentialAliroConfigFragment extends Fragment
         txtStatus          = view.findViewById(R.id.txtCredAliroStatus);
 
         // Mailbox viewer
-        txtMailboxSize      = view.findViewById(R.id.txtMailboxSize);
-        txtMailboxHexDump   = view.findViewById(R.id.txtMailboxHexDump);
-        spinnerMailboxSize  = view.findViewById(R.id.spinnerMailboxSize);
-        btnInitMailbox      = view.findViewById(R.id.btnInitMailbox);
-        btnClearMailbox     = view.findViewById(R.id.btnClearMailbox);
+        txtMailboxSize        = view.findViewById(R.id.txtMailboxSize);
+        txtMailboxHexDump     = view.findViewById(R.id.txtMailboxHexDump);
+        spinnerMailboxSize    = view.findViewById(R.id.spinnerMailboxSize);
+        btnInitMailbox        = view.findViewById(R.id.btnInitMailbox);
+        btnLoadSampleMailbox  = view.findViewById(R.id.btnLoadSampleMailbox);
+        btnClearMailbox       = view.findViewById(R.id.btnClearMailbox);
 
         ArrayAdapter<String> sizeAdapter = new ArrayAdapter<>(
-                requireContext(), android.R.layout.simple_spinner_item, MAILBOX_SIZES);
+                requireContext(), android.R.layout.simple_spinner_item, MAILBOX_SIZE_LABELS);
         sizeAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
         spinnerMailboxSize.setAdapter(sizeAdapter);
         spinnerMailboxSize.setSelection(2); // default: 256
@@ -116,11 +126,13 @@ public class CredentialAliroConfigFragment extends Fragment
         refreshMailboxViewer();
 
         btnGenerateTest.setOnClickListener(v -> generateTestDocument());
+        btnLoadSampleDoc.setOnClickListener(v -> loadSampleDocument());
         btnImport.setOnClickListener(v -> showImportDialog());
         btnClear.setOnClickListener(v -> clearDocument());
         btnCopyIssuerKey.setOnClickListener(v -> copyIssuerKeyToClipboard());
         btnShowQr.setOnClickListener(v -> showIssuerKeyQrDialog());
         btnInitMailbox.setOnClickListener(v -> initializeMailbox());
+        btnLoadSampleMailbox.setOnClickListener(v -> loadSampleMailbox());
         btnClearMailbox.setOnClickListener(v -> clearMailbox());
     }
 
@@ -180,9 +192,9 @@ public class CredentialAliroConfigFragment extends Fragment
         if (!issuerHex.isEmpty())
         {
             layoutIssuerKey.setVisibility(View.VISIBLE);
-            // Preview: first 16 chars + "..." + last 8 chars
+            // Preview: first 16 chars + "…" + last 8 chars
             String preview = issuerHex.length() > 24
-                    ? issuerHex.substring(0, 16) + "…" + issuerHex.substring(issuerHex.length() - 8)
+                    ? issuerHex.substring(0, 16) + "\u2026" + issuerHex.substring(issuerHex.length() - 8)
                     : issuerHex;
             txtIssuerKeyPreview.setText(preview);
         }
@@ -199,7 +211,7 @@ public class CredentialAliroConfigFragment extends Fragment
     }
 
     // -------------------------------------------------------------------------
-    // Generate test document
+    // Generate minimal test document
     // -------------------------------------------------------------------------
 
     private void generateTestDocument()
@@ -217,7 +229,6 @@ public class CredentialAliroConfigFragment extends Fragment
 
         executor.execute(() ->
         {
-            // Get credential public key from Android KeyStore
             byte[] credPubKeyBytes = getCredentialPublicKeyBytes();
             if (credPubKeyBytes == null)
             {
@@ -239,12 +250,63 @@ public class CredentialAliroConfigFragment extends Fragment
                 btnGenerateTest.setEnabled(true);
                 if (result != null)
                 {
-                    showStatus("✓ " + result, true);
+                    showStatus("\u2713 " + result, true);
                     refreshDocumentStatus();
                 }
                 else
                 {
                     showStatus("Failed to generate document. Check logs.", false);
+                }
+            });
+        });
+    }
+
+    // -------------------------------------------------------------------------
+    // Load realistic sample document (employee badge with schedules)
+    // -------------------------------------------------------------------------
+
+    private void loadSampleDocument()
+    {
+        String elementId = editElementId.getText().toString().trim();
+        if (TextUtils.isEmpty(elementId))
+        {
+            elementId = "access";
+            editElementId.setText(elementId);
+        }
+
+        final String finalElementId = elementId;
+        showStatus("Generating sample document (ELATEC001, 2 rules, 2 schedules)...", false);
+        btnLoadSampleDoc.setEnabled(false);
+
+        executor.execute(() ->
+        {
+            byte[] credPubKeyBytes = getCredentialPublicKeyBytes();
+            if (credPubKeyBytes == null)
+            {
+                uiHandler.post(() ->
+                {
+                    if (!isAdded()) return;
+                    showStatus("Credential keypair not found. Open the main screen first.", false);
+                    btnLoadSampleDoc.setEnabled(true);
+                });
+                return;
+            }
+
+            String result = AliroAccessDocument.generateRealisticSampleDocument(
+                    requireContext(), credPubKeyBytes, finalElementId, 365);
+
+            uiHandler.post(() ->
+            {
+                if (!isAdded()) return;
+                btnLoadSampleDoc.setEnabled(true);
+                if (result != null)
+                {
+                    showStatus("\u2713 " + result, true);
+                    refreshDocumentStatus();
+                }
+                else
+                {
+                    showStatus("Failed to generate sample document. Check logs.", false);
                 }
             });
         });
@@ -296,7 +358,7 @@ public class CredentialAliroConfigFragment extends Fragment
                 btnImport.setEnabled(true);
                 if (result != null)
                 {
-                    showStatus("✓ " + result, true);
+                    showStatus("\u2713 " + result, true);
                     refreshDocumentStatus();
                 }
                 else
@@ -461,7 +523,27 @@ public class CredentialAliroConfigFragment extends Fragment
         byte[] mailbox = new byte[size];
         saveMailboxBytes(mailbox);
         refreshMailboxViewer();
-        showStatus("Mailbox initialized: " + size + " bytes", true);
+        showStatus("Mailbox initialized: " + size + " bytes (all zeros)", true);
+    }
+
+    /**
+     * Write the realistic §18 ELATEC sample mailbox (256 bytes) and refresh the viewer.
+     *
+     * Content:
+     *   Entry 0 — Reader Config (Type 0x01): firmware "2.1.0", serial "ELA-TWN4-00042",
+     *             zone "Building A - Main Lobby", door #42
+     *   Entry 1 — Door Status (Type 0x02): locked, 95% battery, 22°C, last event, 163 txns
+     */
+    private void loadSampleMailbox()
+    {
+        byte[] mailbox = AliroMailbox.buildSampleMailbox();
+        saveMailboxBytes(mailbox);
+        refreshMailboxViewer();
+        showStatus("\u2713 Sample mailbox loaded: "
+                + AliroMailbox.MAILBOX_SIZE + " bytes\n"
+                + "  OUI: 00:13:7D (ELATEC)\n"
+                + "  Entry 0 (0x01): Reader Config — FW 2.1.0, Door #42\n"
+                + "  Entry 1 (0x02): Door Status — Locked, 95%, 22\u00B0C", true);
     }
 
     private void clearMailbox()

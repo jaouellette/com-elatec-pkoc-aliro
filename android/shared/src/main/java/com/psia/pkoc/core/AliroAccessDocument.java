@@ -51,7 +51,19 @@ import java.util.Arrays;
  *
  * AccessData (per §7.3):
  *   0: version (uint = 1)
- *   (other fields optional for minimal test document)
+ *   1: id (bstr, optional)
+ *   2: AccessRules array (optional)
+ *   3: Schedules array (optional)
+ *
+ * AccessRule (per §7.3.3):
+ *   0: capabilities (uint, bitmask)
+ *   1: allowScheduleIds (uint, bitmask of schedule indices)
+ *
+ * Schedule (per §7.3.4):
+ *   0: startPeriod (uint, unix epoch seconds)
+ *   1: endPeriod (uint, unix epoch seconds)
+ *   2: recurrenceRule array [durationSeconds, mask, pattern, interval, ordinal]
+ *   3: flags (uint, bit 0 = Time_in_UTC)
  *
  * Storage: stored as Base64-encoded CBOR in SharedPreferences under key "aliro_access_doc".
  * The issuer public key (for reader-side verification) is stored separately under
@@ -101,17 +113,13 @@ public class AliroAccessDocument
         try
         {
             // 1. Generate issuer keypair
-            // Use AliroCryptoProvider.generateEphemeralKeypair() which already handles
-            // the correct provider selection for Android.
             KeyPair issuerKP = AliroCryptoProvider.generateEphemeralKeypair();
             if (issuerKP == null) return null;
             ECPublicKey issuerPub = (ECPublicKey) issuerKP.getPublic();
             byte[] issuerPubBytes = uncompressedPoint(issuerPub);
 
-            // 2. Build AccessData CBOR per §7.3
-            //    Minimal: { 0: 1 }  (version=1, no access rules)
-            CBORObject accessData = CBORObject.NewOrderedMap();
-            accessData.Add(CBORObject.FromObject(0), CBORObject.FromObject(1)); // version=1
+            // 2. Build AccessData CBOR per §7.3 — minimal: { 0: 1 }
+            CBORObject accessData = buildMinimalAccessData();
 
             // 3. Build IssuerSignedItem per Table 7-2
             byte[] random = AliroCryptoProvider.generateRandom(16);
@@ -135,8 +143,7 @@ public class AliroAccessDocument
             if (signature == null) return null;
 
             // 7. Build IssuerAuth = COSE_Sign1 array
-            CBORObject issuerAuth = buildCoseSign1(
-                    issuerPubBytes, msoBytes, signature);
+            CBORObject issuerAuth = buildCoseSign1(issuerPubBytes, msoBytes, signature);
 
             // 8. Build nameSpaces map: { "aliro-a": [bstr(IssuerSignedItem)] }
             CBORObject nameSpaces = CBORObject.NewOrderedMap();
@@ -145,7 +152,6 @@ public class AliroAccessDocument
             nameSpaces.Add(CBORObject.FromObject(NAMESPACE_ACCESS), itemsArray);
 
             // 9. Build issuerSigned: { "1": nameSpaces, "2": IssuerAuth }
-            //    Key "1" = nameSpaces, key "2" = IssuerAuth per Table 8-22
             CBORObject issuerSigned = CBORObject.NewOrderedMap();
             issuerSigned.Add(CBORObject.FromObject("1"), nameSpaces);
             issuerSigned.Add(CBORObject.FromObject("2"), issuerAuth);
@@ -189,6 +195,131 @@ public class AliroAccessDocument
         catch (Exception e)
         {
             Log.e(TAG, "generateTestDocument failed", e);
+            return null;
+        }
+    }
+
+    /**
+     * Generate a realistic self-signed sample Access Document simulating an employee badge.
+     *
+     * Builds a full AccessData element per Aliro 1.0 §7.3 including:
+     *   - Employee ID "ELATEC001"
+     *   - Two access rules (weekday business hours + weekend emergency)
+     *   - Two schedules (Mon-Fri 07:00-19:00 UTC, Sat-Sun 09:00-17:00 UTC)
+     *
+     * AccessData key mapping (§7.3):
+     *   0 = version, 1 = id, 2 = AccessRules, 3 = Schedules
+     *
+     * AccessRule key mapping (§7.3.3):
+     *   0 = capabilities (bitmask: bit0=Secure, bit1=Unsecure, bit3=Momentary_Unsecure)
+     *   1 = allowScheduleIds (bitmask: bit0=schedule0, bit1=schedule1)
+     *
+     * Schedule key mapping (§7.3.4):
+     *   0 = startPeriod (unix epoch uint32), 1 = endPeriod, 2 = recurrenceRule array,
+     *   3 = flags (bit0 = Time_in_UTC)
+     *
+     * recurrenceRule array: [durationSeconds, dayMask, pattern, interval, ordinal]
+     *   pattern 2 = Weekly
+     *
+     * @param context          Application context
+     * @param credPubKeyBytes  65-byte uncompressed credential public key
+     * @param elementIdentifier  DataElementIdentifier (typically "access")
+     * @param validDays        Number of days the document should be valid
+     * @return Summary string for display, or null on failure
+     */
+    public static String generateRealisticSampleDocument(Context context,
+                                                          byte[] credPubKeyBytes,
+                                                          String elementIdentifier,
+                                                          int validDays)
+    {
+        try
+        {
+            // 1. Generate issuer keypair
+            KeyPair issuerKP = AliroCryptoProvider.generateEphemeralKeypair();
+            if (issuerKP == null) return null;
+            ECPublicKey issuerPub = (ECPublicKey) issuerKP.getPublic();
+            byte[] issuerPubBytes = uncompressedPoint(issuerPub);
+
+            // 2. Build realistic AccessData CBOR per §7.3
+            CBORObject accessData = buildRealisticAccessData();
+
+            // 3. Build IssuerSignedItem per Table 7-2
+            byte[] random  = AliroCryptoProvider.generateRandom(16);
+            int    digestId = 0;
+            CBORObject issuerSignedItem = buildIssuerSignedItem(
+                    digestId, random, elementIdentifier, accessData);
+
+            // 4. Compute digest of IssuerSignedItem bstr
+            byte[] itemBytes = issuerSignedItem.EncodeToBytes();
+            byte[] digest    = sha256(itemBytes);
+
+            // 5. Build MobileSecurityObject
+            Instant now   = Instant.now();
+            Instant until = now.plusSeconds((long) validDays * 86400);
+            CBORObject mso = buildMSO(credPubKeyBytes, elementIdentifier,
+                                       digestId, digest, now, until);
+
+            // 6. COSE_Sign1 over MSO
+            byte[] msoBytes  = mso.EncodeToBytes();
+            byte[] signature = coseSign1(issuerKP.getPrivate(), msoBytes);
+            if (signature == null) return null;
+
+            // 7. Build IssuerAuth COSE_Sign1 array
+            CBORObject issuerAuth = buildCoseSign1(issuerPubBytes, msoBytes, signature);
+
+            // 8. nameSpaces
+            CBORObject nameSpaces = CBORObject.NewOrderedMap();
+            CBORObject itemsArray = CBORObject.NewArray();
+            itemsArray.Add(CBORObject.FromObject(itemBytes));
+            nameSpaces.Add(CBORObject.FromObject(NAMESPACE_ACCESS), itemsArray);
+
+            // 9. issuerSigned
+            CBORObject issuerSigned = CBORObject.NewOrderedMap();
+            issuerSigned.Add(CBORObject.FromObject("1"), nameSpaces);
+            issuerSigned.Add(CBORObject.FromObject("2"), issuerAuth);
+
+            // 10. Document
+            CBORObject document = CBORObject.NewOrderedMap();
+            document.Add(CBORObject.FromObject("5"), CBORObject.FromObject(DOCTYPE_ACCESS));
+            document.Add(CBORObject.FromObject("1"), issuerSigned);
+
+            // 11. DeviceResponse
+            CBORObject docResponse = CBORObject.NewOrderedMap();
+            docResponse.Add(CBORObject.FromObject("1"), CBORObject.FromObject("1.0"));
+            CBORObject docs = CBORObject.NewArray();
+            docs.Add(document);
+            docResponse.Add(CBORObject.FromObject("2"), docs);
+            docResponse.Add(CBORObject.FromObject("3"), CBORObject.FromObject(0));
+
+            // 12. Store
+            byte[] cborBytes = docResponse.EncodeToBytes();
+            String b64       = Base64.encodeToString(cborBytes, Base64.DEFAULT);
+            String issuerHex = Hex.toHexString(issuerPubBytes);
+
+            SharedPreferences.Editor editor = context
+                    .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit();
+            editor.putString(KEY_ACCESS_DOC,      b64);
+            editor.putString(KEY_ISSUER_PUB_KEY,  issuerHex);
+            editor.putString(KEY_ELEMENT_ID,      elementIdentifier);
+            editor.putString(KEY_DOC_MODE,        "sample");
+            editor.putString(KEY_DOC_VALID_FROM,  now.toString());
+            editor.putString(KEY_DOC_VALID_UNTIL, until.toString());
+            editor.apply();
+
+            String summary = "Sample document generated.\n"
+                    + "ID: ELATEC001\n"
+                    + "Element: " + elementIdentifier + "\n"
+                    + "Rules: 2 (weekday + weekend)\n"
+                    + "Schedules: Mon-Fri 07:00-19:00, Sat-Sun 09:00-17:00\n"
+                    + "Valid until: " + until.toString().substring(0, 10) + "\n"
+                    + "Issuer key: " + issuerHex.substring(0, 16) + "...\n"
+                    + "Size: " + cborBytes.length + " bytes";
+            Log.d(TAG, "Generated realistic sample Access Document: " + cborBytes.length + " bytes");
+            return summary;
+        }
+        catch (Exception e)
+        {
+            Log.e(TAG, "generateRealisticSampleDocument failed", e);
             return null;
         }
     }
@@ -302,6 +433,138 @@ public class AliroAccessDocument
         if (hex == null || hex.isEmpty()) return null;
         try { return Hex.decode(hex); }
         catch (Exception e) { return null; }
+    }
+
+    // =========================================================================
+    // AccessData builders
+    // =========================================================================
+
+    /**
+     * Build minimal AccessData: { 0: 1 } — version only.
+     * Used by generateTestDocument().
+     */
+    private static CBORObject buildMinimalAccessData()
+    {
+        CBORObject accessData = CBORObject.NewOrderedMap();
+        accessData.Add(CBORObject.FromObject(0), CBORObject.FromObject(1)); // version=1
+        return accessData;
+    }
+
+    /**
+     * Build a realistic employee-badge AccessData per Aliro 1.0 §7.3.
+     *
+     * Structure:
+     * {
+     *   0: 1,                           // version
+     *   1: h'454C41544543303031',       // id = "ELATEC001"
+     *   2: [                            // AccessRules
+     *     { 0: 0x0B, 1: 0x01 },        // Rule 0: Secure+Unsecure+Momentary on schedule 0
+     *     { 0: 0x01, 1: 0x02 }         // Rule 1: Secure only on schedule 1
+     *   ],
+     *   3: [                            // Schedules
+     *     {                             // Schedule 0: Mon-Fri 07:00-19:00 UTC
+     *       0: 1745971200,              // startPeriod: 2025-04-30 00:00:00 UTC
+     *       1: 1777507200,              // endPeriod:   2026-04-30 00:00:00 UTC
+     *       2: [43200, 0x1F, 2, 1, 0], // 12h, Mon-Fri, Weekly, every 1 week
+     *       3: 0x01                     // flags: Time_in_UTC
+     *     },
+     *     {                             // Schedule 1: Sat-Sun 09:00-17:00 UTC
+     *       0: 1745971200,
+     *       1: 1777507200,
+     *       2: [28800, 0x60, 2, 1, 0], // 8h, Sat+Sun, Weekly, every 1 week
+     *       3: 0x01
+     *     }
+     *   ]
+     * }
+     *
+     * Capability bitmask (§7.3.3 Table 7-7):
+     *   bit 0 = Secure (0x01)
+     *   bit 1 = Unsecure (0x02)
+     *   bit 3 = Momentary_Unsecure (0x08)
+     *   => 0x01 | 0x02 | 0x08 = 0x0B for rule 0 (weekday full access)
+     *   => 0x01 for rule 1 (weekend secure only)
+     *
+     * Day-of-week mask (§7.3.4):
+     *   bit 0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri, 5=Sat, 6=Sun
+     *   0x1F = Mon-Fri; 0x60 = Sat+Sun
+     *
+     * recurrenceRule pattern 2 = Weekly (§7.3.4 Table 7-9)
+     */
+    private static CBORObject buildRealisticAccessData()
+    {
+        // ---- Employee ID ----
+        // "ELATEC001" as UTF-8 bytes: 45 4C 41 54 45 43 30 30 31
+        byte[] employeeId = new byte[] {
+            0x45, 0x4C, 0x41, 0x54, 0x45, 0x43, 0x30, 0x30, 0x31
+        };
+
+        // ---- Access Rule 0: Weekday business hours ----
+        // capabilities: Secure(bit0) + Unsecure(bit1) + Momentary_Unsecure(bit3) = 0x0B
+        // allowScheduleIds: schedule 0 (bit 0) = 0x01
+        CBORObject rule0 = CBORObject.NewOrderedMap();
+        rule0.Add(CBORObject.FromObject(0), CBORObject.FromObject(0x0B)); // capabilities
+        rule0.Add(CBORObject.FromObject(1), CBORObject.FromObject(0x01)); // schedule bitmask
+
+        // ---- Access Rule 1: Weekend emergency ----
+        // capabilities: Secure only (bit 0) = 0x01
+        // allowScheduleIds: schedule 1 (bit 1) = 0x02
+        CBORObject rule1 = CBORObject.NewOrderedMap();
+        rule1.Add(CBORObject.FromObject(0), CBORObject.FromObject(0x01)); // capabilities
+        rule1.Add(CBORObject.FromObject(1), CBORObject.FromObject(0x02)); // schedule bitmask
+
+        CBORObject accessRules = CBORObject.NewArray();
+        accessRules.Add(rule0);
+        accessRules.Add(rule1);
+
+        // ---- Schedule 0: Weekday 07:00-19:00 UTC (Mon-Fri, recurring weekly) ----
+        // startPeriod: 2025-04-30 00:00:00 UTC = 1745971200
+        // endPeriod:   2026-04-30 00:00:00 UTC = 1777507200
+        // durationSeconds: 12 * 3600 = 43200
+        // dayMask: Mon-Fri = bits 0-4 = 0x1F
+        // pattern: 2 = Weekly
+        // interval: 1 (every week)
+        // ordinal: 0 (not used for weekly)
+        CBORObject recRule0 = CBORObject.NewArray();
+        recRule0.Add(CBORObject.FromObject(43200)); // durationSeconds (12 h)
+        recRule0.Add(CBORObject.FromObject(0x1F));  // dayMask: Mon-Fri
+        recRule0.Add(CBORObject.FromObject(2));     // pattern: Weekly
+        recRule0.Add(CBORObject.FromObject(1));     // interval: every 1 week
+        recRule0.Add(CBORObject.FromObject(0));     // ordinal: unused
+
+        CBORObject schedule0 = CBORObject.NewOrderedMap();
+        schedule0.Add(CBORObject.FromObject(0), CBORObject.FromObject(1745971200L)); // startPeriod
+        schedule0.Add(CBORObject.FromObject(1), CBORObject.FromObject(1777507200L)); // endPeriod
+        schedule0.Add(CBORObject.FromObject(2), recRule0);                            // recurrenceRule
+        schedule0.Add(CBORObject.FromObject(3), CBORObject.FromObject(0x01));         // flags: UTC
+
+        // ---- Schedule 1: Weekend 09:00-17:00 UTC (Sat-Sun, recurring weekly) ----
+        // durationSeconds: 8 * 3600 = 28800
+        // dayMask: Sat+Sun = bits 5,6 = 0x60
+        CBORObject recRule1 = CBORObject.NewArray();
+        recRule1.Add(CBORObject.FromObject(28800)); // durationSeconds (8 h)
+        recRule1.Add(CBORObject.FromObject(0x60));  // dayMask: Sat+Sun
+        recRule1.Add(CBORObject.FromObject(2));     // pattern: Weekly
+        recRule1.Add(CBORObject.FromObject(1));     // interval: every 1 week
+        recRule1.Add(CBORObject.FromObject(0));     // ordinal: unused
+
+        CBORObject schedule1 = CBORObject.NewOrderedMap();
+        schedule1.Add(CBORObject.FromObject(0), CBORObject.FromObject(1745971200L)); // startPeriod
+        schedule1.Add(CBORObject.FromObject(1), CBORObject.FromObject(1777507200L)); // endPeriod
+        schedule1.Add(CBORObject.FromObject(2), recRule1);                            // recurrenceRule
+        schedule1.Add(CBORObject.FromObject(3), CBORObject.FromObject(0x01));         // flags: UTC
+
+        CBORObject schedules = CBORObject.NewArray();
+        schedules.Add(schedule0);
+        schedules.Add(schedule1);
+
+        // ---- Assemble AccessData ----
+        CBORObject accessData = CBORObject.NewOrderedMap();
+        accessData.Add(CBORObject.FromObject(0), CBORObject.FromObject(1));                    // version
+        accessData.Add(CBORObject.FromObject(1), CBORObject.FromObject(employeeId));           // id
+        accessData.Add(CBORObject.FromObject(2), accessRules);                                 // AccessRules
+        accessData.Add(CBORObject.FromObject(3), schedules);                                   // Schedules
+
+        return accessData;
     }
 
     // =========================================================================
