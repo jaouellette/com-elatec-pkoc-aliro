@@ -1,7 +1,12 @@
 package com.psia.pkoc.core;
 
+import android.content.Context;
+import android.content.SharedPreferences;
+import android.util.Base64;
 import android.util.Log;
 
+import com.psia.pkoc.core.AliroAccessDocument;
+import com.psia.pkoc.core.AliroMailbox;
 import com.upokecenter.cbor.CBORObject;
 
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
@@ -38,6 +43,13 @@ import java.util.List;
 public class AliroSelfTestEngine
 {
     private static final String TAG = "AliroSelfTest";
+
+    // Optional Android Context — used by tests that exercise SharedPreferences-backed methods.
+    // May be null; tests requiring it will skip gracefully if null.
+    private final Context context;
+
+    public AliroSelfTestEngine() { this.context = null; }
+    public AliroSelfTestEngine(Context context) { this.context = context; }
 
     // =========================================================================
     // Test keys (hardcoded from the Aliro config screen defaults)
@@ -158,6 +170,8 @@ public class AliroSelfTestEngine
         runAndReport(results, cb, this::testExchange0xBAWrapper);
         runAndReport(results, cb, this::testExchange0x97BleSuppressed);
         runAndReport(results, cb, this::testBleStepUpFullFlow);
+        runAndReport(results, cb, this::testMailboxSampleTLVParse);
+        runAndReport(results, cb, this::testAccessDocRealisticSample);
 
         // Group 4: Negative Tests
         runAndReport(results, cb, this::testNegAuth0WrongReaderId);
@@ -2692,6 +2706,190 @@ public class AliroSelfTestEngine
         {
             return result("BLE_STEP_UP_FULL_FLOW", "Full Flow",
                     "BLE Step-Up full flow", false, e.toString(), start);
+        }
+    }
+
+    // =========================================================================
+    // GROUP 3 additions: Sample data round-trip tests
+    // =========================================================================
+
+    /**
+     * MAILBOX_SAMPLE_TLV_PARSE — Build the §18 sample mailbox and verify parse round-trip.
+     *
+     * Calls AliroMailbox.buildSampleMailbox() to obtain the 256-byte buffer, checks the
+     * container tag (0x60) and non-zero content, then parses it back to a human-readable
+     * string and verifies that the well-known sample fields are present.
+     */
+    private TestResult testMailboxSampleTLVParse()
+    {
+        long start = System.currentTimeMillis();
+        try
+        {
+            // Step 1: Build the 256-byte sample mailbox buffer.
+            byte[] buffer = AliroMailbox.buildSampleMailbox();
+            if (buffer == null || buffer.length != 256)
+                return result("MAILBOX_SAMPLE_TLV_PARSE", "Full Flow",
+                        "Sample mailbox §18 TLV build + parse round-trip", false,
+                        "buildSampleMailbox() returned null or wrong length: "
+                                + (buffer == null ? "null" : buffer.length), start);
+
+            // Step 2: Verify container tag.
+            if ((buffer[0] & 0xFF) != 0x60)
+                return result("MAILBOX_SAMPLE_TLV_PARSE", "Full Flow",
+                        "Sample mailbox §18 TLV build + parse round-trip", false,
+                        "buffer[0] expected 0x60 (container tag), got 0x"
+                                + String.format("%02X", buffer[0] & 0xFF), start);
+
+            // Step 3: Verify buffer is not all zeros.
+            boolean allZero = true;
+            for (byte b : buffer) { if (b != 0) { allZero = false; break; } }
+            if (allZero)
+                return result("MAILBOX_SAMPLE_TLV_PARSE", "Full Flow",
+                        "Sample mailbox §18 TLV build + parse round-trip", false,
+                        "buffer is all zeros — sample data was not written", start);
+
+            // Step 4: Parse back to human-readable string.
+            String parsed = AliroMailbox.parseMailboxToString(buffer, 256);
+            if (parsed == null)
+                return result("MAILBOX_SAMPLE_TLV_PARSE", "Full Flow",
+                        "Sample mailbox §18 TLV build + parse round-trip", false,
+                        "parseMailboxToString() returned null", start);
+
+            // Step 5: Verify firmware version fields.
+            if (!parsed.contains("Firmware"))
+                return result("MAILBOX_SAMPLE_TLV_PARSE", "Full Flow",
+                        "Sample mailbox §18 TLV build + parse round-trip", false,
+                        "Parsed string missing 'Firmware' field", start);
+            if (!parsed.contains("2.1.0"))
+                return result("MAILBOX_SAMPLE_TLV_PARSE", "Full Flow",
+                        "Sample mailbox §18 TLV build + parse round-trip", false,
+                        "Parsed string missing firmware version '2.1.0'", start);
+
+            // Step 6: Verify battery/door status fields.
+            if (!parsed.contains("Battery"))
+                return result("MAILBOX_SAMPLE_TLV_PARSE", "Full Flow",
+                        "Sample mailbox §18 TLV build + parse round-trip", false,
+                        "Parsed string missing 'Battery' field", start);
+            if (!parsed.contains("95%"))
+                return result("MAILBOX_SAMPLE_TLV_PARSE", "Full Flow",
+                        "Sample mailbox §18 TLV build + parse round-trip", false,
+                        "Parsed string missing battery level '95%'", start);
+
+            // Step 7: Verify ELATEC OUI.
+            if (!parsed.contains("OUI"))
+                return result("MAILBOX_SAMPLE_TLV_PARSE", "Full Flow",
+                        "Sample mailbox §18 TLV build + parse round-trip", false,
+                        "Parsed string missing 'OUI' field", start);
+            if (!parsed.contains("00:13:7D"))
+                return result("MAILBOX_SAMPLE_TLV_PARSE", "Full Flow",
+                        "Sample mailbox §18 TLV build + parse round-trip", false,
+                        "Parsed string missing ELATEC OUI '00:13:7D'", start);
+
+            return result("MAILBOX_SAMPLE_TLV_PARSE", "Full Flow",
+                    "Sample mailbox §18 TLV build + parse round-trip",
+                    true, "buffer[0]=0x60, non-zero, Firmware/2.1.0/Battery/95%/OUI/00:13:7D all present", start);
+        }
+        catch (Exception e)
+        {
+            return result("MAILBOX_SAMPLE_TLV_PARSE", "Full Flow",
+                    "Sample mailbox §18 TLV build + parse round-trip", false, e.toString(), start);
+        }
+    }
+
+    /**
+     * ACCESS_DOC_REALISTIC_SAMPLE — Generate a realistic Access Document and verify the CBOR
+     * structure round-trips through Base64 / SharedPreferences storage.
+     *
+     * Uses a synthetic 65-byte credential public key (0x04 prefix + 32×0x01 X + 32×0x01 Y)
+     * to exercise AliroAccessDocument.generateRealisticSampleDocument() and then decodes the
+     * stored Base64 blob back through the CBOR parser.
+     */
+    private TestResult testAccessDocRealisticSample()
+    {
+        long start = System.currentTimeMillis();
+        if (context == null)
+        {
+            // Skip gracefully when no Context is provided (unit-test environment).
+            return new TestResult("ACCESS_DOC_REALISTIC_SAMPLE", "Full Flow",
+                    "Realistic Access Document CBOR structure validation",
+                    true, true, "SKIPPED — no Android Context available",
+                    System.currentTimeMillis() - start);
+        }
+        try
+        {
+            // Step 1: Build a synthetic 65-byte credential public key (04 || 32×0x01 || 32×0x01).
+            byte[] pubKey = new byte[65];
+            pubKey[0] = 0x04;
+            Arrays.fill(pubKey, 1, 65, (byte) 0x01);
+
+            // Step 2: Generate the realistic sample document.
+            String summary = AliroAccessDocument.generateRealisticSampleDocument(
+                    context, pubKey, "access", 365);
+
+            // Step 3: Verify non-null return.
+            if (summary == null)
+                return result("ACCESS_DOC_REALISTIC_SAMPLE", "Full Flow",
+                        "Realistic Access Document CBOR structure validation", false,
+                        "generateRealisticSampleDocument() returned null", start);
+
+            // Step 4: Verify employee ID in summary.
+            if (!summary.contains("ELATEC001"))
+                return result("ACCESS_DOC_REALISTIC_SAMPLE", "Full Flow",
+                        "Realistic Access Document CBOR structure validation", false,
+                        "Summary missing employee ID 'ELATEC001': " + summary, start);
+
+            // Step 5: Verify element identifier in summary.
+            if (!summary.contains("access"))
+                return result("ACCESS_DOC_REALISTIC_SAMPLE", "Full Flow",
+                        "Realistic Access Document CBOR structure validation", false,
+                        "Summary missing element identifier 'access': " + summary, start);
+
+            // Step 6: Load the stored document from SharedPreferences and verify Base64.
+            SharedPreferences prefs = context.getSharedPreferences("aliro_prefs", Context.MODE_PRIVATE);
+            String storedB64 = prefs.getString("access_document", null);
+            if (storedB64 == null)
+                return result("ACCESS_DOC_REALISTIC_SAMPLE", "Full Flow",
+                        "Realistic Access Document CBOR structure validation", false,
+                        "No 'access_document' entry found in aliro_prefs SharedPreferences", start);
+
+            byte[] cborBytes;
+            try
+            {
+                cborBytes = Base64.decode(storedB64, Base64.DEFAULT);
+            }
+            catch (IllegalArgumentException e)
+            {
+                return result("ACCESS_DOC_REALISTIC_SAMPLE", "Full Flow",
+                        "Realistic Access Document CBOR structure validation", false,
+                        "Stored value is not valid Base64: " + e.getMessage(), start);
+            }
+
+            if (cborBytes == null || cborBytes.length == 0)
+                return result("ACCESS_DOC_REALISTIC_SAMPLE", "Full Flow",
+                        "Realistic Access Document CBOR structure validation", false,
+                        "Base64-decoded CBOR byte array is empty", start);
+
+            // Step 7: Verify CBOR can be parsed without throwing.
+            try
+            {
+                CBORObject.DecodeFromBytes(cborBytes);
+            }
+            catch (Exception e)
+            {
+                return result("ACCESS_DOC_REALISTIC_SAMPLE", "Full Flow",
+                        "Realistic Access Document CBOR structure validation", false,
+                        "CBORObject.DecodeFromBytes threw: " + e.getMessage(), start);
+            }
+
+            return result("ACCESS_DOC_REALISTIC_SAMPLE", "Full Flow",
+                    "Realistic Access Document CBOR structure validation",
+                    true, "summary contains ELATEC001/access, stored Base64 decodes to valid CBOR ("
+                            + cborBytes.length + " bytes)", start);
+        }
+        catch (Exception e)
+        {
+            return result("ACCESS_DOC_REALISTIC_SAMPLE", "Full Flow",
+                    "Realistic Access Document CBOR structure validation", false, e.toString(), start);
         }
     }
 
