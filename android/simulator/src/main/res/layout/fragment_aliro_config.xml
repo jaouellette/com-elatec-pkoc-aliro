@@ -28,7 +28,42 @@
             android:text="Enter values as hex strings. Private key and Reader ID are required. Issuer Public Key and Certificate are only needed when using Reader Certificates."
             android:textSize="13sp"
             android:textColor="@color/colorTextSecondary"
-            android:layout_marginBottom="24dp" />
+            android:layout_marginBottom="12dp" />
+
+        <!-- Import from Credential App -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Import from Credential App"
+            android:textSize="15sp"
+            android:textStyle="bold"
+            android:textColor="@color/colorTextPrimary"
+            android:layout_marginBottom="4dp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Scan the QR code from the credential app\u2019s \u201cExport Reader Config\u201d to auto-fill all fields below. Tap Save after scanning."
+            android:textSize="13sp"
+            android:textColor="@color/colorTextSecondary"
+            android:layout_marginBottom="8dp" />
+
+        <Button
+            android:id="@+id/btnImportFromCredential"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Import from Credential"
+            android:backgroundTint="#1E7A4D"
+            android:textColor="@android:color/white"
+            android:layout_marginBottom="8dp" />
+
+        <!-- Divider -->
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:background="@color/colorTextSecondary"
+            android:layout_marginBottom="16dp"
+            android:layout_marginTop="4dp" />
 
         <!-- Reader Private Key -->
         <TextView

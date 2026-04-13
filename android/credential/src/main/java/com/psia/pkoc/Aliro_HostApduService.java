@@ -10,6 +10,7 @@ import android.util.Log;
 
 import com.psia.pkoc.core.AliroCryptoProvider;
 import com.psia.pkoc.core.AliroAccessDocument;
+import com.psia.pkoc.core.AliroProvisioningManager;
 
 import com.upokecenter.cbor.CBORObject;
 
@@ -87,6 +88,7 @@ public class Aliro_HostApduService extends HostApduService
     private static final byte[] SW_OK            = { (byte)0x90, 0x00 };
     private static final byte[] SW_ERROR         = { 0x6A, (byte)0x82 }; // File not found
     private static final byte[] SW_CONDITIONS    = { 0x69, (byte)0x85 }; // Conditions not satisfied
+    private static final byte[] SW_SECURITY      = { 0x69, (byte)0x82 }; // Security status not satisfied
     private static final byte[] SW_WRONG_LENGTH  = { 0x67, 0x00 };        // Wrong length
     // 61 xx = response bytes still available (GET RESPONSE)
     // 90 00 = success
@@ -273,6 +275,22 @@ public class Aliro_HostApduService extends HostApduService
             Log.d(TAG, "Reader ID:      " + Hex.toHexString(readerIdBytes));
             Log.d(TAG, "Protocol:       " + Hex.toHexString(selectedProtocol));
 
+            // Strict mode: verify reader_group_identifier matches authorized group
+            if (AliroProvisioningManager.isStrictMode(this) && AliroProvisioningManager.isProvisioned(this))
+            {
+                byte[] authorizedGroupId = AliroProvisioningManager.getAuthorizedReaderGroupId(this);
+                if (authorizedGroupId != null)
+                {
+                    byte[] receivedGroupId = Arrays.copyOfRange(readerIdBytes, 0, 16);
+                    if (!Arrays.equals(receivedGroupId, authorizedGroupId))
+                    {
+                        Log.w(TAG, "Strict mode: Reader group ID mismatch — rejecting");
+                        return SW_CONDITIONS; // 6985
+                    }
+                    Log.d(TAG, "Strict mode: Reader group ID verified");
+                }
+            }
+
             // Generate UD ephemeral keypair
             udEphKP = AliroCryptoProvider.generateEphemeralKeypair();
             if (udEphKP == null) return SW_ERROR;
@@ -384,6 +402,35 @@ public class Aliro_HostApduService extends HostApduService
         if (readerStaticPubKeyX == null)
         {
             Log.w(TAG, "LOAD CERT: could not parse reader static pub key, falling back to eph key X");
+        }
+
+        // Strict mode: verify reader certificate against stored Issuer CA public key
+        if (AliroProvisioningManager.isStrictMode(this) && AliroProvisioningManager.isProvisioned(this))
+        {
+            try
+            {
+                int dataOffset = getDataOffset(apdu);
+                int dataLen    = getDataLength(apdu);
+                if (dataOffset >= 0 && dataLen > 0)
+                {
+                    byte[] certData    = Arrays.copyOfRange(apdu, dataOffset, dataOffset + dataLen);
+                    byte[] issuerPubKey = AliroProvisioningManager.getIssuerCAPubKey(this);
+                    if (issuerPubKey != null)
+                    {
+                        boolean certValid = AliroProvisioningManager.verifyProfile0000Cert(certData, issuerPubKey);
+                        if (!certValid)
+                        {
+                            Log.w(TAG, "Strict mode: Reader certificate verification FAILED");
+                            return SW_SECURITY; // 6982
+                        }
+                        Log.d(TAG, "Strict mode: Reader certificate verified against Issuer CA");
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                Log.w(TAG, "Strict mode cert verify error: " + e.getMessage());
+            }
         }
 
         state = State.CERT_LOADED;

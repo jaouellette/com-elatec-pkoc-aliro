@@ -152,9 +152,20 @@ public class AliroCryptoProvider
             ka.init(ourPrivate);
             ka.doPhase(CryptoProvider.decodePublicKey(theirPublic), true);
             byte[] secret = ka.generateSecret();
-            // ECDH output is the full X coordinate (32 bytes for P-256)
-            // Some providers return 32 bytes, some return the full point — take last 32
-            if (secret.length >= 32)
+            // ECDH output is the X coordinate of the shared point.
+            // BouncyCastle returns the raw unsigned big-endian integer which
+            // can be 31 bytes (or rarely fewer) when the X coordinate has
+            // leading zeros.  Pad to 32 bytes on the left to match the C
+            // implementation which always uses a fixed 32-byte buffer.
+            // Some providers return the full uncompressed point — take the
+            // last 32 bytes in that case.
+            if (secret.length > 0 && secret.length <= 32)
+            {
+                byte[] x = new byte[32];
+                arraycopy(secret, 0, x, 32 - secret.length, secret.length);
+                return x;
+            }
+            else if (secret.length > 32)
             {
                 byte[] x = new byte[32];
                 arraycopy(secret, secret.length - 32, x, 0, 32);

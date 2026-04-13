@@ -30,6 +30,7 @@ import androidx.annotation.RequiresApi;
 import com.psia.pkoc.core.AliroAccessDocument;
 import com.psia.pkoc.core.AliroBleMessage;
 import com.psia.pkoc.core.AliroCryptoProvider;
+import com.psia.pkoc.core.AliroProvisioningManager;
 
 import com.upokecenter.cbor.CBORObject;
 
@@ -842,6 +843,22 @@ public class AliroBleCredentialService extends Service
             }
             if (selectedProtocol == null) selectedProtocol = new byte[]{ 0x01, 0x00 };
 
+            // Strict mode: verify reader_group_identifier matches authorized group
+            if (AliroProvisioningManager.isStrictMode(this) && AliroProvisioningManager.isProvisioned(this))
+            {
+                byte[] authorizedGroupId = AliroProvisioningManager.getAuthorizedReaderGroupId(this);
+                if (authorizedGroupId != null)
+                {
+                    byte[] receivedGroupId = Arrays.copyOfRange(readerIdBytes, 0, 16);
+                    if (!Arrays.equals(receivedGroupId, authorizedGroupId))
+                    {
+                        Log.w(TAG, "Strict mode: Reader group ID mismatch — rejecting (BLE)");
+                        return null; // reject the connection
+                    }
+                    Log.d(TAG, "Strict mode: Reader group ID verified (BLE)");
+                }
+            }
+
             // Generate UD ephemeral keypair
             udEphKP = AliroCryptoProvider.generateEphemeralKeypair();
             if (udEphKP == null) return null;
@@ -871,21 +888,22 @@ public class AliroBleCredentialService extends Service
      */
     private byte[] handleLoadCertBle(byte[] apdu)
     {
+        byte[] certData = null;
         try
         {
             int dataOffset = 5;
             int dataLen = apdu[4] & 0xFF;
             if (apdu.length >= dataOffset + dataLen)
             {
-                byte[] cert = Arrays.copyOfRange(apdu, dataOffset, dataOffset + dataLen);
+                certData = Arrays.copyOfRange(apdu, dataOffset, dataOffset + dataLen);
                 // Parse tag 0x85 for reader static public key X
-                for (int i = 0; i < cert.length - 2; i++)
+                for (int i = 0; i < certData.length - 2; i++)
                 {
-                    if ((cert[i] & 0xFF) == 0x85 && (cert[i + 1] & 0xFF) == 0x42)
+                    if ((certData[i] & 0xFF) == 0x85 && (certData[i + 1] & 0xFF) == 0x42)
                     {
-                        if (i + 68 <= cert.length && cert[i + 2] == 0x00 && cert[i + 3] == 0x04)
+                        if (i + 68 <= certData.length && certData[i + 2] == 0x00 && certData[i + 3] == 0x04)
                         {
-                            readerStaticPubKeyX = Arrays.copyOfRange(cert, i + 4, i + 36);
+                            readerStaticPubKeyX = Arrays.copyOfRange(certData, i + 4, i + 36);
                             Log.d(TAG, "LOAD CERT: reader static pub key X = " + Hex.toHexString(readerStaticPubKeyX));
                         }
                         break;
@@ -897,6 +915,32 @@ public class AliroBleCredentialService extends Service
         {
             Log.w(TAG, "LOAD CERT parse error: " + e.getMessage());
         }
+
+        // Strict mode: verify reader certificate against stored Issuer CA public key
+        if (AliroProvisioningManager.isStrictMode(this) && AliroProvisioningManager.isProvisioned(this)
+                && certData != null)
+        {
+            try
+            {
+                byte[] issuerPubKey = AliroProvisioningManager.getIssuerCAPubKey(this);
+                if (issuerPubKey != null)
+                {
+                    boolean certValid = AliroProvisioningManager.verifyProfile0000Cert(certData, issuerPubKey);
+                    if (!certValid)
+                    {
+                        Log.w(TAG, "Strict mode: Reader certificate verification FAILED (BLE)");
+                        // Return security error SW (6982) — caller will abort flow
+                        return new byte[]{ 0x69, (byte)0x82 };
+                    }
+                    Log.d(TAG, "Strict mode: Reader certificate verified against Issuer CA (BLE)");
+                }
+            }
+            catch (Exception e)
+            {
+                Log.w(TAG, "Strict mode cert verify error (BLE): " + e.getMessage());
+            }
+        }
+
         return new byte[]{ (byte)0x90, 0x00 };
     }
 

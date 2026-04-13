@@ -16,6 +16,7 @@ import android.view.ViewGroup;
 import android.util.Base64;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
+import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
@@ -33,6 +34,7 @@ import androidx.fragment.app.Fragment;
 
 import com.psia.pkoc.core.AliroAccessDocument;
 import com.psia.pkoc.core.AliroMailbox;
+import com.psia.pkoc.core.AliroProvisioningManager;
 
 import java.security.KeyStore;
 import java.security.interfaces.ECPublicKey;
@@ -54,6 +56,13 @@ import java.util.concurrent.Executors;
  */
 public class CredentialAliroConfigFragment extends Fragment
 {
+    // Provisioning section views
+    private TextView    txtProvisioningStatus;
+    private Button      btnProvision;
+    private CheckBox    chkStrictMode;
+    private Button      btnExportReaderConfig;
+    private Button      btnClearProvisioning;
+
     private TextView    txtDocumentStatus;
     private Button      btnGenerateTest;
     private Button      btnLoadSampleDoc;
@@ -96,6 +105,13 @@ public class CredentialAliroConfigFragment extends Fragment
     {
         super.onViewCreated(view, savedInstanceState);
 
+        // Provisioning section
+        txtProvisioningStatus = view.findViewById(R.id.txtProvisioningStatus);
+        btnProvision          = view.findViewById(R.id.btnProvisionCredential);
+        chkStrictMode         = view.findViewById(R.id.chkStrictMode);
+        btnExportReaderConfig = view.findViewById(R.id.btnExportReaderConfig);
+        btnClearProvisioning  = view.findViewById(R.id.btnClearProvisioning);
+
         txtDocumentStatus  = view.findViewById(R.id.txtAccessDocStatus);
         btnGenerateTest    = view.findViewById(R.id.btnGenerateTestDoc);
         btnLoadSampleDoc   = view.findViewById(R.id.btnLoadSampleDoc);
@@ -122,8 +138,16 @@ public class CredentialAliroConfigFragment extends Fragment
         spinnerMailboxSize.setAdapter(sizeAdapter);
         spinnerMailboxSize.setSelection(2); // default: 256
 
+        refreshProvisioningStatus();
         refreshDocumentStatus();
         refreshMailboxViewer();
+
+        // Provisioning listeners
+        btnProvision.setOnClickListener(v -> provisionRealCredential());
+        chkStrictMode.setOnCheckedChangeListener((cb, checked) ->
+                AliroProvisioningManager.setStrictMode(requireContext(), checked));
+        btnExportReaderConfig.setOnClickListener(v -> exportReaderConfig());
+        btnClearProvisioning.setOnClickListener(v -> confirmClearProvisioning());
 
         btnGenerateTest.setOnClickListener(v -> generateTestDocument());
         btnLoadSampleDoc.setOnClickListener(v -> loadSampleDocument());
@@ -148,6 +172,124 @@ public class CredentialAliroConfigFragment extends Fragment
     {
         super.onDestroyView();
         executor.shutdown();
+    }
+
+    // -------------------------------------------------------------------------
+    // Real Credential Provisioning
+    // -------------------------------------------------------------------------
+
+    private void refreshProvisioningStatus()
+    {
+        if (!isAdded()) return;
+        boolean provisioned = AliroProvisioningManager.isProvisioned(requireContext());
+        boolean strictMode  = AliroProvisioningManager.isStrictMode(requireContext());
+
+        txtProvisioningStatus.setText(AliroProvisioningManager.getStatusSummary(requireContext()));
+        txtProvisioningStatus.setTextColor(provisioned
+                ? requireContext().getColor(R.color.colorAccent)
+                : requireContext().getColor(android.R.color.darker_gray));
+
+        // Suppress the listener while programmatically setting the checkbox
+        chkStrictMode.setOnCheckedChangeListener(null);
+        chkStrictMode.setChecked(strictMode);
+        chkStrictMode.setOnCheckedChangeListener((cb, checked) ->
+                AliroProvisioningManager.setStrictMode(requireContext(), checked));
+
+        btnExportReaderConfig.setEnabled(provisioned);
+        btnClearProvisioning.setEnabled(provisioned);
+        chkStrictMode.setEnabled(provisioned);
+    }
+
+    private void provisionRealCredential()
+    {
+        new AlertDialog.Builder(requireContext())
+                .setTitle("Provision Real Credential")
+                .setMessage("This will generate a new Issuer CA keypair and reader certificate. "
+                        + "Any previously provisioned keys will be replaced. Continue?")
+                .setPositiveButton("Provision", (d, w) -> doProvision())
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    private void doProvision()
+    {
+        showStatus("Generating keys and certificate...", false);
+        btnProvision.setEnabled(false);
+        executor.execute(() ->
+        {
+            String result = AliroProvisioningManager.provisionCredential(requireContext());
+            uiHandler.post(() ->
+            {
+                if (!isAdded()) return;
+                btnProvision.setEnabled(true);
+                if (result != null)
+                {
+                    refreshProvisioningStatus();
+                    showStatus("\u2713 " + result, true);
+                }
+                else
+                {
+                    showStatus("Provisioning failed — check logs.", false);
+                }
+            });
+        });
+    }
+
+    private void exportReaderConfig()
+    {
+        String json = AliroProvisioningManager.buildExportJson(requireContext());
+        if (json == null)
+        {
+            showStatus("No provisioning data to export.", false);
+            return;
+        }
+
+        // Generate QR code
+        Bitmap qrBitmap = generateQrBitmap(json, 800);
+
+        // Also copy to clipboard as fallback
+        ClipboardManager clipboard = (ClipboardManager)
+                requireContext().getSystemService(Context.CLIPBOARD_SERVICE);
+        clipboard.setPrimaryClip(ClipData.newPlainText("Aliro Reader Config", json));
+
+        View dialogView = LayoutInflater.from(requireContext())
+                .inflate(android.R.layout.activity_list_item, null, false);
+
+        if (qrBitmap != null)
+        {
+            ImageView imageView = new ImageView(requireContext());
+            imageView.setImageBitmap(qrBitmap);
+            int padding = (int)(24 * requireContext().getResources().getDisplayMetrics().density);
+            imageView.setPadding(padding, padding, padding, padding);
+
+            new AlertDialog.Builder(requireContext())
+                    .setTitle("Scan on Reader Device")
+                    .setMessage("Scan this QR code in the reader\u2019s Aliro Config \u2192 \"Import from Credential\"."
+                            + " JSON also copied to clipboard.")
+                    .setView(imageView)
+                    .setPositiveButton("Done", null)
+                    .show();
+        }
+        else
+        {
+            showStatus("QR generation failed. JSON copied to clipboard.", true);
+        }
+    }
+
+    private void confirmClearProvisioning()
+    {
+        new AlertDialog.Builder(requireContext())
+                .setTitle("Clear Provisioning")
+                .setMessage("Remove all provisioning data? The credential will revert to simulator mode "
+                        + "(accepts any reader). This cannot be undone.")
+                .setPositiveButton("Clear", (d, w) ->
+                {
+                    AliroProvisioningManager.clearProvisioning(requireContext());
+                    refreshProvisioningStatus();
+                    showStatus("Provisioning cleared. Credential is in simulator mode.", true);
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
     }
 
     // -------------------------------------------------------------------------

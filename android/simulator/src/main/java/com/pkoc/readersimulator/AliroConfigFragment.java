@@ -26,6 +26,8 @@ import com.journeyapps.barcodescanner.ScanContract;
 import com.journeyapps.barcodescanner.ScanIntentResult;
 import com.journeyapps.barcodescanner.ScanOptions;
 
+import org.json.JSONObject;
+
 /**
  * Fragment for configuring Aliro reader parameters.
  * Values are stored in SharedPreferences and loaded by HomeFragment
@@ -55,8 +57,12 @@ public class AliroConfigFragment extends Fragment
     private TextView lblMailboxSetValue;
     private CheckBox chkMailboxAtomic;
 
+    // Separate launchers for two different QR scan purposes
     private final ActivityResultLauncher<ScanOptions> qrScanLauncher =
             registerForActivityResult(new ScanContract(), this::onQrScanResult);
+
+    private final ActivityResultLauncher<ScanOptions> importConfigScanLauncher =
+            registerForActivityResult(new ScanContract(), this::onImportConfigScanResult);
 
     @Nullable
     @Override
@@ -81,6 +87,7 @@ public class AliroConfigFragment extends Fragment
         txtStatus               = view.findViewById(R.id.txtAliroConfigStatus);
         Button btnSave          = view.findViewById(R.id.btnSaveAliroConfig);
         Button btnScanQr        = view.findViewById(R.id.btnScanIssuerKeyQr);
+        Button btnImportConfig  = view.findViewById(R.id.btnImportFromCredential);
 
         // Mailbox bindings
         chkMailboxEnabled       = view.findViewById(R.id.chkMailboxEnabled);
@@ -117,6 +124,7 @@ public class AliroConfigFragment extends Fragment
 
         btnSave.setOnClickListener(v -> saveToPreferences());
         btnScanQr.setOnClickListener(v -> launchQrScanner());
+        btnImportConfig.setOnClickListener(v -> launchImportConfigScanner());
     }
 
     private void updateMailboxFieldVisibility(String op)
@@ -259,6 +267,10 @@ public class AliroConfigFragment extends Fragment
     // QR scanner
     // -------------------------------------------------------------------------
 
+    // -------------------------------------------------------------------------
+    // QR scanner: Step-Up Issuer Key (legacy single-key QR)
+    // -------------------------------------------------------------------------
+
     private void launchQrScanner()
     {
         ScanOptions options = new ScanOptions();
@@ -289,6 +301,68 @@ public class AliroConfigFragment extends Fragment
         else
         {
             showStatus("QR scan did not contain a valid 65-byte EC public key.", false);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // QR scanner: Import full reader config from credential app
+    // -------------------------------------------------------------------------
+
+    private void launchImportConfigScanner()
+    {
+        ScanOptions options = new ScanOptions();
+        options.setDesiredBarcodeFormats(ScanOptions.QR_CODE);
+        options.setPrompt("Scan the Reader Config QR from the credential app");
+        options.setBeepEnabled(false);
+        options.setOrientationLocked(false);
+        importConfigScanLauncher.launch(options);
+    }
+
+    private void onImportConfigScanResult(ScanIntentResult result)
+    {
+        if (result.getContents() == null) return;   // cancelled
+        String scanned = result.getContents().trim();
+        try
+        {
+            JSONObject obj = new JSONObject(scanned);
+            if (obj.optInt("v", 0) != 1 ||
+                !"aliro_reader_config".equals(obj.optString("type", "")))
+            {
+                showStatus("QR does not contain a valid Aliro reader config.", false);
+                return;
+            }
+
+            String readerPrivKey   = obj.getString("readerPrivateKey").toLowerCase(java.util.Locale.US);
+            String readerId        = obj.getString("readerId").toLowerCase(java.util.Locale.US);
+            String readerCert      = obj.getString("readerCert").toLowerCase(java.util.Locale.US);
+            String issuerPubKey    = obj.getString("issuerPubKey").toLowerCase(java.util.Locale.US);
+
+            // Populate the edit fields
+            editReaderPrivateKey.setText(readerPrivKey);
+            editReaderId.setText(readerId);
+            editReaderIssuerPublicKey.setText(issuerPubKey);
+            editReaderCertificate.setText(readerCert);
+
+            // Auto-fill Step-Up Element ID if empty
+            if (editStepUpElementId.getText().toString().trim().isEmpty())
+            {
+                editStepUpElementId.setText("access");
+            }
+
+            // Auto-fill Step-Up Issuer Public Key with the same issuer pub key
+            if (editStepUpIssuerPubKey.getText().toString().trim().isEmpty())
+            {
+                editStepUpIssuerPubKey.setText(issuerPubKey);
+            }
+
+            showStatus("\u2713 Reader config imported\n"
+                    + "Reader ID: " + readerId.substring(0, Math.min(8, readerId.length())) + "...\n"
+                    + "Cert: " + (readerCert.length() / 2) + " bytes\n"
+                    + "Tap Save to apply.", true);
+        }
+        catch (Exception e)
+        {
+            showStatus("Failed to parse reader config QR: " + e.getMessage(), false);
         }
     }
 

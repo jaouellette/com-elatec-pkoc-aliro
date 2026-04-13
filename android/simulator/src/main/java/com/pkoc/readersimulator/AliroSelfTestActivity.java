@@ -63,16 +63,9 @@ public class AliroSelfTestActivity extends AppCompatActivity
     @Override
     public boolean onCreateOptionsMenu(android.view.Menu menu)
     {
-        // Do not call super — prevents parent activity menu from being inflated
+        // Clear any inherited menu items and show no overflow menu
         menu.clear();
-        return true; // return true so onPrepareOptionsMenu is called
-    }
-
-    @Override
-    public boolean onPrepareOptionsMenu(android.view.Menu menu)
-    {
-        menu.clear(); // ensure nothing slips through
-        return false; // no menu to show
+        return false;
     }
 
     @Override
@@ -115,7 +108,7 @@ public class AliroSelfTestActivity extends AppCompatActivity
 
         new Thread(() ->
         {
-            AliroSelfTestEngine engine = new AliroSelfTestEngine();
+            AliroSelfTestEngine engine = new AliroSelfTestEngine(AliroSelfTestActivity.this);
             engine.runAll(new AliroSelfTestEngine.Callback()
             {
                 @Override

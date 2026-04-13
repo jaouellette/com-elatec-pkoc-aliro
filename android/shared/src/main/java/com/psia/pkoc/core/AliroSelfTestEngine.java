@@ -172,6 +172,7 @@ public class AliroSelfTestEngine
         runAndReport(results, cb, this::testBleStepUpFullFlow);
         runAndReport(results, cb, this::testMailboxSampleTLVParse);
         runAndReport(results, cb, this::testAccessDocRealisticSample);
+        runAndReport(results, cb, this::testProvisioningRoundTrip);
 
         // Group 4: Negative Tests
         runAndReport(results, cb, this::testNegAuth0WrongReaderId);
@@ -2845,12 +2846,16 @@ public class AliroSelfTestEngine
                         "Summary missing element identifier 'access': " + summary, start);
 
             // Step 6: Load the stored document from SharedPreferences and verify Base64.
-            SharedPreferences prefs = context.getSharedPreferences("aliro_prefs", Context.MODE_PRIVATE);
-            String storedB64 = prefs.getString("access_document", null);
+            // AliroAccessDocument stores to PREFS_NAME="AliroCredentialConfig",
+            // KEY_ACCESS_DOC="aliro_access_doc".
+            SharedPreferences prefs = context.getSharedPreferences(
+                    AliroAccessDocument.PREFS_NAME, Context.MODE_PRIVATE);
+            String storedB64 = prefs.getString(AliroAccessDocument.KEY_ACCESS_DOC, null);
             if (storedB64 == null)
                 return result("ACCESS_DOC_REALISTIC_SAMPLE", "Full Flow",
                         "Realistic Access Document CBOR structure validation", false,
-                        "No 'access_document' entry found in aliro_prefs SharedPreferences", start);
+                        "No '" + AliroAccessDocument.KEY_ACCESS_DOC + "' entry found in "
+                                + AliroAccessDocument.PREFS_NAME + " SharedPreferences", start);
 
             byte[] cborBytes;
             try
@@ -2890,6 +2895,143 @@ public class AliroSelfTestEngine
         {
             return result("ACCESS_DOC_REALISTIC_SAMPLE", "Full Flow",
                     "Realistic Access Document CBOR structure validation", false, e.toString(), start);
+        }
+    }
+
+    /**
+     * PROVISIONING_ROUND_TRIP — Real credential provisioning: generate Issuer CA, reader cert,
+     * export/import JSON, verify cert.
+     *
+     * Requires a non-null Context (uses SharedPreferences). Skips gracefully if null.
+     *
+     * Steps:
+     *   1. AliroProvisioningManager.provisionCredential(context) — non-null return
+     *   2. AliroProvisioningManager.isProvisioned(context)       — must return true
+     *   3. AliroProvisioningManager.buildExportJson(context)     — non-null, valid JSON
+     *   4. Parse JSON: verify readerPrivateKey(64 hex), readerId(64 hex),
+     *                  readerCert(non-empty), issuerPubKey(130 hex), readerGroupId(32 hex)
+     *   5. Hex-decode readerCert + issuerPubKey; call verifyProfile0000Cert — must return true
+     *   6. AliroProvisioningManager.clearProvisioning(context)
+     *   7. AliroProvisioningManager.isProvisioned(context)       — must return false
+     */
+    private TestResult testProvisioningRoundTrip()
+    {
+        long start = System.currentTimeMillis();
+        if (context == null)
+        {
+            // Skip gracefully when no Context is provided (unit-test environment).
+            return new TestResult("PROVISIONING_ROUND_TRIP", "Full Flow",
+                    "Real credential provisioning: generate Issuer CA, reader cert, export/import JSON, verify cert",
+                    true, true, "SKIPPED — no Android Context available",
+                    System.currentTimeMillis() - start);
+        }
+        try
+        {
+            // Step 1: provisionCredential — must return non-null summary string.
+            String summary = AliroProvisioningManager.provisionCredential(context);
+            if (summary == null)
+                return result("PROVISIONING_ROUND_TRIP", "Full Flow",
+                        "Real credential provisioning: generate Issuer CA, reader cert, export/import JSON, verify cert",
+                        false, "provisionCredential() returned null", start);
+
+            // Step 2: isProvisioned — must return true after successful provisioning.
+            if (!AliroProvisioningManager.isProvisioned(context))
+                return result("PROVISIONING_ROUND_TRIP", "Full Flow",
+                        "Real credential provisioning: generate Issuer CA, reader cert, export/import JSON, verify cert",
+                        false, "isProvisioned() returned false immediately after provisionCredential()", start);
+
+            // Step 3: buildExportJson — must return non-null and parse as valid JSON.
+            String json = AliroProvisioningManager.buildExportJson(context);
+            if (json == null)
+                return result("PROVISIONING_ROUND_TRIP", "Full Flow",
+                        "Real credential provisioning: generate Issuer CA, reader cert, export/import JSON, verify cert",
+                        false, "buildExportJson() returned null", start);
+
+            org.json.JSONObject obj;
+            try
+            {
+                obj = new org.json.JSONObject(json);
+            }
+            catch (Exception e)
+            {
+                return result("PROVISIONING_ROUND_TRIP", "Full Flow",
+                        "Real credential provisioning: generate Issuer CA, reader cert, export/import JSON, verify cert",
+                        false, "buildExportJson() did not produce valid JSON: " + e.getMessage(), start);
+            }
+
+            // Step 4: Verify required JSON fields with correct lengths.
+            String readerPrivateKey = obj.optString("readerPrivateKey", "");
+            if (readerPrivateKey.length() != 64)
+                return result("PROVISIONING_ROUND_TRIP", "Full Flow",
+                        "Real credential provisioning: generate Issuer CA, reader cert, export/import JSON, verify cert",
+                        false, "readerPrivateKey length=" + readerPrivateKey.length() + ", expected 64 hex chars", start);
+
+            String readerId = obj.optString("readerId", "");
+            if (readerId.length() != 64)
+                return result("PROVISIONING_ROUND_TRIP", "Full Flow",
+                        "Real credential provisioning: generate Issuer CA, reader cert, export/import JSON, verify cert",
+                        false, "readerId length=" + readerId.length() + ", expected 64 hex chars", start);
+
+            String readerCertHex = obj.optString("readerCert", "");
+            if (readerCertHex.isEmpty())
+                return result("PROVISIONING_ROUND_TRIP", "Full Flow",
+                        "Real credential provisioning: generate Issuer CA, reader cert, export/import JSON, verify cert",
+                        false, "readerCert is empty", start);
+
+            String issuerPubKeyHex = obj.optString("issuerPubKey", "");
+            if (issuerPubKeyHex.length() != 130)
+                return result("PROVISIONING_ROUND_TRIP", "Full Flow",
+                        "Real credential provisioning: generate Issuer CA, reader cert, export/import JSON, verify cert",
+                        false, "issuerPubKey length=" + issuerPubKeyHex.length() + ", expected 130 hex chars", start);
+
+            String readerGroupId = obj.optString("readerGroupId", "");
+            if (readerGroupId.length() != 32)
+                return result("PROVISIONING_ROUND_TRIP", "Full Flow",
+                        "Real credential provisioning: generate Issuer CA, reader cert, export/import JSON, verify cert",
+                        false, "readerGroupId length=" + readerGroupId.length() + ", expected 32 hex chars", start);
+
+            // Step 5: Hex-decode cert and issuer pub key, verify cert signature.
+            byte[] certBytes;
+            byte[] issuerPubKeyBytes;
+            try
+            {
+                certBytes       = Hex.decode(readerCertHex);
+                issuerPubKeyBytes = Hex.decode(issuerPubKeyHex);
+            }
+            catch (Exception e)
+            {
+                return result("PROVISIONING_ROUND_TRIP", "Full Flow",
+                        "Real credential provisioning: generate Issuer CA, reader cert, export/import JSON, verify cert",
+                        false, "Hex decode of readerCert/issuerPubKey failed: " + e.getMessage(), start);
+            }
+
+            boolean certValid = AliroProvisioningManager.verifyProfile0000Cert(certBytes, issuerPubKeyBytes);
+            if (!certValid)
+                return result("PROVISIONING_ROUND_TRIP", "Full Flow",
+                        "Real credential provisioning: generate Issuer CA, reader cert, export/import JSON, verify cert",
+                        false, "verifyProfile0000Cert() returned false — cert signature check failed", start);
+
+            // Step 6: Clear provisioning data.
+            AliroProvisioningManager.clearProvisioning(context);
+
+            // Step 7: isProvisioned must return false after clearing.
+            if (AliroProvisioningManager.isProvisioned(context))
+                return result("PROVISIONING_ROUND_TRIP", "Full Flow",
+                        "Real credential provisioning: generate Issuer CA, reader cert, export/import JSON, verify cert",
+                        false, "isProvisioned() returned true after clearProvisioning()", start);
+
+            return result("PROVISIONING_ROUND_TRIP", "Full Flow",
+                    "Real credential provisioning: generate Issuer CA, reader cert, export/import JSON, verify cert",
+                    true,
+                    "provisionCredential OK, isProvisioned=true, JSON fields valid (privKey/id/cert/issuerPub/groupId), "
+                            + "verifyProfile0000Cert=true, clearProvisioning OK, isProvisioned=false",
+                    start);
+        }
+        catch (Exception e)
+        {
+            return result("PROVISIONING_ROUND_TRIP", "Full Flow",
+                    "Real credential provisioning: generate Issuer CA, reader cert, export/import JSON, verify cert",
+                    false, e.toString(), start);
         }
     }
 

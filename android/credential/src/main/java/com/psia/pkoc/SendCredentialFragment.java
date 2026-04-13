@@ -210,9 +210,13 @@ public class SendCredentialFragment extends Fragment
             }
 
             binding.readerIcon.setImageResource(R.drawable.ic_reader_success);
-            // Determine transport from the intent action or default to NFC
-            boolean isAliro = intent.getBooleanExtra("aliro", false);
-            String transport = isAliro ? "Aliro NFC" : "PKOC NFC";
+            // Determine protocol from the broadcast action
+            String action = intent.getAction();
+            String transport;
+            if ("com.psia.pkoc.ALIRO_CREDENTIAL_SENT".equals(action))
+                transport = "Aliro NFC";
+            else
+                transport = "PKOC NFC";
             binding.statusText.setText(transport + ": " + getString(R.string.credential_sent));
             binding.statusText.setVisibility(View.VISIBLE);
 
