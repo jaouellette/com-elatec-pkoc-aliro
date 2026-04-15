@@ -3,6 +3,7 @@ package com.psia.pkoc;
 import android.content.Context;
 import android.content.SharedPreferences;
 import android.os.Bundle;
+import android.util.Log;
 import android.view.LayoutInflater;
 import android.view.View;
 import android.view.ViewGroup;
@@ -11,6 +12,7 @@ import android.widget.SeekBar;
 import androidx.annotation.NonNull;
 import androidx.fragment.app.Fragment;
 
+import com.psia.pkoc.core.CryptoProvider;
 import com.psia.pkoc.core.PKOC_ConnectionType;
 import com.psia.pkoc.core.PKOC_Preferences;
 import com.psia.pkoc.core.PKOC_TransmissionType;
@@ -38,9 +40,9 @@ public class SettingsFragment extends Fragment
             clearError(binding.siteIdentifierInput);
         }
 
-        if (!Validators.isValidHex(pubKeyHex, 65))
+        if (!pubKeyHex.isEmpty() && !Validators.isValidHex(pubKeyHex, 65))
         {
-            setError(binding.sitePublicKeyInput, "Must be 65-byte hex (130 chars)");
+            setError(binding.sitePublicKeyInput, "Must be 65-byte hex (130 chars) or empty for device key");
             ok = false;
         }
         else
@@ -159,6 +161,10 @@ public class SettingsFragment extends Fragment
             if (checkedId == binding.UncompressedButton.getId())
             {
 
+                binding.ecdheConfigStatus.setVisibility(View.GONE);
+                binding.btnResetEcdheDefaults.setVisibility(View.GONE);
+                binding.btnClearEcdheConfig.setVisibility(View.GONE);
+                ((View) binding.btnResetEcdheDefaults.getParent()).setVisibility(View.GONE);
                 binding.siteIdentifierLabel.setVisibility(View.GONE);
                 binding.siteIdentifierInput.setVisibility(View.GONE);
                 binding.readerIdentifierLabel.setVisibility(View.GONE);
@@ -174,12 +180,16 @@ public class SettingsFragment extends Fragment
             else
             {
 
+                binding.ecdheConfigStatus.setVisibility(View.VISIBLE);
+                ((View) binding.btnResetEcdheDefaults.getParent()).setVisibility(View.VISIBLE);
                 binding.siteIdentifierLabel.setVisibility(View.VISIBLE);
                 binding.siteIdentifierInput.setVisibility(View.VISIBLE);
                 binding.readerIdentifierLabel.setVisibility(View.VISIBLE);
                 binding.readerIdentifierInput.setVisibility(View.VISIBLE);
                 binding.sitePublicKeyLabel.setVisibility(View.VISIBLE);
                 binding.sitePublicKeyInput.setVisibility(View.VISIBLE);
+
+                loadAndDisplayEcdheConfig();
 
                 sharedPrefs
                     .edit()
@@ -221,9 +231,12 @@ public class SettingsFragment extends Fragment
             }
         });
 
-        DebouncedTextWatcher.attach(binding.siteIdentifierInput, 300, t -> persistSiteIfValid());
-        DebouncedTextWatcher.attach(binding.sitePublicKeyInput,  300, t -> persistSiteIfValid());
-        DebouncedTextWatcher.attach(binding.readerIdentifierInput, 300, t -> persistReaderIfValid());
+        DebouncedTextWatcher.attach(binding.siteIdentifierInput, 300, t -> { persistSiteIfValid(); updateEcdheStatusLabel(); });
+        DebouncedTextWatcher.attach(binding.sitePublicKeyInput,  300, t -> { persistSiteIfValid(); updateEcdheStatusLabel(); });
+        DebouncedTextWatcher.attach(binding.readerIdentifierInput, 300, t -> { persistReaderIfValid(); updateEcdheStatusLabel(); });
+
+        binding.btnResetEcdheDefaults.setOnClickListener(v -> resetEcdheToDefaults());
+        binding.btnClearEcdheConfig.setOnClickListener(v -> clearEcdheForCustom());
 
         binding.rangingSlider.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener()
         {
@@ -274,10 +287,12 @@ public class SettingsFragment extends Fragment
         if (toFlow == PKOC_ConnectionType.ECHDE_Full)
             binding.RadioGroup.check(binding.ECHDEComplete.getId());
 
-        // Show/hide ECDHE-specific fields
+        // Show/hide ECDHE-specific fields + status/buttons
         boolean isEcdhe = toFlow == PKOC_ConnectionType.ECHDE_Full;
         int visibility = isEcdhe ? View.VISIBLE : View.GONE;
 
+        binding.ecdheConfigStatus.setVisibility(visibility);
+        ((View) binding.btnResetEcdheDefaults.getParent()).setVisibility(visibility);
         binding.siteIdentifierLabel.setVisibility(visibility);
         binding.siteIdentifierInput.setVisibility(visibility);
         binding.readerIdentifierLabel.setVisibility(visibility);
@@ -314,22 +329,120 @@ public class SettingsFragment extends Fragment
 
         if (toFlow == PKOC_ConnectionType.ECHDE_Full)
         {
-            String savedEphemeralKey = sharedPrefs.getString("PKOC_SiteEphemeralKey", "");
-            String savedSiteId = sharedPrefs.getString("PKOC_Site_ID", "");
-            String savedReaderId = sharedPrefs.getString("PKOC_Reader_ID", "");
-            binding.sitePublicKeyInput.setText(savedEphemeralKey);
-            binding.siteIdentifierInput.setText(savedSiteId);
-            binding.readerIdentifierInput.setText(savedReaderId);
-
-            sharedPrefs.edit()
-                    .putString("PKOC_SiteEphemeralKey", savedEphemeralKey)
-                    .putString("PKOC_Site_ID", savedSiteId)
-                    .putString("PKOC_Reader_ID", savedReaderId)
-                    .apply();
+            loadAndDisplayEcdheConfig();
         }
     }
 
 
+
+    // =========================================================================
+    // ECDHE config helpers
+    // =========================================================================
+
+    /** Load ECDHE values from prefs (with defaults) and display them. */
+    private void loadAndDisplayEcdheConfig()
+    {
+        String siteKey  = sharedPrefs.getString(
+                PKOC_Preferences.ECDHE_SitePublicKey,
+                PKOC_Preferences.DEFAULT_SITE_PUBLIC_KEY);
+        String siteId   = sharedPrefs.getString(
+                PKOC_Preferences.ECDHE_SiteId,
+                PKOC_Preferences.DEFAULT_SITE_UUID);
+        String readerId = sharedPrefs.getString(
+                PKOC_Preferences.ECDHE_ReaderId,
+                PKOC_Preferences.DEFAULT_READER_UUID);
+
+        // If site public key is empty, show the device's own PKOC public key
+        // as the default (self-signed demo mode).
+        if (siteKey == null || siteKey.isEmpty())
+        {
+            try
+            {
+                byte[] devicePub = CryptoProvider.getUncompressedPublicKeyBytes();
+                if (devicePub != null)
+                {
+                    siteKey = org.bouncycastle.util.encoders.Hex.toHexString(devicePub);
+                }
+            }
+            catch (Exception e)
+            {
+                Log.w("SettingsFragment", "Could not get device public key for default", e);
+            }
+        }
+
+        binding.sitePublicKeyInput.setText(siteKey);
+        binding.siteIdentifierInput.setText(siteId);
+        binding.readerIdentifierInput.setText(readerId);
+
+        updateEcdheStatusLabel();
+    }
+
+    /** Check if current ECDHE values match the built-in defaults and update status label. */
+    private void updateEcdheStatusLabel()
+    {
+        if (binding == null || binding.ecdheConfigStatus == null) return;
+
+        String siteId   = safeText(binding.siteIdentifierInput);
+        String readerId = safeText(binding.readerIdentifierInput);
+        String siteKey  = safeText(binding.sitePublicKeyInput);
+
+        boolean isDefault = siteId.equals(PKOC_Preferences.DEFAULT_SITE_UUID)
+                && readerId.equals(PKOC_Preferences.DEFAULT_READER_UUID)
+                && siteKey.equals(PKOC_Preferences.DEFAULT_SITE_PUBLIC_KEY);
+
+        if (isDefault)
+        {
+            binding.ecdheConfigStatus.setText("Using built-in ELATEC defaults");
+            binding.ecdheConfigStatus.setTextColor(0xFF4472C4); // blue
+        }
+        else
+        {
+            binding.ecdheConfigStatus.setText("Using custom configuration");
+            binding.ecdheConfigStatus.setTextColor(0xFF2E7D32); // green
+        }
+    }
+
+    /** Reset all ECDHE fields to built-in defaults. */
+    private void resetEcdheToDefaults()
+    {
+        sharedPrefs.edit()
+                .putString(PKOC_Preferences.ECDHE_SiteId, PKOC_Preferences.DEFAULT_SITE_UUID)
+                .putString(PKOC_Preferences.ECDHE_ReaderId, PKOC_Preferences.DEFAULT_READER_UUID)
+                .putString(PKOC_Preferences.ECDHE_SitePublicKey, PKOC_Preferences.DEFAULT_SITE_PUBLIC_KEY)
+                .putString(PKOC_Preferences.ReaderUUID, PKOC_Preferences.DEFAULT_READER_UUID)
+                .putString(PKOC_Preferences.SiteUUID, PKOC_Preferences.DEFAULT_SITE_UUID)
+                .apply();
+
+        // Re-load and display — this will resolve the empty site key
+        // back to the device's own PKOC public key.
+        loadAndDisplayEcdheConfig();
+
+        android.widget.Toast.makeText(requireContext(),
+                "ECDHE config reset to ELATEC defaults",
+                android.widget.Toast.LENGTH_SHORT).show();
+    }
+
+    /** Clear all ECDHE fields so the user can enter custom values. */
+    private void clearEcdheForCustom()
+    {
+        sharedPrefs.edit()
+                .putString(PKOC_Preferences.ECDHE_SiteId, "")
+                .putString(PKOC_Preferences.ECDHE_ReaderId, "")
+                .putString(PKOC_Preferences.ECDHE_SitePublicKey, "")
+                .apply();
+
+        binding.siteIdentifierInput.setText("");
+        binding.readerIdentifierInput.setText("");
+        binding.sitePublicKeyInput.setText("");
+
+        updateEcdheStatusLabel();
+
+        binding.siteIdentifierInput.requestFocus();
+
+        android.widget.Toast.makeText(requireContext(),
+                "Enter your custom Site UUID, Reader UUID, and Site Public Key",
+                android.widget.Toast.LENGTH_SHORT).show();
+    }
 
     @Override
     public void onViewCreated (@NonNull View view, Bundle savedInstanceState)

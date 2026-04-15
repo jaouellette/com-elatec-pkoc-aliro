@@ -75,16 +75,9 @@ public class PKOCSelfTestActivity extends AppCompatActivity
     @Override
     public boolean onCreateOptionsMenu(android.view.Menu menu)
     {
-        // Do not call super — prevents parent activity menu from being inflated
+        // Clear any inherited menu items and show no overflow menu
         menu.clear();
-        return true; // return true so onPrepareOptionsMenu is called
-    }
-
-    @Override
-    public boolean onPrepareOptionsMenu(android.view.Menu menu)
-    {
-        menu.clear(); // ensure nothing slips through
-        return false; // no menu to show
+        return false;
     }
 
     @Override
@@ -163,9 +156,10 @@ public class PKOCSelfTestActivity extends AppCompatActivity
                     getPackageName() + ".fileprovider", reportFile);
 
             Intent shareIntent = new Intent(Intent.ACTION_SEND);
-            shareIntent.setType("text/html");
+            shareIntent.setType("application/octet-stream");
             shareIntent.putExtra(Intent.EXTRA_STREAM, uri);
             shareIntent.putExtra(Intent.EXTRA_SUBJECT, "PKOC Compliance Report — " + date);
+            shareIntent.putExtra(Intent.EXTRA_TEXT, "PKOC self-test compliance report attached.");
             shareIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
             startActivity(Intent.createChooser(shareIntent, "Share Compliance Report"));
         }

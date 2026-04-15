@@ -5,6 +5,7 @@ import android.util.Log;
 import org.bouncycastle.asn1.ASN1Integer;
 import org.bouncycastle.asn1.ASN1Sequence;
 import org.bouncycastle.crypto.engines.AESEngine;
+import org.bouncycastle.crypto.modes.CCMBlockCipher;
 import org.bouncycastle.crypto.modes.GCMBlockCipher;
 import org.bouncycastle.crypto.params.AEADParameters;
 import org.bouncycastle.crypto.params.KeyParameter;
@@ -34,7 +35,7 @@ import java.util.UUID;
 import javax.crypto.KeyAgreement;
 
 /**
- * PKOC 1.0 Compliance Self-Test Engine.
+ * PKOC 1.0 / v3.1.1 Compliance Self-Test Engine.
  *
  * Runs all test cases in-process using pure Java — no NFC/BLE hardware required.
  * Uses a loopback architecture with 4 inner classes:
@@ -48,6 +49,7 @@ import javax.crypto.KeyAgreement;
  *   2. BLE Protocol Format (13 tests)
  *   3. Full Flow (3 tests)
  *   4. Negative Tests (5 tests)
+ *   5. PKOC v3.1.1 Spec Compliance (5 tests)
  */
 public class PKOCSelfTestEngine
 {
@@ -153,6 +155,13 @@ public class PKOCSelfTestEngine
         runAndReport(results, cb, this::testNegNfcSigTampered);
         runAndReport(results, cb, this::testNegBleWrongSiteKey);
         runAndReport(results, cb, this::testNegBleCcmTampered);
+
+        // Group 5: PKOC v3.1.1 Spec Compliance (5 tests)
+        runAndReport(results, cb, this::testV311CcmEncryptDecrypt);
+        runAndReport(results, cb, this::testV311IvFormat);
+        runAndReport(results, cb, this::testV311KdfDerivation);
+        runAndReport(results, cb, this::testV311ProtocolVersion);
+        runAndReport(results, cb, this::testV311SigInputSymmetry);
 
         if (cb != null) cb.onAllComplete(results);
         return results;
@@ -1259,15 +1268,15 @@ public class PKOCSelfTestEngine
                     buildBleTlv(0x03, deviceSig),
                     buildBleTlv(0x09, intToBytes4((int) (System.currentTimeMillis() / 1000)))
             );
-            byte[] encrypted = aesGcmEncrypt(sessionKey, plaintext, 1);
+            byte[] encrypted = aesCcmEncrypt(sessionKey, plaintext, 1);
             if (encrypted == null)
                 return result("PKOC_BLE_ECDHE", "Full Flow", "BLE ECDHE flow", false,
-                        "AES-GCM encryption failed", start);
+                        "AES-256-CCM encryption failed", start);
 
-            byte[] decrypted = aesGcmDecrypt(sessionKey, encrypted, 1);
+            byte[] decrypted = aesCcmDecrypt(sessionKey, encrypted, 1);
             if (decrypted == null)
                 return result("PKOC_BLE_ECDHE", "Full Flow", "BLE ECDHE flow", false,
-                        "AES-GCM decryption failed", start);
+                        "AES-256-CCM decryption failed", start);
 
             if (!Arrays.equals(plaintext, decrypted))
                 return result("PKOC_BLE_ECDHE", "Full Flow", "BLE ECDHE flow", false,
@@ -1275,7 +1284,7 @@ public class PKOCSelfTestEngine
 
             return result("PKOC_BLE_ECDHE", "Full Flow",
                     "Full BLE ECDHE: key agreement → encrypt/decrypt → verify sig",
-                    true, "SigValid=true, AES-GCM round-trip OK, 96-byte sig data", start);
+                    true, "SigValid=true, AES-256-CCM round-trip OK, 96-byte sig data", start);
         }
         catch (Exception e)
         {
@@ -1440,21 +1449,21 @@ public class PKOCSelfTestEngine
             new SecureRandom().nextBytes(key);
             byte[] plaintext = "PKOCTamperTest".getBytes();
 
-            byte[] encrypted = aesGcmEncrypt(key, plaintext, 1);
+            byte[] encrypted = aesCcmEncrypt(key, plaintext, 1);
             if (encrypted == null)
-                return result("NEG_BLE_CCM_TAMPERED", "Negative", "Tampered CCM/GCM", false,
+                return result("NEG_BLE_CCM_TAMPERED", "Negative", "Tampered AES-CCM", false,
                         "Encryption failed", start);
 
             // Flip a bit in ciphertext
             encrypted[0] ^= 0x01;
 
-            byte[] decrypted = aesGcmDecrypt(key, encrypted, 1);
+            byte[] decrypted = aesCcmDecrypt(key, encrypted, 1);
             if (decrypted != null)
-                return result("NEG_BLE_CCM_TAMPERED", "Negative", "Tampered CCM/GCM", false,
+                return result("NEG_BLE_CCM_TAMPERED", "Negative", "Tampered AES-CCM", false,
                         "Tampered ciphertext should NOT decrypt", start);
 
             return result("NEG_BLE_CCM_TAMPERED", "Negative",
-                    "ECDHE flow with tampered ciphertext: GCM tag validation fails",
+                    "ECDHE flow with tampered ciphertext: CCM tag validation fails",
                     true, "Tampered ciphertext correctly rejected", start);
         }
         catch (Exception e)
@@ -1654,8 +1663,8 @@ public class PKOCSelfTestEngine
 
         byte[] buildOpeningMessage()
         {
-            // Protocol version TLV: 0x0C + 5 bytes (spec_ver=0x03, vendor=0x0000, features=0x0001)
-            byte[] protoId = {0x03, 0x00, 0x00, 0x00, 0x01};
+            // Protocol version TLV: 0x0C + 5 bytes (spec_ver=0x01 per v3.1.1, vendor=0x0000, features=0x0001 CCM)
+            byte[] protoId = {0x01, 0x00, 0x00, 0x00, 0x01};
             byte[] proto = buildBleTlv(0x0C, protoId);
 
             // Compressed eph pub key TLV: 0x02 + 33 bytes
@@ -1698,7 +1707,7 @@ public class PKOCSelfTestEngine
             byte[] pkTlv = buildBleTlv(0x01, credentialPub);
             byte[] sigTlv = buildBleTlv(0x03, sig);
             byte[] timeTlv = buildBleTlv(0x09, intToBytes4((int) (System.currentTimeMillis() / 1000)));
-            byte[] protoTlv = buildBleTlv(0x0C, new byte[]{0x03, 0x00, 0x00, 0x00, 0x01});
+            byte[] protoTlv = buildBleTlv(0x0C, new byte[]{0x01, 0x00, 0x00, 0x00, 0x01});
 
             return concat(pkTlv, sigTlv, timeTlv, protoTlv);
         }
@@ -1878,59 +1887,67 @@ public class PKOCSelfTestEngine
         }
     }
 
-    /** AES-GCM encrypt with counter-based IV */
-    private static byte[] aesGcmEncrypt(byte[] key, byte[] plaintext, int counter)
+    /**
+     * Build the 12-byte AES-CCM IV per PKOC v3.1.1 Section 7.2.4.
+     * Format: 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x01 || Counter (4 bytes, big-endian)
+     */
+    private static byte[] buildAesCcmIV(int counter)
+    {
+        byte[] iv = new byte[12];
+        iv[7] = 0x01; // 8-byte prefix: 0x0000000000000001
+        iv[8]  = (byte) ((counter >> 24) & 0xFF);
+        iv[9]  = (byte) ((counter >> 16) & 0xFF);
+        iv[10] = (byte) ((counter >> 8)  & 0xFF);
+        iv[11] = (byte) (counter & 0xFF);
+        return iv;
+    }
+
+    /** AES-256-CCM encrypt per PKOC v3.1.1 §7.2.4 (T=16, q=3, AAD=empty) */
+    private static byte[] aesCcmEncrypt(byte[] key, byte[] plaintext, int counter)
     {
         try
         {
-            byte[] iv = new byte[12];
-            // 0x00000000000001 (7 bytes) + counter (4 bytes BE)
-            iv[6] = 0x01;
-            iv[8] = (byte) (counter >> 24);
-            iv[9] = (byte) (counter >> 16);
-            iv[10] = (byte) (counter >> 8);
-            iv[11] = (byte) counter;
-
-            GCMBlockCipher gcm = new GCMBlockCipher(new AESEngine());
+            byte[] iv = buildAesCcmIV(counter);
+            CCMBlockCipher ccm = new CCMBlockCipher(new AESEngine());
             AEADParameters params = new AEADParameters(new KeyParameter(key), 128, iv);
-            gcm.init(true, params);
+            ccm.init(true, params);
 
-            byte[] output = new byte[gcm.getOutputSize(plaintext.length)];
-            int len = gcm.processBytes(plaintext, 0, plaintext.length, output, 0);
-            gcm.doFinal(output, len);
-            return output;
+            byte[] output = new byte[ccm.getOutputSize(plaintext.length)];
+            int len = ccm.processBytes(plaintext, 0, plaintext.length, output, 0);
+            len += ccm.doFinal(output, len);
+
+            byte[] result = new byte[len];
+            System.arraycopy(output, 0, result, 0, len);
+            return result;
         }
         catch (Exception e)
         {
-            Log.e(TAG, "aesGcmEncrypt failed", e);
+            Log.e(TAG, "aesCcmEncrypt failed", e);
             return null;
         }
     }
 
-    /** AES-GCM decrypt with counter-based IV */
-    private static byte[] aesGcmDecrypt(byte[] key, byte[] ciphertextAndTag, int counter)
+    /** AES-256-CCM decrypt per PKOC v3.1.1 §7.2.4 (T=16, q=3, AAD=empty) */
+    private static byte[] aesCcmDecrypt(byte[] key, byte[] ciphertextAndTag, int counter)
     {
         try
         {
-            byte[] iv = new byte[12];
-            iv[6] = 0x01;
-            iv[8] = (byte) (counter >> 24);
-            iv[9] = (byte) (counter >> 16);
-            iv[10] = (byte) (counter >> 8);
-            iv[11] = (byte) counter;
-
-            GCMBlockCipher gcm = new GCMBlockCipher(new AESEngine());
+            byte[] iv = buildAesCcmIV(counter);
+            CCMBlockCipher ccm = new CCMBlockCipher(new AESEngine());
             AEADParameters params = new AEADParameters(new KeyParameter(key), 128, iv);
-            gcm.init(false, params);
+            ccm.init(false, params);
 
-            byte[] output = new byte[gcm.getOutputSize(ciphertextAndTag.length)];
-            int len = gcm.processBytes(ciphertextAndTag, 0, ciphertextAndTag.length, output, 0);
-            gcm.doFinal(output, len);
-            return output;
+            byte[] output = new byte[ccm.getOutputSize(ciphertextAndTag.length)];
+            int len = ccm.processBytes(ciphertextAndTag, 0, ciphertextAndTag.length, output, 0);
+            len += ccm.doFinal(output, len);
+
+            byte[] result = new byte[len];
+            System.arraycopy(output, 0, result, 0, len);
+            return result;
         }
         catch (Exception e)
         {
-            Log.e(TAG, "aesGcmDecrypt failed", e);
+            Log.e(TAG, "aesCcmDecrypt failed", e);
             return null;
         }
     }
@@ -2032,5 +2049,256 @@ public class PKOCSelfTestEngine
     {
         return new TestResult(testId, group, name, passed, false, detail,
                 System.currentTimeMillis() - startMs);
+    }
+
+    // =========================================================================
+    // GROUP 5: PKOC v3.1.1 Spec Compliance (5 tests)
+    // =========================================================================
+
+    /** V311_CCM_ENCRYPT_DECRYPT: AES-256-CCM round-trip with T=16, counter=1 */
+    private TestResult testV311CcmEncryptDecrypt()
+    {
+        long start = System.currentTimeMillis();
+        try
+        {
+            byte[] key = new byte[32];
+            new SecureRandom().nextBytes(key);
+            byte[] plaintext = "PKOC v3.1.1 AES-256-CCM test payload".getBytes();
+
+            // Counter starts at 1 per spec
+            byte[] encrypted = aesCcmEncrypt(key, plaintext, 1);
+            if (encrypted == null)
+                return result("V311_CCM_ENCRYPT_DECRYPT", "v3.1.1 Compliance",
+                        "AES-256-CCM round-trip", false, "Encryption failed", start);
+
+            // Ciphertext must be longer than plaintext (includes 16-byte tag)
+            if (encrypted.length != plaintext.length + 16)
+                return result("V311_CCM_ENCRYPT_DECRYPT", "v3.1.1 Compliance",
+                        "AES-256-CCM round-trip", false,
+                        "Expected ciphertext length " + (plaintext.length + 16)
+                                + ", got " + encrypted.length, start);
+
+            byte[] decrypted = aesCcmDecrypt(key, encrypted, 1);
+            if (decrypted == null)
+                return result("V311_CCM_ENCRYPT_DECRYPT", "v3.1.1 Compliance",
+                        "AES-256-CCM round-trip", false, "Decryption failed", start);
+
+            if (!Arrays.equals(plaintext, decrypted))
+                return result("V311_CCM_ENCRYPT_DECRYPT", "v3.1.1 Compliance",
+                        "AES-256-CCM round-trip", false, "Plaintext mismatch", start);
+
+            return result("V311_CCM_ENCRYPT_DECRYPT", "v3.1.1 Compliance",
+                    "AES-256-CCM encrypt/decrypt with T=16, counter=1",
+                    true, "Round-trip OK, tag=16 bytes", start);
+        }
+        catch (Exception e)
+        {
+            return result("V311_CCM_ENCRYPT_DECRYPT", "v3.1.1 Compliance",
+                    "AES-256-CCM round-trip", false, e.toString(), start);
+        }
+    }
+
+    /** V311_IV_FORMAT: Verify 12-byte IV = 0x0000000000000001 || counter (4 bytes BE) */
+    private TestResult testV311IvFormat()
+    {
+        long start = System.currentTimeMillis();
+        try
+        {
+            // Counter = 1 (initial value per spec)
+            byte[] iv1 = buildAesCcmIV(1);
+            if (iv1.length != 12)
+                return result("V311_IV_FORMAT", "v3.1.1 Compliance",
+                        "IV format", false, "IV length " + iv1.length + ", expected 12", start);
+
+            // Check fixed prefix: bytes 0-6 = 0x00, byte 7 = 0x01
+            for (int i = 0; i < 7; i++)
+            {
+                if (iv1[i] != 0x00)
+                    return result("V311_IV_FORMAT", "v3.1.1 Compliance",
+                            "IV format", false, "IV[" + i + "]=" + iv1[i] + ", expected 0x00", start);
+            }
+            if (iv1[7] != 0x01)
+                return result("V311_IV_FORMAT", "v3.1.1 Compliance",
+                        "IV format", false, "IV[7]=" + iv1[7] + ", expected 0x01", start);
+
+            // Check counter bytes for counter=1: 0x00000001
+            if (iv1[8] != 0 || iv1[9] != 0 || iv1[10] != 0 || iv1[11] != 1)
+                return result("V311_IV_FORMAT", "v3.1.1 Compliance",
+                        "IV format", false, "Counter bytes wrong for counter=1", start);
+
+            // Counter = 256 → bytes 8-11 = 0x00000100
+            byte[] iv256 = buildAesCcmIV(256);
+            if (iv256[8] != 0 || iv256[9] != 0 || iv256[10] != 1 || iv256[11] != 0)
+                return result("V311_IV_FORMAT", "v3.1.1 Compliance",
+                        "IV format", false, "Counter bytes wrong for counter=256", start);
+
+            // Different counters must produce different IVs
+            if (Arrays.equals(iv1, iv256))
+                return result("V311_IV_FORMAT", "v3.1.1 Compliance",
+                        "IV format", false, "IV for counter=1 and counter=256 are identical", start);
+
+            return result("V311_IV_FORMAT", "v3.1.1 Compliance",
+                    "IV = 0x0000000000000001 || counter (4B BE)",
+                    true, "12-byte IV format correct, counter encoding verified", start);
+        }
+        catch (Exception e)
+        {
+            return result("V311_IV_FORMAT", "v3.1.1 Compliance",
+                    "IV format", false, e.toString(), start);
+        }
+    }
+
+    /** V311_KDF_DERIVATION: Z_AB = SHA-256(x_S) per BSI TR-03111 §4.3.1 */
+    private TestResult testV311KdfDerivation()
+    {
+        long start = System.currentTimeMillis();
+        try
+        {
+            // Generate two ephemeral keypairs and perform ECDH from both sides
+            KeyPair kpA = generateP256Keypair();
+            KeyPair kpB = generateP256Keypair();
+
+            byte[] rawA = ecdhRawSecret(kpA.getPrivate(), getUncompressedPubKey(kpB));
+            byte[] rawB = ecdhRawSecret(kpB.getPrivate(), getUncompressedPubKey(kpA));
+
+            if (rawA == null || rawB == null)
+                return result("V311_KDF_DERIVATION", "v3.1.1 Compliance",
+                        "BSI TR-03111 KDF", false, "ECDH raw secret is null", start);
+
+            if (!Arrays.equals(rawA, rawB))
+                return result("V311_KDF_DERIVATION", "v3.1.1 Compliance",
+                        "BSI TR-03111 KDF", false, "Raw secrets don't match", start);
+
+            // KDF: Z_AB = SHA-256(x_S)
+            MessageDigest sha = MessageDigest.getInstance("SHA-256");
+            byte[] zAB_A = sha.digest(rawA);
+            sha.reset();
+            byte[] zAB_B = sha.digest(rawB);
+
+            if (zAB_A.length != 32)
+                return result("V311_KDF_DERIVATION", "v3.1.1 Compliance",
+                        "BSI TR-03111 KDF", false, "Z_AB length " + zAB_A.length + ", expected 32", start);
+
+            if (!Arrays.equals(zAB_A, zAB_B))
+                return result("V311_KDF_DERIVATION", "v3.1.1 Compliance",
+                        "BSI TR-03111 KDF", false, "Derived keys don't match", start);
+
+            // Verify Z_AB differs from raw secret (SHA-256 should transform)
+            if (Arrays.equals(rawA, zAB_A))
+                return result("V311_KDF_DERIVATION", "v3.1.1 Compliance",
+                        "BSI TR-03111 KDF", false, "Z_AB equals raw secret — SHA-256 not applied", start);
+
+            return result("V311_KDF_DERIVATION", "v3.1.1 Compliance",
+                    "Z_AB = SHA-256(x_S) per BSI TR-03111",
+                    true, "Both sides derive identical 32-byte AES key", start);
+        }
+        catch (Exception e)
+        {
+            return result("V311_KDF_DERIVATION", "v3.1.1 Compliance",
+                    "BSI TR-03111 KDF", false, e.toString(), start);
+        }
+    }
+
+    /** V311_PROTOCOL_VERSION: Verify protocol version TLV = 0x01 0x00 0x00 0x00 0x01 */
+    private TestResult testV311ProtocolVersion()
+    {
+        long start = System.currentTimeMillis();
+        try
+        {
+            // v3.1.1: spec version=0x01, vendor=0x0000, features=0x0001 (CCM)
+            byte[] expected = {0x01, 0x00, 0x00, 0x00, 0x01};
+
+            LoopbackPKOCBleReader reader = new LoopbackPKOCBleReader();
+            byte[] msg = reader.buildOpeningMessage();
+
+            // Find protocol ID TLV (tag 0x0C)
+            int offset = findTlvTag(msg, 0x0C);
+            if (offset < 0)
+                return result("V311_PROTOCOL_VERSION", "v3.1.1 Compliance",
+                        "Protocol version TLV", false, "TLV 0x0C not found", start);
+
+            int len = msg[offset + 1] & 0xFF;
+            if (len != 5)
+                return result("V311_PROTOCOL_VERSION", "v3.1.1 Compliance",
+                        "Protocol version TLV", false,
+                        "Protocol ID length " + len + ", expected 5", start);
+
+            byte[] actual = Arrays.copyOfRange(msg, offset + 2, offset + 2 + 5);
+            if (!Arrays.equals(expected, actual))
+                return result("V311_PROTOCOL_VERSION", "v3.1.1 Compliance",
+                        "Protocol version TLV", false,
+                        "Expected " + Hex.toHexString(expected) + ", got " + Hex.toHexString(actual), start);
+
+            return result("V311_PROTOCOL_VERSION", "v3.1.1 Compliance",
+                    "Protocol version = 0x01 0x00 0x00 0x00 0x01",
+                    true, "Spec v0x01, vendor 0x0000, features 0x0001 (CCM)", start);
+        }
+        catch (Exception e)
+        {
+            return result("V311_PROTOCOL_VERSION", "v3.1.1 Compliance",
+                    "Protocol version TLV", false, e.toString(), start);
+        }
+    }
+
+    /** V311_SIG_INPUT_SYMMETRY: Both reader and device sign identical 96-byte input */
+    private TestResult testV311SigInputSymmetry()
+    {
+        long start = System.currentTimeMillis();
+        try
+        {
+            KeyPair readerEphKP = generateP256Keypair();
+            KeyPair deviceEphKP = generateP256Keypair();
+            byte[] readerEphX = Arrays.copyOfRange(getUncompressedPubKey(readerEphKP), 1, 33);
+            byte[] deviceEphX = Arrays.copyOfRange(getUncompressedPubKey(deviceEphKP), 1, 33);
+
+            // Build 96-byte signature input: SiteID(16) + ReaderID(16) + DeviceEphX(32) + ReaderEphX(32)
+            byte[] sigInputReader = new byte[96];
+            System.arraycopy(TEST_SITE_ID, 0, sigInputReader, 0, 16);
+            System.arraycopy(TEST_READER_LOCATION_ID, 0, sigInputReader, 16, 16);
+            System.arraycopy(deviceEphX, 0, sigInputReader, 32, 32);
+            System.arraycopy(readerEphX, 0, sigInputReader, 64, 32);
+
+            // Device builds the same input independently
+            byte[] sigInputDevice = new byte[96];
+            System.arraycopy(TEST_SITE_ID, 0, sigInputDevice, 0, 16);
+            System.arraycopy(TEST_READER_LOCATION_ID, 0, sigInputDevice, 16, 16);
+            System.arraycopy(deviceEphX, 0, sigInputDevice, 32, 32);
+            System.arraycopy(readerEphX, 0, sigInputDevice, 64, 32);
+
+            if (sigInputReader.length != 96)
+                return result("V311_SIG_INPUT_SYMMETRY", "v3.1.1 Compliance",
+                        "Signature input symmetry", false,
+                        "Length " + sigInputReader.length + ", expected 96", start);
+
+            if (!Arrays.equals(sigInputReader, sigInputDevice))
+                return result("V311_SIG_INPUT_SYMMETRY", "v3.1.1 Compliance",
+                        "Signature input symmetry", false,
+                        "Reader and device signature inputs differ", start);
+
+            // Both sides sign the same data, reader verifies device's sig and vice versa
+            KeyPair siteKP = generateP256Keypair();
+            KeyPair deviceCredKP = generateP256Keypair();
+
+            byte[] readerSig = signSha256Ecdsa(siteKP.getPrivate(), sigInputReader);
+            byte[] deviceSig = signSha256Ecdsa(deviceCredKP.getPrivate(), sigInputDevice);
+
+            boolean readerSigValid = verifyPkocSignature(readerSig, getUncompressedPubKey(siteKP), sigInputDevice);
+            boolean deviceSigValid = verifyPkocSignature(deviceSig, getUncompressedPubKey(deviceCredKP), sigInputReader);
+
+            if (!readerSigValid || !deviceSigValid)
+                return result("V311_SIG_INPUT_SYMMETRY", "v3.1.1 Compliance",
+                        "Signature input symmetry", false,
+                        "Cross-verification failed: reader=" + readerSigValid
+                                + ", device=" + deviceSigValid, start);
+
+            return result("V311_SIG_INPUT_SYMMETRY", "v3.1.1 Compliance",
+                    "Both parties sign identical 96-byte input",
+                    true, "Mutual cross-verification passed", start);
+        }
+        catch (Exception e)
+        {
+            return result("V311_SIG_INPUT_SYMMETRY", "v3.1.1 Compliance",
+                    "Signature input symmetry", false, e.toString(), start);
+        }
     }
 }

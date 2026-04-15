@@ -512,28 +512,29 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
     {
         SharedPreferences prefs = requireActivity().getPreferences(Context.MODE_PRIVATE);
 
+        // Use built-in defaults from PKOC_Preferences if nothing has been configured.
+        // Users can override these in Settings → ECDHE Perfect Secrecy.
         String existingReader = prefs.getString(PKOC_Preferences.ReaderUUID, null);
         String existingSite = prefs.getString(PKOC_Preferences.SiteUUID, null);
 
+        boolean needsSave = false;
         SharedPreferences.Editor editor = prefs.edit();
 
         if (existingReader == null || existingReader.isEmpty())
         {
-            editor = prefs.edit();
-            UUID newUuid = UUID.randomUUID();
-            existingReader = newUuid.toString();
+            existingReader = PKOC_Preferences.DEFAULT_READER_UUID;
             editor.putString(PKOC_Preferences.ReaderUUID, existingReader);
+            needsSave = true;
         }
 
         if (existingSite == null || existingSite.isEmpty())
         {
-            editor = (editor == null) ? prefs.edit() : editor;
-            UUID newUuid = UUID.randomUUID();
-            existingSite = newUuid.toString();
+            existingSite = PKOC_Preferences.DEFAULT_SITE_UUID;
             editor.putString(PKOC_Preferences.SiteUUID, existingSite);
+            needsSave = true;
         }
 
-        if (editor != null)
+        if (needsSave)
         {
             editor.apply();
         }
@@ -549,7 +550,7 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
         Log.d("onCreate", "Initializing Bluetooth");
         mBluetoothManager = (BluetoothManager) requireContext().getSystemService(Context.BLUETOOTH_SERVICE);
         BluetoothAdapter mBluetoothAdapter = mBluetoothManager.getAdapter();
-        mBluetoothAdapter.setName("PSIA PKOC Reader Simulator");
+        mBluetoothAdapter.setName("ELATEC PKOC");
 
         if (!checkBluetoothSupport(mBluetoothAdapter))
         {
@@ -1122,7 +1123,7 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
             deviceModel.signature = null;
             deviceModel.publicKey = null;
             deviceModel.sharedSecret = null;
-            deviceModel.counter = 0;
+            deviceModel.counter = 1; // Per PKOC v3.1.1 spec §7.2.4: counter starts at 1
             deviceModel.connectionType = null;
 
             {
@@ -1142,10 +1143,10 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                 byte[] compressedTransientPublicKey = CryptoProvider.getCompressedPublicKeyBytes(encodedPublicKey);
 
 //                byte[] version = new byte[]{(byte) 0x0C, (byte) 0x03, (short) 0x0000, (short) 0x0001};
-                // Dhruv: This is hard set to AES CCM and has 5 bytes of length
+                // PKOC v3.1.1 Protocol Identifiers: spec version 0x01, vendor 0x0000, features 0x0001 (CCM)
                 byte[] version = new byte[]
                         {
-                                (byte) 0x03, (short) 0x00, (short) 0x00, (short) 0x00, (short) 0x01
+                                (byte) 0x01, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x01
                         };
                 Log.i(TAG, "Version: " + Arrays.toString(version));
                 byte[] readerId = UuidConverters.fromUuid(readerUUID);
@@ -1340,10 +1341,10 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                                 Log.d(TAG, "Creation time: " + deviceModel.creationTime);
                                 break;
                             case ProtocolVersion:
-                                // Dhruv changed this to support 5 byte protocol version
+                                // PKOC v3.1.1: spec version 0x01, vendor 0x0000, features 0x0001 (CCM)
                                 deviceModel.protocolVersion = new byte[]
                                         {
-                                                (byte) 0x03, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x01
+                                                (byte) 0x01, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x01
                                         };
                                 Log.d(TAG, "Protocol Version is:" + Arrays.toString(deviceModel.protocolVersion));
                             default:
@@ -1527,6 +1528,14 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
 
                     Log.d(TAG, "Message sent to connected device: " + Hex.toHexString(responseTLV));
                     writeToReadCharacteristic(device, responseTLV, true);
+
+                    // PKOC v3.1.1 §7.2.5 Step 9: Discard ephemeral keys and Z_AB
+                    // after transaction to ensure Perfect Forward Secrecy.
+                    deviceModel.transientKeyPair = null;
+                    deviceModel.sharedSecret = null;
+                    deviceModel.receivedTransientPublicKey = null;
+                    Log.d(TAG, "Ephemeral keys and shared secret discarded (PFS)");
+
                     boolean finalSigValid = sigValid;
                     new Handler(Looper.getMainLooper()).post(() ->
                     {

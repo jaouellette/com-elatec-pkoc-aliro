@@ -173,9 +173,10 @@ public class LeafSelfTestActivity extends AppCompatActivity
                     getPackageName() + ".fileprovider", reportFile);
 
             Intent shareIntent = new Intent(Intent.ACTION_SEND);
-            shareIntent.setType("text/html");
+            shareIntent.setType("application/octet-stream");
             shareIntent.putExtra(Intent.EXTRA_STREAM, uri);
             shareIntent.putExtra(Intent.EXTRA_SUBJECT, "LEAF Verified Compliance Report — " + date);
+            shareIntent.putExtra(Intent.EXTRA_TEXT, "LEAF Verified self-test compliance report attached.");
             shareIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
             startActivity(Intent.createChooser(shareIntent, "Share LEAF Compliance Report"));
         }
