@@ -3,8 +3,8 @@
     xmlns:app="http://schemas.android.com/apk/res-auto">
 
     <item
-        android:id="@+id/action_display_public_key"
-        android:title="@string/display_reader_details"
+        android:id="@+id/displayPublicKeyFragment"
+        android:title="Display Public Key"
         app:showAsAction="never" />
 
     <item
@@ -13,15 +13,27 @@
         app:showAsAction="never" />
 
     <item
+        android:id="@+id/action_leaf_config"
+        android:title="LEAF Verified Config"
+        android:orderInCategory="200"
+        app:showAsAction="never" />
+
+    <item
         android:id="@+id/action_self_test"
         android:title="Aliro Self-Test"
-        android:orderInCategory="200"
+        android:orderInCategory="300"
         app:showAsAction="never" />
 
     <item
         android:id="@+id/action_pkoc_self_test"
         android:title="PKOC Self-Test"
-        android:orderInCategory="201"
+        android:orderInCategory="301"
+        app:showAsAction="never" />
+
+    <item
+        android:id="@+id/action_leaf_self_test"
+        android:title="LEAF Self-Test"
+        android:orderInCategory="350"
         app:showAsAction="never" />
 
 </menu>

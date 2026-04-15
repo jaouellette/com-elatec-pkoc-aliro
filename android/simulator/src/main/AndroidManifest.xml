@@ -60,6 +60,10 @@
             android:name=".PKOCSelfTestActivity"
             android:label="PKOC Self-Test" />
 
+        <activity
+            android:name=".LeafSelfTestActivity"
+            android:label="LEAF Self-Test" />
+
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.fileprovider"

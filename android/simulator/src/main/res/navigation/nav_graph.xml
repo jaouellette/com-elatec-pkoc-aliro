@@ -8,7 +8,7 @@
     <fragment
         android:id="@+id/homeFragment"
         android:name="com.pkoc.readersimulator.HomeFragment"
-        android:label="ELATEC PKOC/Aliro Simulator"
+        android:label="Home"
         tools:layout="@layout/fragment_home" >
         <action
             android:id="@+id/action_homeFragment_to_displayPublicKeyFragment"
@@ -33,5 +33,11 @@
         android:name="com.pkoc.readersimulator.AliroConfigFragment"
         android:label="Aliro Config"
         tools:layout="@layout/fragment_aliro_config" />
+
+    <fragment
+        android:id="@+id/leafConfigFragment"
+        android:name="com.pkoc.readersimulator.LeafConfigFragment"
+        android:label="LEAF Verified Config"
+        tools:layout="@layout/fragment_leaf_config" />
 
 </navigation>

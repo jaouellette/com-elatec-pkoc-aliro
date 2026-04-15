@@ -77,6 +77,7 @@ import com.psia.pkoc.core.UuidConverters;
 import com.psia.pkoc.core.transactions.NfcNormalFlowTransaction;
 import com.psia.pkoc.core.AliroCryptoProvider;
 import com.psia.pkoc.core.AliroMailbox;
+import com.psia.pkoc.core.LeafVerifiedManager;
 import java.security.KeyPair;
 import java.security.interfaces.ECPublicKey;
 
@@ -114,6 +115,7 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
     public static final int    MODE_PKOC = 0;
     public static final int    MODE_ALIRO = 1;
     public static final int    MODE_AUTO  = 2; // tries Aliro SELECT first, falls back to PKOC
+    public static final int    MODE_LEAF  = 3; // LEAF Verified Open ID only
 
     private int readerMode = MODE_AUTO; // default: auto-detect
     private Button rdrButton;
@@ -286,6 +288,7 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
         {
             case MODE_PKOC:  modeGroup.check(R.id.modePkoc);  break;
             case MODE_ALIRO: modeGroup.check(R.id.modeAliro); break;
+            case MODE_LEAF:  modeGroup.check(R.id.modeLeaf);  break;
             default:         modeGroup.check(R.id.modeAuto);  break;
         }
         updateModeLabel();
@@ -294,6 +297,7 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
         {
             if      (checkedId == R.id.modePkoc)  readerMode = MODE_PKOC;
             else if (checkedId == R.id.modeAliro) readerMode = MODE_ALIRO;
+            else if (checkedId == R.id.modeLeaf)  readerMode = MODE_LEAF;
             else                                  readerMode = MODE_AUTO;
             requireActivity().getPreferences(Context.MODE_PRIVATE)
                     .edit().putInt(PREF_READER_MODE, readerMode).apply();
@@ -400,6 +404,9 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
         super.onResume();
         // Clear any stale keypad input when returning from another fragment
         if (pinDisplay != null) pinDisplay.setText("");
+
+        // Refresh mode label in case LEAF mode was toggled in LEAF Config
+        updateModeLabel();
 
         // Re-position keypad if it hasn't been positioned yet (can happen
         // when returning from another fragment and the OnGlobalLayoutListener
@@ -652,11 +659,22 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                     showAliroError("This credential does not support Aliro.");
                 }
             }
+            else if (readerMode == MODE_LEAF)
+            {
+                // ---------------------------------------------------------------
+                // LEAF-only mode — try LEAF SELECT, fail if not supported
+                // ---------------------------------------------------------------
+                Log.d("NFC", "LEAF mode — running LEAF Open ID flow");
+                performLeafNfcTransaction(isoDep);
+            }
             else
             {
                 // ---------------------------------------------------------------
-                // Auto mode — try Aliro SELECT first, fall back to PKOC
+                // Auto mode — try Aliro first, then LEAF (if Root CA configured),
+                // then fall back to PKOC
                 // ---------------------------------------------------------------
+
+                // 1. Try Aliro
                 byte[] aliroSelect = buildAliroSelectCommand();
                 Log.d("NFC", "Auto mode — trying Aliro SELECT: " + Hex.toHexString(aliroSelect));
                 byte[] selectResponse = isoDep.transceive(aliroSelect);
@@ -669,8 +687,26 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                 }
                 else
                 {
-                    Log.d("NFC", "Not Aliro (SW=" + swHex(selectResponse) + ") — falling back to PKOC");
-                    runPkocNfcFlow(isoDep);
+                    // 2. Try LEAF if a Root CA has been imported
+                    boolean leafEnabled = requireActivity().getPreferences(Context.MODE_PRIVATE)
+                            .getBoolean(LeafVerifiedManager.READER_PREF_LEAF_MODE, false);
+                    byte[] rootCAPub = LeafVerifiedManager.getReaderRootCAPubKey(requireContext());
+
+                    if (leafEnabled && rootCAPub != null)
+                    {
+                        Log.d("NFC", "Not Aliro — trying LEAF flow");
+                        boolean leafHandled = performLeafNfcTransaction(isoDep);
+                        if (!leafHandled)
+                        {
+                            Log.d("NFC", "LEAF failed — falling back to PKOC");
+                            runPkocNfcFlow(isoDep);
+                        }
+                    }
+                    else
+                    {
+                        Log.d("NFC", "Not Aliro (SW=" + swHex(selectResponse) + ") — falling back to PKOC");
+                        runPkocNfcFlow(isoDep);
+                    }
                 }
             }
 
@@ -686,23 +722,36 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
     private void updateRdrButtonVisibility()
     {
         if (rdrButton == null) return;
-        rdrButton.setVisibility(readerMode == MODE_ALIRO ? View.GONE : View.VISIBLE);
+        rdrButton.setVisibility((readerMode == MODE_ALIRO || readerMode == MODE_LEAF) ? View.GONE : View.VISIBLE);
     }
 
     /** Update the main title text to reflect the current reader mode. */
+    private boolean isLeafModeEnabled()
+    {
+        return requireActivity().getPreferences(Context.MODE_PRIVATE)
+                .getBoolean(LeafVerifiedManager.READER_PREF_LEAF_MODE, false);
+    }
+
     private void updateModeLabel()
     {
         if (textView == null) return;
+        boolean leafOn = isLeafModeEnabled();
+
         switch (readerMode)
         {
             case MODE_PKOC:
                 textView.setText("Scan a PKOC NFC or BLE Credential");
                 break;
             case MODE_ALIRO:
-                textView.setText("Scan an Aliro NFC Credential");
+                textView.setText("Scan a Aliro NFC Credential");
                 break;
-            default:
-                textView.setText("Scan a PKOC or Aliro Credential");
+            case MODE_LEAF:
+                textView.setText("Scan a LEAF Verified NFC Credential");
+                break;
+            default: // Auto
+                textView.setText(leafOn
+                        ? "Scan an Aliro, LEAF Verified, or PKOC Credential"
+                        : "Scan a PKOC or Aliro Credential");
                 break;
         }
     }
@@ -1659,8 +1708,13 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
             // - For all other cases (PKOC), render as a single bold block (legacy behaviour).
             boolean hasAliroSections = connectionTypeText.contains("\nACCESS DOCUMENT")
                     || connectionTypeText.contains("\nMAILBOX");
+            boolean isLeafResult = connectionTypeText.contains("\nOPEN ID");
+            boolean hasSections = hasAliroSections || isLeafResult;
 
-            if (hasAliroSections)
+            // -----------------------------------------------------------------
+            // Smart formatting for Aliro / LEAF section-based results
+            // -----------------------------------------------------------------
+            if (hasSections)
             {
                 String[] ctLines = connectionTypeText.split("\n", -1);
                 SpannableStringBuilder ctSb = new SpannableStringBuilder();
@@ -1670,17 +1724,13 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                     String line = ctLines[li];
                     String lineWithNl = (li < ctLines.length - 1) ? line + "\n" : line;
 
-                    // Determine style for this line.
-                    // A section header is a non-indented line whose first word is
-                    // all uppercase letters (e.g. "ACCESS DOCUMENT", "MAILBOX (256 bytes)").
                     boolean isFirstLine  = (li == 0);
                     String trimmed = line.trim();
                     boolean isSectionHdr = !trimmed.isEmpty()
-                            && !line.startsWith(" ")  // not indented
+                            && !line.startsWith(" ")
                             && Character.isUpperCase(trimmed.charAt(0))
                             && trimmed.length() > 1
                             && !isFirstLine
-                            // first word must be all-uppercase
                             && trimmed.split("[^A-Za-z]")[0].equals(
                                     trimmed.split("[^A-Za-z]")[0].toUpperCase());
 
@@ -1718,10 +1768,17 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                 }
                 ctSb.append("\n\n");
                 formattedText.append(ctSb);
+
+                // Both LEAF and Aliro: formatted section headers are appended above.
+                // Fall through to the full public key + bit-length breakdown below.
+                // The credential public key is the same ECC P-256 format (04||X||Y)
+                // across all three protocols and can be used by any reader/panel.
             }
             else
             {
-                // Legacy path: render entire connectionTypeText as one bold block
+                // -----------------------------------------------------------------
+                // Plain PKOC: bold connection type as one block
+                // -----------------------------------------------------------------
                 SpannableString connectionTypeSpannable = new SpannableString(connectionTypeText + "\n\n");
                 connectionTypeSpannable.setSpan(new StyleSpan(Typeface.BOLD), 0, connectionTypeText.length(), Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
                 connectionTypeSpannable.setSpan(new ForegroundColorSpan(Color.BLACK), 0, connectionTypeText.length(), Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
@@ -2005,6 +2062,273 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
         {
             Log.e(TAG, "PKOC NFC IO error", e);
         }
+    }
+
+    // =========================================================================
+    // LEAF Verified NFC Reader Flow (Open ID — Path 1)
+    // =========================================================================
+
+    /**
+     * Perform the LEAF Verified Open ID (Path 1) NFC transaction.
+     *
+     * Protocol:
+     *   1. SELECT LEAF Open App AID
+     *   2. SELECT certificate EF (file 0x0001)
+     *   3. READ BINARY in 224-byte chunks — collect full X.509 DER certificate
+     *   4. Verify certificate against stored Root CA public key
+     *   5. Generate 32-byte random challenge
+     *   6. INTERNAL AUTHENTICATE with challenge
+     *   7. Verify ECDSA signature (DER) from response against credential public key from cert
+     *   8. Extract 12-digit Open ID from cert subject CN
+     *   9. Display result on UI
+     *
+     * @param isoDep  Connected IsoDep tag
+     * @return true if LEAF credential was detected and authenticated (even if cert/sig fails),
+     *         false if the tag did not respond to LEAF SELECT (not a LEAF credential)
+     */
+    private boolean performLeafNfcTransaction(android.nfc.tech.IsoDep isoDep)
+    {
+        try
+        {
+            // ------------------------------------------------------------------
+            // Step 1: SELECT LEAF Open App AID
+            // ------------------------------------------------------------------
+            byte[] leafAid  = LeafVerifiedManager.LEAF_OPEN_APP_AID;
+            byte[] selectCmd = new byte[5 + leafAid.length + 1];
+            selectCmd[0] = 0x00;  // CLA
+            selectCmd[1] = (byte)0xA4; // INS = SELECT
+            selectCmd[2] = 0x04;  // P1 = select by AID
+            selectCmd[3] = 0x00;  // P2
+            selectCmd[4] = (byte)leafAid.length; // Lc
+            System.arraycopy(leafAid, 0, selectCmd, 5, leafAid.length);
+            selectCmd[5 + leafAid.length] = 0x00; // Le
+
+            Log.d(TAG, "LEAF SELECT AID: " + Hex.toHexString(selectCmd));
+            byte[] selectResp = isoDep.transceive(selectCmd);
+            Log.d(TAG, "LEAF SELECT response: " + Hex.toHexString(selectResp));
+
+            if (!isSW9000(selectResp))
+            {
+                Log.d(TAG, "LEAF: AID not supported, SW=" + swHex(selectResp));
+                return false;  // not a LEAF credential
+            }
+
+            // ------------------------------------------------------------------
+            // Step 2: SELECT certificate EF (file ID 0x0001)
+            // ------------------------------------------------------------------
+            byte[] fileId   = LeafVerifiedManager.LEAF_CERT_FILE_ID;
+            byte[] selectEF = { 0x00, (byte)0xA4, 0x02, 0x00, 0x02, fileId[0], fileId[1] };
+            Log.d(TAG, "LEAF SELECT EF: " + Hex.toHexString(selectEF));
+            byte[] selectEFResp = isoDep.transceive(selectEF);
+            Log.d(TAG, "LEAF SELECT EF response: " + Hex.toHexString(selectEFResp));
+
+            if (!isSW9000(selectEFResp))
+            {
+                Log.e(TAG, "LEAF: SELECT EF failed, SW=" + swHex(selectEFResp));
+                showLeafError("LEAF SELECT EF failed: " + swHex(selectEFResp));
+                return true;
+            }
+
+            // ------------------------------------------------------------------
+            // Step 3: READ BINARY in 224-byte chunks
+            // ------------------------------------------------------------------
+            final int CHUNK = 224;
+            java.io.ByteArrayOutputStream certAcc = new java.io.ByteArrayOutputStream();
+            int offset = 0;
+            boolean done = false;
+
+            while (!done)
+            {
+                int p1 = (offset >> 8) & 0x7F;
+                int p2 = offset & 0xFF;
+                byte[] readCmd = { 0x00, (byte)0xB0, (byte)p1, (byte)p2, (byte)CHUNK };
+                Log.d(TAG, "LEAF READ BINARY offset=" + offset + " len=" + CHUNK);
+                byte[] readResp = isoDep.transceive(readCmd);
+
+                if (readResp == null || readResp.length < 2)
+                {
+                    Log.e(TAG, "LEAF READ BINARY: empty response at offset=" + offset);
+                    break;
+                }
+
+                byte sw1 = readResp[readResp.length - 2];
+                byte sw2 = readResp[readResp.length - 1];
+                int dataLen = readResp.length - 2;
+
+                if (dataLen > 0)
+                    certAcc.write(readResp, 0, dataLen);
+
+                if (sw1 == (byte)0x90 && sw2 == 0x00)
+                {
+                    // More data may follow — continue reading
+                    offset += dataLen;
+                    if (dataLen < CHUNK)
+                        done = true; // received less than requested = end of file
+                }
+                else if (sw1 == (byte)0x62 && sw2 == (byte)0x82)
+                {
+                    // End of file
+                    Log.d(TAG, "LEAF READ BINARY: end of file at offset=" + offset);
+                    done = true;
+                }
+                else
+                {
+                    Log.e(TAG, "LEAF READ BINARY: unexpected SW " + String.format("%02X%02X", sw1, sw2));
+                    showLeafError("LEAF READ BINARY failed: " + String.format("%02X%02X", sw1, sw2));
+                    return true;
+                }
+            }
+
+            byte[] certDER = certAcc.toByteArray();
+            Log.d(TAG, "LEAF: certificate read complete, " + certDER.length + " bytes");
+
+            if (certDER.length == 0)
+            {
+                showLeafError("LEAF: empty certificate received.");
+                return true;
+            }
+
+            // ------------------------------------------------------------------
+            // Step 4: Verify certificate against Root CA public key
+            // ------------------------------------------------------------------
+            byte[] rootCAPub = LeafVerifiedManager.getReaderRootCAPubKey(requireContext());
+            if (rootCAPub == null)
+            {
+                Log.e(TAG, "LEAF: no Root CA public key configured — aborting");
+                showLeafError("LEAF: Root CA not configured. Import via LEAF Config.");
+                return true;
+            }
+
+            boolean certVerified = LeafVerifiedManager.verifyCertificate(certDER, rootCAPub);
+            String certVerifyMsg = certVerified ? "Verified \u2713" : "FAILED \u2717";
+            Log.d(TAG, "LEAF: cert verify=" + certVerified);
+
+            if (!certVerified)
+            {
+                Log.e(TAG, "LEAF: certificate failed Root CA verification — aborting");
+                showLeafError("LEAF: certificate verification failed.");
+                return true;
+            }
+
+            // Spec Step 4: Only upon successful validation, extract Open ID
+            byte[] credPubKey = LeafVerifiedManager.extractPublicKeyFromCert(certDER);
+            String openId     = LeafVerifiedManager.extractOpenIDFromCert(certDER);
+
+            if (credPubKey == null)
+            {
+                showLeafError("LEAF: failed to extract credential public key from cert.");
+                return true;
+            }
+
+            // Validate Open ID is exactly 12-digit numeric per spec
+            if (openId == null || !openId.matches("\\d{12}"))
+            {
+                showLeafError("LEAF: Open ID is not a valid 12-digit numeric value.");
+                return true;
+            }
+
+            // ------------------------------------------------------------------
+            // Step 5: Generate 32-byte random challenge
+            // ------------------------------------------------------------------
+            byte[] challenge = new byte[32];
+            new java.security.SecureRandom().nextBytes(challenge);
+            Log.d(TAG, "LEAF challenge: " + Hex.toHexString(challenge));
+
+            // ------------------------------------------------------------------
+            // Step 6: INTERNAL AUTHENTICATE (INS=0x88)
+            // ------------------------------------------------------------------
+            byte[] authCmd = new byte[5 + challenge.length];
+            authCmd[0] = 0x00;            // CLA
+            authCmd[1] = (byte)0x88;      // INS = INTERNAL AUTHENTICATE
+            authCmd[2] = 0x00;            // P1
+            authCmd[3] = 0x00;            // P2
+            authCmd[4] = (byte)challenge.length; // Lc
+            System.arraycopy(challenge, 0, authCmd, 5, challenge.length);
+
+            Log.d(TAG, "LEAF INTERNAL AUTHENTICATE: " + Hex.toHexString(authCmd));
+            byte[] authResp = isoDep.transceive(authCmd);
+            Log.d(TAG, "LEAF INTERNAL AUTHENTICATE response: " + Hex.toHexString(authResp));
+
+            if (!isSW9000(authResp) || authResp.length < 4)
+            {
+                showLeafError("LEAF INTERNAL AUTHENTICATE failed: " + swHex(authResp));
+                return true;
+            }
+
+            // DER signature is everything before the trailing 9000
+            byte[] sigDER = java.util.Arrays.copyOfRange(authResp, 0, authResp.length - 2);
+
+            // ------------------------------------------------------------------
+            // Step 7: Verify ECDSA signature against credential's public key
+            // ------------------------------------------------------------------
+            boolean sigVerified = LeafVerifiedManager.verifyChallenge(challenge, sigDER, credPubKey);
+            Log.d(TAG, "LEAF: sig verify=" + sigVerified);
+
+            // ------------------------------------------------------------------
+            // Step 8: Extract Open ID and build display string
+            // ------------------------------------------------------------------
+            final String finalOpenId      = openId;
+            final boolean finalCertVerified = certVerified;
+            final boolean finalSigVerified  = sigVerified;
+            final String finalCertMsg      = certVerifyMsg;
+            final String finalPubKeyHex    = Hex.toHexString(credPubKey).toUpperCase();
+
+            // ------------------------------------------------------------------
+            // Step 9: Display result on UI thread
+            // ------------------------------------------------------------------
+            requireActivity().runOnUiThread(() ->
+            {
+                if (!isAdded()) return;
+                readerImageView.setVisibility(View.GONE);
+                keypadLayout.setVisibility(View.GONE);
+
+                // Build the connectionType string in the same style as Aliro results.
+                // The first line becomes the bold title; section headers are ALL-CAPS.
+                StringBuilder sb = new StringBuilder();
+                // Compute 40-bit Wiegand output per LEAF spec
+                String wiegandDisplay = LeafVerifiedManager.formatWiegand40Display(finalOpenId);
+
+                sb.append("LEAF NFC \u2014 Open ID ").append(finalSigVerified ? "Verified" : "FAILED");
+                sb.append("\n\nOPEN ID APPLICATION\n");
+                sb.append("  ID:             ").append(finalOpenId).append("\n");
+                sb.append("  Format:         12-digit unique ID\n");
+                sb.append("  Certificate:    X.509 PKI (ECC P-256)\n");
+                sb.append("  Auth:           Unilateral (reader verifies credential)\n");
+                sb.append("\nVERIFICATION\n");
+                sb.append("  Subject:        CN=LEAF-").append(finalOpenId).append("\n");
+                sb.append("  Issuer:         LEAF Root CA\n");
+                sb.append("  Cert Verify:    ").append(finalCertMsg).append("\n");
+                sb.append("  Challenge:      ").append(finalSigVerified ? "Verified \u2713" : "FAILED \u2717");
+                sb.append("\n\nREADER OUTPUT\n");
+                sb.append("  Format:         40-bit (38 data + 2 parity)\n");
+                sb.append("  Wiegand:        ").append(wiegandDisplay != null ? wiegandDisplay : "error");
+
+                String connectionTypeStr = sb.toString();
+                displayPublicKeyInfo(finalPubKeyHex, connectionTypeStr);
+
+                // Audible feedback
+                android.media.ToneGenerator toneGen =
+                        new android.media.ToneGenerator(android.media.AudioManager.STREAM_RING, 100);
+                toneGen.startTone(finalSigVerified
+                        ? android.media.ToneGenerator.TONE_SUP_DIAL
+                        : android.media.ToneGenerator.TONE_CDMA_ABBR_ALERT, 150);
+            });
+
+            return true;
+        }
+        catch (java.io.IOException e)
+        {
+            Log.e(TAG, "LEAF NFC IO error", e);
+            return false;
+        }
+    }
+
+    /** Show a toast error for LEAF failures */
+    private void showLeafError(String message)
+    {
+        Log.e(TAG, "LEAF error: " + message);
+        requireActivity().runOnUiThread(() ->
+                Toast.makeText(requireContext(), message, Toast.LENGTH_LONG).show());
     }
 
     /** Build the Aliro expedited-phase SELECT APDU (Table 10-1, AID from Table 10-3). */

@@ -62,7 +62,7 @@ public class MainActivity extends AppCompatActivity
         NavHostFragment navHostFragment = (NavHostFragment) getSupportFragmentManager().findFragmentById(R.id.nav_host_fragment);
         NavController navController = navHostFragment.getNavController();
 
-        if (item.getItemId() == R.id.action_display_public_key)
+        if (item.getItemId() == R.id.displayPublicKeyFragment)
         {
             navController.navigate(R.id.action_homeFragment_to_displayPublicKeyFragment);
             return true;
@@ -71,6 +71,12 @@ public class MainActivity extends AppCompatActivity
         if (item.getItemId() == R.id.action_aliro_config)
         {
             navigateToAliroConfig();
+            return true;
+        }
+
+        if (item.getItemId() == R.id.action_leaf_config)
+        {
+            navController.navigate(R.id.leafConfigFragment);
             return true;
         }
 
@@ -83,6 +89,12 @@ public class MainActivity extends AppCompatActivity
         if (item.getItemId() == R.id.action_pkoc_self_test)
         {
             startActivity(new Intent(this, PKOCSelfTestActivity.class));
+            return true;
+        }
+
+        if (item.getItemId() == R.id.action_leaf_self_test)
+        {
+            startActivity(new Intent(this, LeafSelfTestActivity.class));
             return true;
         }
 

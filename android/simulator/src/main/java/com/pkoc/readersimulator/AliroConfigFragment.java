@@ -1,8 +1,6 @@
 package com.pkoc.readersimulator;
 
-import android.app.Activity;
 import android.content.Context;
-import android.content.Intent;
 import android.content.SharedPreferences;
 import android.os.Bundle;
 import android.text.TextUtils;
@@ -30,8 +28,11 @@ import org.json.JSONObject;
 
 /**
  * Fragment for configuring Aliro reader parameters.
+ *
  * Values are stored in SharedPreferences and loaded by HomeFragment
  * when an Aliro NFC or BLE transaction begins.
+ *
+ * LEAF Verified configuration has been moved to {@link LeafConfigFragment}.
  */
 public class AliroConfigFragment extends Fragment
 {
@@ -264,10 +265,6 @@ public class AliroConfigFragment extends Fragment
     }
 
     // -------------------------------------------------------------------------
-    // QR scanner
-    // -------------------------------------------------------------------------
-
-    // -------------------------------------------------------------------------
     // QR scanner: Step-Up Issuer Key (legacy single-key QR)
     // -------------------------------------------------------------------------
 
@@ -365,6 +362,8 @@ public class AliroConfigFragment extends Fragment
             showStatus("Failed to parse reader config QR: " + e.getMessage(), false);
         }
     }
+
+    // -------------------------------------------------------------------------
 
     private void showStatus(String message, boolean success)
     {

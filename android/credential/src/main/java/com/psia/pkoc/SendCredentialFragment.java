@@ -215,6 +215,8 @@ public class SendCredentialFragment extends Fragment
             String transport;
             if ("com.psia.pkoc.ALIRO_CREDENTIAL_SENT".equals(action))
                 transport = "Aliro NFC";
+            else if (LeafVerifiedHceService.ACTION_LEAF_CREDENTIAL_SENT.equals(action))
+                transport = "LEAF NFC";
             else
                 transport = "PKOC NFC";
             binding.statusText.setText(transport + ": " + getString(R.string.credential_sent));
@@ -448,6 +450,7 @@ public class SendCredentialFragment extends Fragment
 
         IntentFilter filter = new IntentFilter("com.psia.pkoc.CREDENTIAL_SENT");
         filter.addAction("com.psia.pkoc.ALIRO_CREDENTIAL_SENT");
+        filter.addAction(LeafVerifiedHceService.ACTION_LEAF_CREDENTIAL_SENT);
         ContextCompat.registerReceiver(requireActivity(), nfcReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED);
     }
 
@@ -836,7 +839,21 @@ public class SendCredentialFragment extends Fragment
                 if (menuItem.getItemId() == R.id.action_settings)
                 {
                     NavController navController = Navigation.findNavController(requireActivity(), R.id.nav_host_fragment_content_main);
-                    navController.navigate(R.id.settingsFragment);
+                    navController.navigate(R.id.action_sendCredentialFragment_to_settingsFragment);
+                    return true;
+                }
+
+                if (menuItem.getItemId() == R.id.action_aliro_config)
+                {
+                    NavController navController = Navigation.findNavController(requireActivity(), R.id.nav_host_fragment_content_main);
+                    navController.navigate(R.id.credentialAliroConfigFragment);
+                    return true;
+                }
+
+                if (menuItem.getItemId() == R.id.action_leaf_config)
+                {
+                    NavController navController = Navigation.findNavController(requireActivity(), R.id.nav_host_fragment_content_main);
+                    navController.navigate(R.id.credentialLeafConfigFragment);
                     return true;
                 }
 
@@ -865,13 +882,6 @@ public class SendCredentialFragment extends Fragment
                 {
                     NavController navController = Navigation.findNavController(requireActivity(), R.id.nav_host_fragment_content_main);
                     navController.navigate(R.id.action_sendCredentialFragment_to_scanReaderQrFragment);
-                    return true;
-                }
-
-                if (menuItem.getItemId() == R.id.action_aliro_config)
-                {
-                    NavController navController = Navigation.findNavController(requireActivity(), R.id.nav_host_fragment_content_main);
-                    navController.navigate(R.id.action_sendCredentialFragment_to_credentialAliroConfigFragment);
                     return true;
                 }
 

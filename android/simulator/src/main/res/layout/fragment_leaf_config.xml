@@ -1,0 +1,159 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/colorBackground"
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="24dp">
+
+        <!-- ================================================================= -->
+        <!-- Header -->
+        <!-- ================================================================= -->
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="LEAF Verified Reader Configuration"
+            android:textSize="18sp"
+            android:textStyle="bold"
+            android:textColor="#A41D23"
+            android:layout_marginBottom="8dp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="LEAF Verified enables Open ID (Path 1) detection. Import the Root CA public key that was exported from the credential app via QR code to allow this reader to cryptographically verify LEAF credentials."
+            android:textSize="13sp"
+            android:textColor="@color/colorTextSecondary"
+            android:layout_marginBottom="16dp" />
+
+        <!-- Divider -->
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:background="@color/colorTextSecondary"
+            android:layout_marginBottom="16dp" />
+
+        <!-- ================================================================= -->
+        <!-- LEAF Mode -->
+        <!-- ================================================================= -->
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="LEAF Detection"
+            android:textSize="15sp"
+            android:textStyle="bold"
+            android:textColor="#A41D23"
+            android:layout_marginBottom="4dp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="When enabled the reader will attempt LEAF Open ID detection automatically during NFC transactions."
+            android:textSize="13sp"
+            android:textColor="@color/colorTextSecondary"
+            android:layout_marginBottom="8dp" />
+
+        <CheckBox
+            android:id="@+id/chkLeafMode"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Enable LEAF detection in Auto mode"
+            android:textSize="14sp"
+            android:layout_marginBottom="24dp" />
+
+        <!-- Divider -->
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:background="@color/colorTextSecondary"
+            android:layout_marginBottom="16dp" />
+
+        <!-- ================================================================= -->
+        <!-- Root CA Section -->
+        <!-- ================================================================= -->
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Root CA Public Key"
+            android:textSize="15sp"
+            android:textStyle="bold"
+            android:textColor="#A41D23"
+            android:layout_marginBottom="4dp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="The Root CA public key is used to verify that a presented LEAF credential certificate was signed by a trusted authority. Import it by scanning the QR code shown in the credential app\u2019s LEAF Config screen."
+            android:textSize="13sp"
+            android:textColor="@color/colorTextSecondary"
+            android:layout_marginBottom="12dp" />
+
+        <!-- Root CA status box -->
+        <TextView
+            android:id="@+id/txtLeafRootCaStatus"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Root CA: not configured"
+            android:textSize="13sp"
+            android:fontFamily="monospace"
+            android:textColor="@android:color/darker_gray"
+            android:background="#F5F5F5"
+            android:padding="12dp"
+            android:layout_marginBottom="12dp" />
+
+        <!-- Import Root CA + Clear row -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:layout_marginBottom="32dp">
+
+            <Button
+                android:id="@+id/btnImportLeafRootCa"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="Import Root CA"
+                android:backgroundTint="#1E7A4D"
+                android:textColor="@android:color/white"
+                android:textSize="12sp"
+                android:layout_marginEnd="6dp" />
+
+            <Button
+                android:id="@+id/btnClearLeafRootCa"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="Clear Root CA"
+                android:backgroundTint="@android:color/holo_red_dark"
+                android:textColor="@android:color/white"
+                android:textSize="12sp"
+                android:enabled="false"
+                android:layout_marginStart="6dp" />
+
+        </LinearLayout>
+
+        <!-- ================================================================= -->
+        <!-- Status message -->
+        <!-- ================================================================= -->
+
+        <TextView
+            android:id="@+id/txtLeafConfigStatus"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:textSize="13sp"
+            android:textColor="@color/colorTextSecondary"
+            android:gravity="center"
+            android:visibility="gone" />
+
+    </LinearLayout>
+</ScrollView>

@@ -395,7 +395,8 @@ public class AliroProvisioningManager
             if (issuerPubKey.length() != 130) return null;
 
             // Store in reader's default SharedPreferences
-            context.getSharedPreferences("MainActivity", Context.MODE_PRIVATE)
+            context
+                    .getSharedPreferences("MainActivity", Context.MODE_PRIVATE)
                     .edit()
                     .putString("aliro_reader_private_key",    readerPrivKey)
                     .putString("aliro_reader_id",             readerId)

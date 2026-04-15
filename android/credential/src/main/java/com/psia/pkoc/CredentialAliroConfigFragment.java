@@ -53,6 +53,8 @@ import java.util.concurrent.Executors;
  *   6. Initialize mailbox with all-zero bytes (selected size)
  *   7. Load a realistic sample mailbox (ELATEC §18 TLV with reader config + door status)
  *   8. Clear the mailbox
+ *
+ * LEAF Verified configuration has been moved to {@link CredentialLeafConfigFragment}.
  */
 public class CredentialAliroConfigFragment extends Fragment
 {
@@ -311,9 +313,9 @@ public class CredentialAliroConfigFragment extends Fragment
             return;
         }
 
-        String mode       = prefs.getString(AliroAccessDocument.KEY_DOC_MODE,        "—");
-        String elementId  = prefs.getString(AliroAccessDocument.KEY_ELEMENT_ID,      "—");
-        String validUntil = prefs.getString(AliroAccessDocument.KEY_DOC_VALID_UNTIL, "—");
+        String mode       = prefs.getString(AliroAccessDocument.KEY_DOC_MODE,        "\u2014");
+        String elementId  = prefs.getString(AliroAccessDocument.KEY_ELEMENT_ID,      "\u2014");
+        String validUntil = prefs.getString(AliroAccessDocument.KEY_DOC_VALID_UNTIL, "\u2014");
         String issuerHex  = prefs.getString(AliroAccessDocument.KEY_ISSUER_PUB_KEY,  "");
         byte[] docBytes   = AliroAccessDocument.getDocumentBytes(requireContext());
         int size          = docBytes != null ? docBytes.length : 0;

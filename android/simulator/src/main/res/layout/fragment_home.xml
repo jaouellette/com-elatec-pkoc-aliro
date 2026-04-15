@@ -152,6 +152,17 @@
                     android:buttonTint="@color/colorPrimary" />
 
                 <RadioButton
+                    android:id="@+id/modeLeaf"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="4dp"
+                    android:layout_marginEnd="4dp"
+                    android:text="LEAF Verified"
+                    android:textColor="@color/colorPrimaryDark"
+                    android:textSize="14sp"
+                    android:buttonTint="@color/colorPrimary" />
+
+                <RadioButton
                     android:id="@+id/modeAuto"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
@@ -173,6 +184,17 @@
                 android:layout_marginTop="8dp"
                 android:text="Show Reader Details"
                 android:visibility="visible" />
+
+            <Button
+                android:id="@+id/btnAliroBle"
+                style="@android:style/Widget.Material.Button.Inset"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_below="@id/rdrButton"
+                android:layout_centerHorizontal="true"
+                android:layout_marginTop="8dp"
+                android:text="Start Aliro BLE"
+                android:visibility="gone" />
 
         </RelativeLayout>
     </ScrollView>
@@ -320,15 +342,5 @@
         </LinearLayout>
 
     </LinearLayout>
-    <Button
-        android:id="@+id/btnAliroBle"
-        style="@android:style/Widget.Material.Button.Inset"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_marginBottom="16dp"
-        android:text="Start Aliro BLE"
-        android:visibility="gone"
-        app:layout_constraintBottom_toBottomOf="@id/guidelineKeypadTop"
-        app:layout_constraintLeft_toLeftOf="parent"
-        app:layout_constraintRight_toRightOf="parent" />
+
 </androidx.constraintlayout.widget.ConstraintLayout>

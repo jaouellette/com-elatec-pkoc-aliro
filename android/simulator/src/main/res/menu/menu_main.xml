@@ -13,15 +13,27 @@
         app:showAsAction="never" />
 
     <item
+        android:id="@+id/action_leaf_config"
+        android:title="LEAF Verified Config"
+        android:orderInCategory="200"
+        app:showAsAction="never" />
+
+    <item
         android:id="@+id/action_self_test"
         android:title="Aliro Self-Test"
-        android:orderInCategory="200"
+        android:orderInCategory="300"
         app:showAsAction="never" />
 
     <item
         android:id="@+id/action_pkoc_self_test"
         android:title="PKOC Self-Test"
-        android:orderInCategory="201"
+        android:orderInCategory="301"
+        app:showAsAction="never" />
+
+    <item
+        android:id="@+id/action_leaf_self_test"
+        android:title="LEAF Verified Self-Test"
+        android:orderInCategory="350"
         app:showAsAction="never" />
 
 </menu>
