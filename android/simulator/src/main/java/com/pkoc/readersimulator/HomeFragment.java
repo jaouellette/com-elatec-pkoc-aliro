@@ -743,7 +743,7 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                 textView.setText("Scan a PKOC NFC or BLE Credential");
                 break;
             case MODE_ALIRO:
-                textView.setText("Scan a Aliro NFC Credential");
+                textView.setText("Scan a Aliro NFC or BLE Credential");
                 break;
             case MODE_LEAF:
                 textView.setText("Scan a LEAF Verified NFC Credential");

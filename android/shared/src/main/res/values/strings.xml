@@ -1,5 +1,5 @@
 <resources>
-    <string name="app_name">ELATEC PKOC/Aliro Core Library</string>
+    <string name="app_name">ELATEC Open Standards Core Library</string>
     <string name="enter_custom_bit_length_65_255">Enter custom bit length (65–256)</string>
     <string name="copy_key">Copy Key</string>
     <string name="public_key_qr_code">Public Key QR Code</string>
