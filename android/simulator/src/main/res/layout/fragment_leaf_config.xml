@@ -110,19 +110,19 @@
             android:padding="12dp"
             android:layout_marginBottom="12dp" />
 
-        <!-- Import Root CA + Clear row -->
+        <!-- Import Root CA (QR) + Clear row -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:orientation="horizontal"
-            android:layout_marginBottom="32dp">
+            android:layout_marginBottom="12dp">
 
             <Button
                 android:id="@+id/btnImportLeafRootCa"
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
                 android:layout_weight="1"
-                android:text="Import Root CA"
+                android:text="Import via QR"
                 android:backgroundTint="#1E7A4D"
                 android:textColor="@android:color/white"
                 android:textSize="12sp"
@@ -141,6 +141,38 @@
                 android:layout_marginStart="6dp" />
 
         </LinearLayout>
+
+        <!-- Manual hex paste option -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Or paste Root CA public key hex (130 chars, starting with 04):"
+            android:textSize="12sp"
+            android:textColor="@color/colorTextSecondary"
+            android:layout_marginBottom="4dp" />
+
+        <EditText
+            android:id="@+id/editLeafRootCaHex"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="04abcdef..."
+            android:inputType="textMultiLine"
+            android:textSize="11sp"
+            android:fontFamily="monospace"
+            android:singleLine="false"
+            android:maxLines="3"
+            android:scrollHorizontally="false"
+            android:layout_marginBottom="8dp" />
+
+        <Button
+            android:id="@+id/btnApplyLeafRootCaHex"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Apply Pasted Key"
+            android:backgroundTint="#4472C4"
+            android:textColor="@android:color/white"
+            android:textSize="12sp"
+            android:layout_marginBottom="32dp" />
 
         <!-- ================================================================= -->
         <!-- Status message -->

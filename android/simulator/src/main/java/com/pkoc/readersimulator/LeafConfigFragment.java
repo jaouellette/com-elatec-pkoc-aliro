@@ -46,6 +46,8 @@ public class LeafConfigFragment extends Fragment
     private TextView txtLeafRootCaStatus;
     private Button   btnImportLeafRootCa;
     private Button   btnClearLeafRootCa;
+    private android.widget.EditText editLeafRootCaHex;
+    private Button   btnApplyLeafRootCaHex;
     private TextView txtStatus;
 
     /** QR scanner for LEAF Root CA import. */
@@ -66,17 +68,20 @@ public class LeafConfigFragment extends Fragment
     {
         super.onViewCreated(view, savedInstanceState);
 
-        chkLeafMode         = view.findViewById(R.id.chkLeafMode);
-        txtLeafRootCaStatus = view.findViewById(R.id.txtLeafRootCaStatus);
-        btnImportLeafRootCa = view.findViewById(R.id.btnImportLeafRootCa);
-        btnClearLeafRootCa  = view.findViewById(R.id.btnClearLeafRootCa);
-        txtStatus           = view.findViewById(R.id.txtLeafConfigStatus);
+        chkLeafMode           = view.findViewById(R.id.chkLeafMode);
+        txtLeafRootCaStatus   = view.findViewById(R.id.txtLeafRootCaStatus);
+        btnImportLeafRootCa   = view.findViewById(R.id.btnImportLeafRootCa);
+        btnClearLeafRootCa    = view.findViewById(R.id.btnClearLeafRootCa);
+        editLeafRootCaHex     = view.findViewById(R.id.editLeafRootCaHex);
+        btnApplyLeafRootCaHex = view.findViewById(R.id.btnApplyLeafRootCaHex);
+        txtStatus             = view.findViewById(R.id.txtLeafConfigStatus);
 
         loadFromPreferences();
 
         chkLeafMode.setOnCheckedChangeListener((cb, checked) -> saveLeafModeEnabled(checked));
         btnImportLeafRootCa.setOnClickListener(v -> launchLeafRootCaScanner());
         btnClearLeafRootCa.setOnClickListener(v -> clearLeafRootCa());
+        btnApplyLeafRootCaHex.setOnClickListener(v -> applyPastedRootCa());
     }
 
     @Override
@@ -158,6 +163,10 @@ public class LeafConfigFragment extends Fragment
             txtLeafRootCaStatus.setTextColor(
                     requireContext().getColor(R.color.colorAccent));
             if (btnClearLeafRootCa != null) btnClearLeafRootCa.setEnabled(true);
+
+            // Populate the hex edit field with the full key so user can see/edit it
+            if (editLeafRootCaHex != null && editLeafRootCaHex.getText().length() == 0)
+                editLeafRootCaHex.setText(rootCaHex);
         }
     }
 
@@ -222,6 +231,36 @@ public class LeafConfigFragment extends Fragment
             showStatus("QR does not contain a valid LEAF Root CA "
                     + "(expected JSON or 130-char hex).", false);
         }
+    }
+
+    // =========================================================================
+    // Manual hex paste — Root CA import
+    // =========================================================================
+
+    /** Apply a manually pasted Root CA public key hex from the EditText. */
+    private void applyPastedRootCa()
+    {
+        if (editLeafRootCaHex == null) return;
+        String hex = editLeafRootCaHex.getText().toString()
+                .trim()
+                .replaceAll("\\s+", "")  // strip whitespace
+                .replaceAll("[^0-9a-fA-F]", "") // strip non-hex chars
+                .toLowerCase(java.util.Locale.US);
+
+        if (!isValidHex(hex, 130))
+        {
+            showStatus("Invalid key — must be exactly 130 hex characters (65 bytes, starting with 04).", false);
+            return;
+        }
+        if (!hex.startsWith("04"))
+        {
+            showStatus("Key must start with 04 (uncompressed EC point).", false);
+            return;
+        }
+
+        LeafVerifiedManager.setReaderRootCAPubKey(requireContext(), hex);
+        refreshLeafRootCaStatus();
+        showStatus("\u2713 Root CA applied from pasted hex.", true);
     }
 
     // =========================================================================

@@ -41,7 +41,21 @@ import java.util.Arrays;
  *         "4": deviceKeyInfo { "1": COSE_Key of credential pub key }
  *         "5": docType ("aliro-a")
  *         "6": validityInfo { "1": signed, "2": validFrom, "3": validUntil }
- *         "7": timeVerificationRequired (false)
+ *         "7": timeVerificationRequired (boolean, SHALL be present per §7.2.2)
+ *
+ * Revocation Document (DocType "aliro-r"):
+ *   issuerSigned:
+ *     nameSpaces ("aliro-r"):
+ *       [IssuerSignedItem, ...]
+ *     IssuerAuth:  COSE_Sign1 [ header, nil, MobileSecurityObject, signature ]
+ *       MobileSecurityObject:
+ *         "1": version ("1.0")
+ *         "2": digestAlgorithm ("SHA-256")
+ *         "3": valueDigests { "aliro-r": { digestID -> SHA-256(IssuerSignedItem) } }
+ *         (NO "4" deviceKeyInfo — per Aliro §7.6)
+ *         "5": docType ("aliro-r")
+ *         "6": validityInfo { "1": signed, "2": validFrom, "3": validUntil }
+ *         "7": timeVerificationRequired (boolean)
  *
  * IssuerSignedItem (per Table 7-2):
  *   "1": digestID (uint)
@@ -82,9 +96,18 @@ public class AliroAccessDocument
     public static final String KEY_DOC_VALID_FROM = "aliro_access_doc_valid_from"; // ISO-8601
     public static final String KEY_DOC_VALID_UNTIL= "aliro_access_doc_valid_until";// ISO-8601
 
+    // Revocation Document SharedPreferences keys
+    public static final String KEY_REVOC_DOC            = "aliro_revocation_doc";           // Base64 CBOR
+    public static final String KEY_REVOC_ISSUER_PUB_KEY = "aliro_revoc_doc_issuer_pub_key"; // hex
+    public static final String KEY_REVOC_ELEMENT_ID     = "aliro_revoc_doc_element_id";     // string
+
     // Aliro doc type and namespace constants
     public static final String DOCTYPE_ACCESS      = "aliro-a";
     public static final String NAMESPACE_ACCESS    = "aliro-a";
+
+    // Aliro Revocation Document constants (per §7.6)
+    public static final String DOCTYPE_REVOCATION  = "aliro-r";
+    public static final String NAMESPACE_REVOCATION = "aliro-r";
 
     // -------------------------------------------------------------------------
 
@@ -98,6 +121,9 @@ public class AliroAccessDocument
      * Creates a fresh P-256 issuer keypair, builds a minimal AccessData element
      * with the given element identifier, signs it with COSE_Sign1/ES256, and
      * stores the document in SharedPreferences.
+     *
+     * Also generates and stores a paired Revocation Document (aliro-r) with the
+     * same elementIdentifier and validDays.
      *
      * @param context          Application context
      * @param credPubKeyBytes  65-byte uncompressed credential public key
@@ -118,8 +144,10 @@ public class AliroAccessDocument
             ECPublicKey issuerPub = (ECPublicKey) issuerKP.getPublic();
             byte[] issuerPubBytes = uncompressedPoint(issuerPub);
 
-            // 2. Build AccessData CBOR per §7.3 — minimal: { 0: 1 }
-            CBORObject accessData = buildMinimalAccessData();
+            // 2. Build AccessData CBOR per §7.3 — realistic employee badge data
+            // so the Step-Up document shows meaningful content (Employee ID,
+            // Access Rules, Schedules) in both the simulator and credential UIs.
+            CBORObject accessData = buildRealisticAccessData();
 
             // 3. Build IssuerSignedItem per Table 7-2
             byte[] random = AliroCryptoProvider.generateRandom(16);
@@ -127,9 +155,14 @@ public class AliroAccessDocument
             CBORObject issuerSignedItem = buildIssuerSignedItem(
                     digestId, random, elementIdentifier, accessData);
 
-            // 4. Compute digest of IssuerSignedItem bstr
+            // 4. Wrap IssuerSignedItem in CBOR tag 24 per ISO 18013-5 §8.3.2.1.2.2
             byte[] itemBytes = issuerSignedItem.EncodeToBytes();
-            byte[] digest    = sha256(itemBytes);
+            CBORObject taggedItem = CBORObject.FromObjectAndTag(
+                    CBORObject.FromObject(itemBytes), 24);
+            // Digest is over the CBOR encoding of #6.24(bstr(IssuerSignedItem))
+            // per ISO 18013-5 §9.1.2.5
+            byte[] taggedItemBytes = taggedItem.EncodeToBytes();
+            byte[] digest = sha256(taggedItemBytes);
 
             // 5. Build MobileSecurityObject per §7.2 + Table 7-1
             Instant now    = Instant.now();
@@ -145,10 +178,10 @@ public class AliroAccessDocument
             // 7. Build IssuerAuth = COSE_Sign1 array
             CBORObject issuerAuth = buildCoseSign1(issuerPubBytes, msoBytes, signature);
 
-            // 8. Build nameSpaces map: { "aliro-a": [bstr(IssuerSignedItem)] }
+            // 8. Build nameSpaces map: { "aliro-a": [#6.24(bstr(IssuerSignedItem))] }
             CBORObject nameSpaces = CBORObject.NewOrderedMap();
             CBORObject itemsArray = CBORObject.NewArray();
-            itemsArray.Add(CBORObject.FromObject(itemBytes));
+            itemsArray.Add(taggedItem);
             nameSpaces.Add(CBORObject.FromObject(NAMESPACE_ACCESS), itemsArray);
 
             // 9. Build issuerSigned: { "1": nameSpaces, "2": IssuerAuth }
@@ -158,8 +191,9 @@ public class AliroAccessDocument
 
             // 10. Build full document: { "5": docType, "1": issuerSigned }
             CBORObject document = CBORObject.NewOrderedMap();
-            document.Add(CBORObject.FromObject("5"), CBORObject.FromObject(DOCTYPE_ACCESS));
+            // Keys must be in deterministic order per Aliro §7.2 / RFC 8949 §4.2.1
             document.Add(CBORObject.FromObject("1"), issuerSigned);
+            document.Add(CBORObject.FromObject("5"), CBORObject.FromObject(DOCTYPE_ACCESS));
 
             // 11. Wrap in DeviceResponse: { "1": "1.0", "2": [document], "3": 0 }
             CBORObject docResponse = CBORObject.NewOrderedMap();
@@ -190,11 +224,157 @@ public class AliroAccessDocument
                     + "Issuer key: " + issuerHex.substring(0, 16) + "...\n"
                     + "Size: " + cborBytes.length + " bytes";
             Log.d(TAG, "Generated test Access Document: " + cborBytes.length + " bytes");
+
+            // 13. Also generate paired Revocation Document
+            // Generate Revocation Document with the SAME issuer keypair so both
+            // documents verify against the same dut_credential_issuer_public_key.
+            String revocResult = generateRevocationDocument(context, elementIdentifier, validDays,
+                    issuerKP, issuerPubBytes);
+            if (revocResult != null)
+            {
+                Log.d(TAG, "Generated paired Revocation Document");
+            }
+            else
+            {
+                Log.w(TAG, "Revocation Document generation failed (non-fatal)");
+            }
+
+            // 14. Initialize mailbox with structured sample data per Aliro §18
+            // so the simulator displays meaningful Reader Config / Door Status.
+            // Only initialize if mailbox is empty — don't overwrite harness test data.
+            try
+            {
+                SharedPreferences mailboxPrefs = context
+                        .getSharedPreferences("AliroMailbox", Context.MODE_PRIVATE);
+                String existing = mailboxPrefs.getString("mailbox", null);
+                if (existing == null || existing.isEmpty())
+                {
+                    byte[] sampleMailbox = AliroMailbox.buildSampleMailbox();
+                    mailboxPrefs.edit()
+                            .putString("mailbox", Base64.encodeToString(sampleMailbox, Base64.DEFAULT))
+                            .apply();
+                    Log.d(TAG, "Initialized mailbox with structured sample data (" + sampleMailbox.length + " bytes)");
+                }
+                else
+                {
+                    Log.d(TAG, "Mailbox already has data — skipping sample initialization");
+                }
+            }
+            catch (Exception mbEx)
+            {
+                Log.w(TAG, "Mailbox sample initialization failed (non-fatal)", mbEx);
+            }
+
             return summary;
         }
         catch (Exception e)
         {
             Log.e(TAG, "generateTestDocument failed", e);
+            return null;
+        }
+    }
+
+    /**
+     * Generate a self-signed Revocation Document (DocType "aliro-r").
+     *
+     * Per Aliro §7.6:
+     *   - DocType = "aliro-r"
+     *   - Namespace = "aliro-r"
+     *   - IssuerAuth SHALL NOT contain deviceKeyInfo field (no MSO key "4")
+     *   - Otherwise same structure as Access Document
+     *
+     * @param context           Application context
+     * @param elementIdentifier DataElementIdentifier (same as paired Access Document)
+     * @param validDays         Number of days the document should be valid
+     * @return Summary string for display, or null on failure
+     */
+    public static String generateRevocationDocument(Context context,
+                                                     String elementIdentifier,
+                                                     int validDays,
+                                                     KeyPair issuerKP,
+                                                     byte[] issuerPubBytes)
+    {
+        try
+        {
+
+            // 2. Build minimal revocation data element: { 0: 1 } (version only)
+            CBORObject revocData = buildMinimalAccessData(); // { 0: 1 }
+
+            // 3. Build IssuerSignedItem per Table 7-2
+            byte[] random   = AliroCryptoProvider.generateRandom(16);
+            int    digestId = 0;
+            CBORObject issuerSignedItem = buildIssuerSignedItem(
+                    digestId, random, elementIdentifier, revocData);
+
+            // 4. Wrap IssuerSignedItem in CBOR tag 24 per ISO 18013-5 §8.3.2.1.2.2
+            byte[] itemBytes      = issuerSignedItem.EncodeToBytes();
+            CBORObject taggedItem = CBORObject.FromObjectAndTag(
+                    CBORObject.FromObject(itemBytes), 24);
+            // Digest is over the CBOR encoding of #6.24(bstr(IssuerSignedItem))
+            // per ISO 18013-5 §9.1.2.5
+            byte[] taggedItemBytes = taggedItem.EncodeToBytes();
+            byte[] digest          = sha256(taggedItemBytes);
+
+            // 5. Build MobileSecurityObject WITHOUT deviceKeyInfo (no key "4") per §7.6
+            Instant now   = Instant.now();
+            Instant until = now.plusSeconds((long) validDays * 86400);
+            CBORObject mso = buildRevocationMSO(elementIdentifier, digestId, digest, now, until);
+
+            // 6. COSE_Sign1 over MobileSecurityObject
+            byte[] msoBytes  = mso.EncodeToBytes();
+            byte[] signature = coseSign1(issuerKP.getPrivate(), msoBytes);
+            if (signature == null) return null;
+
+            // 7. Build IssuerAuth = COSE_Sign1 array (NOT wrapped in CBOR tag 18)
+            CBORObject issuerAuth = buildCoseSign1(issuerPubBytes, msoBytes, signature);
+
+            // 8. Build nameSpaces map: { "aliro-r": [#6.24(bstr(IssuerSignedItem))] }
+            CBORObject nameSpaces = CBORObject.NewOrderedMap();
+            CBORObject itemsArray = CBORObject.NewArray();
+            itemsArray.Add(taggedItem);
+            nameSpaces.Add(CBORObject.FromObject(NAMESPACE_REVOCATION), itemsArray);
+
+            // 9. Build issuerSigned: { "1": nameSpaces, "2": IssuerAuth }
+            CBORObject issuerSigned = CBORObject.NewOrderedMap();
+            issuerSigned.Add(CBORObject.FromObject("1"), nameSpaces);
+            issuerSigned.Add(CBORObject.FromObject("2"), issuerAuth);
+
+            // 10. Build full document: { "1": issuerSigned, "5": docType }
+            CBORObject document = CBORObject.NewOrderedMap();
+            document.Add(CBORObject.FromObject("1"), issuerSigned);
+            document.Add(CBORObject.FromObject("5"), CBORObject.FromObject(DOCTYPE_REVOCATION));
+
+            // 11. Wrap in DeviceResponse: { "1": "1.0", "2": [document], "3": 0 }
+            CBORObject docResponse = CBORObject.NewOrderedMap();
+            docResponse.Add(CBORObject.FromObject("1"), CBORObject.FromObject("1.0"));
+            CBORObject docs = CBORObject.NewArray();
+            docs.Add(document);
+            docResponse.Add(CBORObject.FromObject("2"), docs);
+            docResponse.Add(CBORObject.FromObject("3"), CBORObject.FromObject(0));
+
+            // 12. Store under revocation-specific keys
+            byte[] cborBytes = docResponse.EncodeToBytes();
+            String b64       = Base64.encodeToString(cborBytes, Base64.DEFAULT);
+            String issuerHex = Hex.toHexString(issuerPubBytes);
+
+            SharedPreferences.Editor editor = context
+                    .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit();
+            editor.putString(KEY_REVOC_DOC,            b64);
+            editor.putString(KEY_REVOC_ISSUER_PUB_KEY, issuerHex);
+            editor.putString(KEY_REVOC_ELEMENT_ID,     elementIdentifier);
+            editor.apply();
+
+            String summary = "Revocation Document generated.\n"
+                    + "Element: " + elementIdentifier + "\n"
+                    + "Valid until: " + until.toString().substring(0, 10) + "\n"
+                    + "Issuer key: " + issuerHex.substring(0, 16) + "...\n"
+                    + "Size: " + cborBytes.length + " bytes";
+            Log.d(TAG, "Generated Revocation Document: " + cborBytes.length + " bytes");
+            return summary;
+        }
+        catch (Exception e)
+        {
+            Log.e(TAG, "generateRevocationDocument failed", e);
             return null;
         }
     }
@@ -249,9 +429,14 @@ public class AliroAccessDocument
             CBORObject issuerSignedItem = buildIssuerSignedItem(
                     digestId, random, elementIdentifier, accessData);
 
-            // 4. Compute digest of IssuerSignedItem bstr
+            // 4. Wrap IssuerSignedItem in CBOR tag 24 per ISO 18013-5 §8.3.2.1.2.2
             byte[] itemBytes = issuerSignedItem.EncodeToBytes();
-            byte[] digest    = sha256(itemBytes);
+            CBORObject taggedItem = CBORObject.FromObjectAndTag(
+                    CBORObject.FromObject(itemBytes), 24);
+            // Digest is over the CBOR encoding of #6.24(bstr(IssuerSignedItem))
+            // per ISO 18013-5 §9.1.2.5
+            byte[] taggedItemBytes = taggedItem.EncodeToBytes();
+            byte[] digest = sha256(taggedItemBytes);
 
             // 5. Build MobileSecurityObject
             Instant now   = Instant.now();
@@ -270,7 +455,7 @@ public class AliroAccessDocument
             // 8. nameSpaces
             CBORObject nameSpaces = CBORObject.NewOrderedMap();
             CBORObject itemsArray = CBORObject.NewArray();
-            itemsArray.Add(CBORObject.FromObject(itemBytes));
+            itemsArray.Add(taggedItem);
             nameSpaces.Add(CBORObject.FromObject(NAMESPACE_ACCESS), itemsArray);
 
             // 9. issuerSigned
@@ -280,8 +465,9 @@ public class AliroAccessDocument
 
             // 10. Document
             CBORObject document = CBORObject.NewOrderedMap();
-            document.Add(CBORObject.FromObject("5"), CBORObject.FromObject(DOCTYPE_ACCESS));
+            // Keys must be in deterministic order per Aliro §7.2 / RFC 8949 §4.2.1
             document.Add(CBORObject.FromObject("1"), issuerSigned);
+            document.Add(CBORObject.FromObject("5"), CBORObject.FromObject(DOCTYPE_ACCESS));
 
             // 11. DeviceResponse
             CBORObject docResponse = CBORObject.NewOrderedMap();
@@ -394,12 +580,35 @@ public class AliroAccessDocument
     }
 
     /**
+     * Clear the stored Revocation Document.
+     */
+    public static void clearRevocationDocument(Context context)
+    {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+               .edit()
+               .remove(KEY_REVOC_DOC)
+               .remove(KEY_REVOC_ISSUER_PUB_KEY)
+               .remove(KEY_REVOC_ELEMENT_ID)
+               .apply();
+        Log.d(TAG, "Revocation Document cleared");
+    }
+
+    /**
      * Check whether an Access Document is currently stored.
      */
     public static boolean hasDocument(Context context)
     {
         return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
                       .contains(KEY_ACCESS_DOC);
+    }
+
+    /**
+     * Check whether a Revocation Document is currently stored.
+     */
+    public static boolean hasRevocationDocument(Context context)
+    {
+        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                      .contains(KEY_REVOC_DOC);
     }
 
     /**
@@ -415,12 +624,33 @@ public class AliroAccessDocument
     }
 
     /**
+     * Get the stored Revocation Document CBOR bytes, or null if none.
+     */
+    public static byte[] getRevocationDocumentBytes(Context context)
+    {
+        String b64 = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                            .getString(KEY_REVOC_DOC, null);
+        if (b64 == null) return null;
+        try { return Base64.decode(b64, Base64.DEFAULT); }
+        catch (Exception e) { return null; }
+    }
+
+    /**
      * Get the stored element identifier (DataElementIdentifier) for the DeviceRequest.
      */
     public static String getElementIdentifier(Context context)
     {
         return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
                       .getString(KEY_ELEMENT_ID, "access");
+    }
+
+    /**
+     * Get the stored element identifier for the Revocation Document.
+     */
+    public static String getRevocationElementIdentifier(Context context)
+    {
+        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                      .getString(KEY_REVOC_ELEMENT_ID, "access");
     }
 
     /**
@@ -441,7 +671,7 @@ public class AliroAccessDocument
 
     /**
      * Build minimal AccessData: { 0: 1 } — version only.
-     * Used by generateTestDocument().
+     * Used by generateTestDocument() and generateRevocationDocument().
      */
     private static CBORObject buildMinimalAccessData()
     {
@@ -579,22 +809,81 @@ public class AliroAccessDocument
                                                      String elementIdentifier,
                                                      CBORObject elementValue)
     {
+        // Per Aliro Table 7-2, IssuerSignedItem uses abbreviated keys (SHALL).
+        // Deterministic CBOR order: "1" < "2" < "3" < "4"
         CBORObject item = CBORObject.NewOrderedMap();
-        item.Add(CBORObject.FromObject("1"), CBORObject.FromObject(digestId));
-        item.Add(CBORObject.FromObject("2"), CBORObject.FromObject(random));
-        item.Add(CBORObject.FromObject("3"), CBORObject.FromObject(elementIdentifier));
-        item.Add(CBORObject.FromObject("4"), elementValue);
+        item.Add(CBORObject.FromObject("1"), CBORObject.FromObject(digestId));          // digestID
+        item.Add(CBORObject.FromObject("2"), CBORObject.FromObject(random));            // random
+        item.Add(CBORObject.FromObject("3"), CBORObject.FromObject(elementIdentifier)); // elementIdentifier
+        item.Add(CBORObject.FromObject("4"), elementValue);                             // elementValue
         return item;
     }
 
     /**
      * Build MobileSecurityObject per §7.2 + Table 7-1.
      * Keys are remapped integers-as-text-strings per Table 7-1.
+     * Includes deviceKeyInfo at key "4".
      */
     private static CBORObject buildMSO(byte[] credPubKeyBytes,
                                         String elementIdentifier,
                                         int digestId, byte[] digest,
                                         Instant validFrom, Instant validUntil)
+    {
+        // MSO (MobileSecurityObject) per Aliro §7.2.2 + Table 7-1.
+        // Keys SHALL be replaced with abbreviated keys per Table 7-1.
+        // Deterministic CBOR order (RFC 8949 §4.2.1): "1" < "2" < "3" < "4" < "5" < "6"
+        CBORObject mso = CBORObject.NewOrderedMap();
+
+        // "1" = version
+        mso.Add(CBORObject.FromObject("1"), CBORObject.FromObject("1.0"));
+
+        // "2" = digestAlgorithm
+        mso.Add(CBORObject.FromObject("2"), CBORObject.FromObject("SHA-256"));
+
+        // "3" = valueDigests
+        CBORObject digestMap = CBORObject.NewOrderedMap();
+        digestMap.Add(CBORObject.FromObject(digestId), CBORObject.FromObject(digest));
+        CBORObject valueDigests = CBORObject.NewOrderedMap();
+        valueDigests.Add(CBORObject.FromObject(NAMESPACE_ACCESS), digestMap);
+        mso.Add(CBORObject.FromObject("3"), valueDigests);
+
+        // "4" = deviceKeyInfo { "1" = deviceKey }
+        CBORObject coseKey = buildCoseEcKey(credPubKeyBytes);
+        CBORObject deviceKeyInfo = CBORObject.NewOrderedMap();
+        deviceKeyInfo.Add(CBORObject.FromObject("1"), coseKey);
+        mso.Add(CBORObject.FromObject("4"), deviceKeyInfo);
+
+        // "5" = docType
+        mso.Add(CBORObject.FromObject("5"), CBORObject.FromObject(DOCTYPE_ACCESS));
+
+        // "6" = validityInfo { "1" = signed, "2" = validFrom, "3" = validUntil }
+        // Per ISO 18013-5, tdate = #6.0(tstr) — CBOR tag 0 wrapping RFC 3339 date string.
+        CBORObject validity = CBORObject.NewOrderedMap();
+        validity.Add(CBORObject.FromObject("1"),
+                CBORObject.FromObjectAndTag(validFrom.toString(), 0));
+        validity.Add(CBORObject.FromObject("2"),
+                CBORObject.FromObjectAndTag(validFrom.toString(), 0));
+        validity.Add(CBORObject.FromObject("3"),
+                CBORObject.FromObjectAndTag(validUntil.toString(), 0));
+        mso.Add(CBORObject.FromObject("6"), validity);
+
+        // "7" = timeVerificationRequired (boolean)
+        // Per Aliro §7.2.2: "SHALL be present in the MobileSecurityObject"
+        // Per §7.2.4: false means Reader MAY skip time validation.
+        mso.Add(CBORObject.FromObject("7"), CBORObject.FromObject(false));
+
+        return mso;
+    }
+
+    /**
+     * Build MobileSecurityObject for Revocation Document per §7.6 + Table 7-1.
+     * Same as buildMSO() but WITHOUT key "4" (deviceKeyInfo) per Aliro §7.6.
+     * Keys: "1" (version), "2" (digestAlgorithm), "3" (valueDigests),
+     *       "5" (docType = "aliro-r"), "6" (validityInfo), "7" (timeVerificationRequired)
+     */
+    private static CBORObject buildRevocationMSO(String elementIdentifier,
+                                                   int digestId, byte[] digest,
+                                                   Instant validFrom, Instant validUntil)
     {
         CBORObject mso = CBORObject.NewOrderedMap();
 
@@ -604,34 +893,30 @@ public class AliroAccessDocument
         // "2" = digestAlgorithm
         mso.Add(CBORObject.FromObject("2"), CBORObject.FromObject("SHA-256"));
 
-        // "3" = valueDigests: { namespace: { digestID: digest_bytes } }
+        // "3" = valueDigests (uses "aliro-r" namespace)
         CBORObject digestMap = CBORObject.NewOrderedMap();
         digestMap.Add(CBORObject.FromObject(digestId), CBORObject.FromObject(digest));
         CBORObject valueDigests = CBORObject.NewOrderedMap();
-        valueDigests.Add(CBORObject.FromObject(NAMESPACE_ACCESS), digestMap);
+        valueDigests.Add(CBORObject.FromObject(NAMESPACE_REVOCATION), digestMap);
         mso.Add(CBORObject.FromObject("3"), valueDigests);
 
-        // "4" = deviceKeyInfo: { "1": COSE_Key }
-        CBORObject coseKey = buildCoseEcKey(credPubKeyBytes);
-        CBORObject deviceKeyInfo = CBORObject.NewOrderedMap();
-        deviceKeyInfo.Add(CBORObject.FromObject("1"), coseKey);
-        mso.Add(CBORObject.FromObject("4"), deviceKeyInfo);
+        // Key "4" (deviceKeyInfo) is intentionally OMITTED per Aliro §7.6
 
-        // "5" = docType
-        mso.Add(CBORObject.FromObject("5"), CBORObject.FromObject(DOCTYPE_ACCESS));
+        // "5" = docType = "aliro-r"
+        mso.Add(CBORObject.FromObject("5"), CBORObject.FromObject(DOCTYPE_REVOCATION));
 
-        // "6" = validityInfo: { "1": signed, "2": validFrom, "3": validUntil }
+        // "6" = validityInfo { "1" = signed, "2" = validFrom, "3" = validUntil }
         CBORObject validity = CBORObject.NewOrderedMap();
         validity.Add(CBORObject.FromObject("1"),
-                CBORObject.FromObject(validFrom.toString()));
+                CBORObject.FromObjectAndTag(validFrom.toString(), 0));
         validity.Add(CBORObject.FromObject("2"),
-                CBORObject.FromObject(validFrom.toString()));
+                CBORObject.FromObjectAndTag(validFrom.toString(), 0));
         validity.Add(CBORObject.FromObject("3"),
-                CBORObject.FromObject(validUntil.toString()));
+                CBORObject.FromObjectAndTag(validUntil.toString(), 0));
         mso.Add(CBORObject.FromObject("6"), validity);
 
-        // "7" = timeVerificationRequired (false for test docs)
-        mso.Add(CBORObject.FromObject("7"), CBORObject.False);
+        // "7" = timeVerificationRequired (boolean)
+        mso.Add(CBORObject.FromObject("7"), CBORObject.FromObject(false));
 
         return mso;
     }
@@ -674,11 +959,23 @@ public class AliroAccessDocument
             unprotectedHeader.Add(CBORObject.FromObject(4), CBORObject.FromObject(kid));
         }
 
+        // Per ISO 18013-5 §9.1.2.4, the payload is MobileSecurityObjectBytes =
+        // #6.24(bstr .cbor MobileSecurityObject) — the MSO bytes wrapped in CBOR tag 24.
+        // The harness decodes the payload and expects CBORTag(24, bstr).
+        CBORObject taggedPayload = CBORObject.FromObjectAndTag(
+                CBORObject.FromObject(msoBytes), 24);
+        byte[] payloadBytes = taggedPayload.EncodeToBytes();
+
         CBORObject coseSign1 = CBORObject.NewArray();
         coseSign1.Add(CBORObject.FromObject(protectedBytes));
         coseSign1.Add(unprotectedHeader);
-        coseSign1.Add(CBORObject.FromObject(msoBytes)); // payload (embedded)
+        coseSign1.Add(CBORObject.FromObject(payloadBytes)); // payload = #6.24(bstr(MSO))
         coseSign1.Add(CBORObject.FromObject(signature));
+
+        // NOTE: Do NOT wrap in CBOR tag 18. The Aliro test harness Python code
+        // accesses IssuerAuth elements via subscript (issuerAuth[0], etc.) and
+        // crashes with "'CBORTag' object is not subscriptable" if tag 18 is present.
+        // Per ISO 18013-5, COSE_Sign1 tag is optional when type is known from context.
         return coseSign1;
     }
 
@@ -696,12 +993,18 @@ public class AliroAccessDocument
             protectedHeader.Add(CBORObject.FromObject(1), CBORObject.FromObject(-7));
             byte[] protectedBytes = protectedHeader.EncodeToBytes();
 
+            // The payload stored in COSE_Sign1 is #6.24(bstr(MSO)) per ISO 18013-5 §9.1.2.4.
+            // The Sig_Structure signs over the payload AS STORED, i.e. the tagged bytes.
+            CBORObject taggedPayload = CBORObject.FromObjectAndTag(
+                    CBORObject.FromObject(msoBytes), 24);
+            byte[] payloadBytes = taggedPayload.EncodeToBytes();
+
             // Sig_Structure = ["Signature1", bstr(protected), bstr(external_aad=""), bstr(payload)]
             CBORObject sigStructure = CBORObject.NewArray();
             sigStructure.Add(CBORObject.FromObject("Signature1"));
             sigStructure.Add(CBORObject.FromObject(protectedBytes));
             sigStructure.Add(CBORObject.FromObject(new byte[0])); // empty external_aad
-            sigStructure.Add(CBORObject.FromObject(msoBytes));
+            sigStructure.Add(CBORObject.FromObject(payloadBytes));
 
             byte[] toBeSigned = sigStructure.EncodeToBytes();
 
@@ -754,8 +1057,11 @@ public class AliroAccessDocument
             CBORObject firstDoc = docs.get(0);
             CBORObject iSigned  = firstDoc.get(CBORObject.FromObject("1"));
             CBORObject iAuth    = iSigned.get(CBORObject.FromObject("2"));
-            // IssuerAuth[2] = payload (MobileSecurityObject bytes)
-            byte[] msoBytes     = iAuth.get(2).GetByteString();
+            // IssuerAuth[2] = payload bytes. Decode to get #6.24(bstr(MSO)).
+            byte[] payloadBytes = iAuth.get(2).GetByteString();
+            CBORObject tagged   = CBORObject.DecodeFromBytes(payloadBytes);
+            // Unwrap tag 24 to get raw MSO bytes, then decode MSO
+            byte[] msoBytes     = tagged.GetByteString();
             CBORObject mso      = CBORObject.DecodeFromBytes(msoBytes);
             CBORObject validity = mso.get(CBORObject.FromObject("6"));
             CBORObject until    = validity.get(CBORObject.FromObject("3"));

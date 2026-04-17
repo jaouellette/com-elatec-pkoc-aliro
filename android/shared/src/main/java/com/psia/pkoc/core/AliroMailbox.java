@@ -53,8 +53,10 @@ public class AliroMailbox
     /** Entry type: Door Status */
     public static final int TYPE_DOOR_STATUS   = 0x02;
 
-    /** Total mailbox buffer size in bytes */
-    public static final int MAILBOX_SIZE       = 256;
+    /** Total mailbox buffer size in bytes.
+     *  300 bytes to accommodate certification harness read patterns
+     *  (reads at offset+len up to 300). */
+    public static final int MAILBOX_SIZE       = 300;
 
     // =========================================================================
     // Public API

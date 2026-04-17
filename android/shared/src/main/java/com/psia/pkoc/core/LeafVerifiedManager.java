@@ -89,7 +89,15 @@ public final class LeafVerifiedManager
     };
 
     /** Certificate EF file identifier — 00 01 */
-    public static final byte[] LEAF_CERT_FILE_ID = { 0x00, 0x01 };
+    /**
+     * LEAF certificate EF file identifiers.
+     * Different LEAF cards use different ISO file IDs depending on silicon type:
+     *   - MIFARE DUOX (DESFire-based): ISO File ID 0x03E1 → SELECT EF bytes {E1, 03}
+     *   - Pure ISO 7816-4 cards: EF 0001 → SELECT EF bytes {00, 01}
+     * The reader tries each in order until one succeeds.
+     */
+    public static final byte[] LEAF_CERT_FILE_ID = { (byte)0xE1, 0x03 };
+    public static final byte[] LEAF_CERT_FILE_ID_ALT = { 0x00, 0x01 };
 
     /** SharedPreferences file name for all LEAF data (avoids Aliro namespace collisions). */
     public static final String PREFS_NAME = "LeafVerified";

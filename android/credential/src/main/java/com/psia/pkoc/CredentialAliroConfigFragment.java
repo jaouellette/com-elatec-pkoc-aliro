@@ -65,6 +65,12 @@ public class CredentialAliroConfigFragment extends Fragment
     private Button      btnExportReaderConfig;
     private Button      btnClearProvisioning;
 
+    // Test Harness section views
+    private EditText    editTestHarnessGroupId;
+    private EditText    editTestHarnessIssuerCa;
+    private EditText    editTestHarnessReaderPubKey;
+    private Button      btnApplyTestHarness;
+
     private TextView    txtDocumentStatus;
     private Button      btnGenerateTest;
     private Button      btnLoadSampleDoc;
@@ -150,6 +156,17 @@ public class CredentialAliroConfigFragment extends Fragment
                 AliroProvisioningManager.setStrictMode(requireContext(), checked));
         btnExportReaderConfig.setOnClickListener(v -> exportReaderConfig());
         btnClearProvisioning.setOnClickListener(v -> confirmClearProvisioning());
+
+        // Test Harness section
+        editTestHarnessGroupId      = view.findViewById(R.id.editTestHarnessGroupId);
+        editTestHarnessIssuerCa     = view.findViewById(R.id.editTestHarnessIssuerCa);
+        editTestHarnessReaderPubKey = view.findViewById(R.id.editTestHarnessReaderPubKey);
+        btnApplyTestHarness         = view.findViewById(R.id.btnApplyTestHarness);
+
+        // Pre-populate with current values if set
+        loadTestHarnessFields();
+
+        btnApplyTestHarness.setOnClickListener(v -> applyTestHarnessConfig());
 
         btnGenerateTest.setOnClickListener(v -> generateTestDocument());
         btnLoadSampleDoc.setOnClickListener(v -> loadSampleDocument());
@@ -292,6 +309,89 @@ public class CredentialAliroConfigFragment extends Fragment
                 })
                 .setNegativeButton("Cancel", null)
                 .show();
+    }
+
+    // -------------------------------------------------------------------------
+    // Test Harness Configuration
+    // -------------------------------------------------------------------------
+
+    private static final String DEFAULT_TH_GROUP_ID   = "00113344667799AA00113344667799AA";
+    private static final String DEFAULT_TH_ISSUER_CA   = "043928f322019d4757893bde6a0fe5e13e3e537b9ca0f549c0bd2f40f79060252a0a4f291192157a95cb6eb202759428c00cd834998c5d0eab192ee8873c5d34ee";
+    private static final String DEFAULT_TH_READER_PUB  = "043928f322019d4757893bde6a0fe5e13e3e537b9ca0f549c0bd2f40f79060252a0a4f291192157a95cb6eb202759428c00cd834998c5d0eab192ee8873c5d34ee";
+
+    private void loadTestHarnessFields()
+    {
+        if (!isAdded()) return;
+        String groupId = AliroProvisioningManager.getAuthorizedReaderGroupIdHex(requireContext());
+        String issuerCa = AliroProvisioningManager.getIssuerCAPubKeyHex(requireContext());
+        String readerPub = AliroProvisioningManager.getTestHarnessReaderPubKeyHex(requireContext());
+
+        // Use defaults if nothing is stored
+        if (groupId == null || groupId.isEmpty()) groupId = DEFAULT_TH_GROUP_ID;
+        if (issuerCa == null || issuerCa.isEmpty()) issuerCa = DEFAULT_TH_ISSUER_CA;
+        if (readerPub == null || readerPub.isEmpty()) readerPub = DEFAULT_TH_READER_PUB;
+
+        if (editTestHarnessGroupId != null) editTestHarnessGroupId.setText(groupId);
+        if (editTestHarnessIssuerCa != null) editTestHarnessIssuerCa.setText(issuerCa);
+        if (editTestHarnessReaderPubKey != null) editTestHarnessReaderPubKey.setText(readerPub);
+    }
+
+    private void applyTestHarnessConfig()
+    {
+        String groupIdHex = editTestHarnessGroupId.getText().toString()
+                .trim().replaceAll("\\s+", "").replaceAll("[^0-9a-fA-F]", "").toLowerCase(java.util.Locale.US);
+        String issuerCaHex = editTestHarnessIssuerCa.getText().toString()
+                .trim().replaceAll("\\s+", "").replaceAll("[^0-9a-fA-F]", "").toLowerCase(java.util.Locale.US);
+
+        boolean hasGroup = !groupIdHex.isEmpty();
+        boolean hasIssuer = !issuerCaHex.isEmpty();
+
+        String readerPubHex = editTestHarnessReaderPubKey.getText().toString()
+                .trim().replaceAll("\\s+", "").replaceAll("[^0-9a-fA-F]", "").toLowerCase(java.util.Locale.US);
+        boolean hasReaderPub = !readerPubHex.isEmpty();
+
+        if (hasGroup && groupIdHex.length() != 32)
+        {
+            showStatus("Reader Group ID must be exactly 32 hex characters (16 bytes).", false);
+            return;
+        }
+        if (hasIssuer && issuerCaHex.length() != 130)
+        {
+            showStatus("Issuer CA must be exactly 130 hex characters (65 bytes).", false);
+            return;
+        }
+        if (hasIssuer && !issuerCaHex.startsWith("04"))
+        {
+            showStatus("Issuer CA must start with 04 (uncompressed EC point).", false);
+            return;
+        }
+        if (hasReaderPub && readerPubHex.length() != 130)
+        {
+            showStatus("Reader Public Key must be exactly 130 hex characters (65 bytes).", false);
+            return;
+        }
+        if (hasReaderPub && !readerPubHex.startsWith("04"))
+        {
+            showStatus("Reader Public Key must start with 04 (uncompressed EC point).", false);
+            return;
+        }
+
+        if (hasGroup)
+            AliroProvisioningManager.setAuthorizedReaderGroupId(requireContext(), groupIdHex);
+        if (hasIssuer)
+            AliroProvisioningManager.setIssuerCAPubKey(requireContext(), issuerCaHex);
+        if (hasReaderPub)
+            AliroProvisioningManager.setTestHarnessReaderPubKey(requireContext(), readerPubHex);
+
+        // Do NOT enable strict mode for test harness — leave it unchecked
+
+        StringBuilder msg = new StringBuilder("\u2713 Test Harness config applied.");
+        if (hasGroup)  msg.append("\nGroup ID: ").append(groupIdHex.substring(0, 8)).append("...");
+        if (hasIssuer) msg.append("\nIssuer CA: ").append(issuerCaHex.substring(0, 8)).append("...");
+        if (hasReaderPub) msg.append("\nReader Key: ").append(readerPubHex.substring(0, 8)).append("...");
+
+        showStatus(msg.toString(), true);
+        refreshProvisioningStatus();
     }
 
     // -------------------------------------------------------------------------

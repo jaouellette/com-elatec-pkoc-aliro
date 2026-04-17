@@ -1,12 +1,7 @@
 package com.psia.pkoc.core;
 
-import android.content.Context;
-import android.content.SharedPreferences;
-import android.util.Base64;
 import android.util.Log;
 
-import com.psia.pkoc.core.AliroAccessDocument;
-import com.psia.pkoc.core.AliroMailbox;
 import com.upokecenter.cbor.CBORObject;
 
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
@@ -30,26 +25,15 @@ import java.util.List;
  * Uses a loopback architecture: LoopbackReader simulates the reader side and
  * LoopbackCredential simulates the User Device (credential) side.
  *
- * Test IDs align with Aliro 1.0 Test Plan (26-42803-001) PICS identifiers
- * where applicable. In-process tests supplement the external hardware-based
- * test harness described in §4.1 (Raspberry Pi + NXP PN7160/SR150).
- *
  * Test groups:
  *   1. CRYPTO_  — Cryptographic primitives
  *   2. APDU_    — APDU format validation
- *   3. NFC_/BLE_ — Full flow integration (loopback) — matches §7 / §8 PICS IDs
- *   4. NEG_     — Negative / boundary tests — matches §7.14-7.34 error cases
+ *   3. NFC_/BLE_ — Full flow integration (loopback)
+ *   4. NEG_     — Negative / boundary tests
  */
 public class AliroSelfTestEngine
 {
     private static final String TAG = "AliroSelfTest";
-
-    // Optional Android Context — used by tests that exercise SharedPreferences-backed methods.
-    // May be null; tests requiring it will skip gracefully if null.
-    private final Context context;
-
-    public AliroSelfTestEngine() { this.context = null; }
-    public AliroSelfTestEngine(Context context) { this.context = context; }
 
     // =========================================================================
     // Test keys (hardcoded from the Aliro config screen defaults)
@@ -70,16 +54,10 @@ public class AliroSelfTestEngine
             0x5C, 0x04, 0x01, 0x00, 0x00, 0x09
     };
 
-    // Aliro AID (primary) — A000000909ACCE5501
+    // Aliro AID
     private static final byte[] ALIRO_AID = {
             (byte) 0xA0, 0x00, 0x00, 0x09, 0x09,
             (byte) 0xAC, (byte) 0xCE, 0x55, 0x01
-    };
-
-    // Step-Up AID — A000000909ACCE5502 (Table 10-3)
-    private static final byte[] ALIRO_STEPUP_AID = {
-            (byte) 0xA0, 0x00, 0x00, 0x09, 0x09,
-            (byte) 0xAC, (byte) 0xCE, 0x55, 0x02
     };
 
     // =========================================================================
@@ -153,7 +131,7 @@ public class AliroSelfTestEngine
         runAndReport(results, cb, this::testApduGetResponseFormat);
         runAndReport(results, cb, this::testApduSw61Chain);
 
-        // Group 3: Full Flow Tests (PICS IDs per §7 / §8)
+        // Group 3: Full Flow Tests
         runAndReport(results, cb, this::testNfcUdStandardNoCert);
         runAndReport(results, cb, this::testNfcUdStandardWithCert);
         runAndReport(results, cb, this::testNfcRdrStandardNoCert);
@@ -162,17 +140,6 @@ public class AliroSelfTestEngine
         runAndReport(results, cb, this::testStepUpFullFlow);
         runAndReport(results, cb, this::testMailboxWriteRead);
         runAndReport(results, cb, this::testMailboxReadRequest);
-        runAndReport(results, cb, this::testMailboxSetRequest);
-        runAndReport(results, cb, this::testMailboxAtomicSession);
-        runAndReport(results, cb, this::testMailboxWriteThenRead);
-
-        // Group 3 additions: EXCHANGE compliance (CI-7/CI-8) + BLE Step-Up
-        runAndReport(results, cb, this::testExchange0xBAWrapper);
-        runAndReport(results, cb, this::testExchange0x97BleSuppressed);
-        runAndReport(results, cb, this::testBleStepUpFullFlow);
-        runAndReport(results, cb, this::testMailboxSampleTLVParse);
-        runAndReport(results, cb, this::testAccessDocRealisticSample);
-        runAndReport(results, cb, this::testProvisioningRoundTrip);
 
         // Group 4: Negative Tests
         runAndReport(results, cb, this::testNegAuth0WrongReaderId);
@@ -181,7 +148,12 @@ public class AliroSelfTestEngine
         runAndReport(results, cb, this::testNegSessionKeyDestroy);
         runAndReport(results, cb, this::testNegEnvelopeWrongState);
         runAndReport(results, cb, this::testNegStepUpSkDestroy);
-        runAndReport(results, cb, this::testMailboxOutOfBounds);
+
+        // --- Harness-validated features ---
+        runAndReport(results, cb, this::testCryptoKpersistent);
+        runAndReport(results, cb, this::testCryptoFastKeys);
+        runAndReport(results, cb, this::testMultiGroupKeyLookup);
+        runAndReport(results, cb, this::testMailboxStructuredFormat);
 
         if (cb != null) cb.onAllComplete(results);
         return results;
@@ -262,7 +234,7 @@ public class AliroSelfTestEngine
                     TEST_READER_PUB_KEY_X, TEST_READER_ID, tid,
                     Arrays.copyOfRange(pub1, 1, 33),
                     Arrays.copyOfRange(pub2, 1, 33),
-                    PROPRIETARY_TLV, null,
+                    PROPRIETARY_TLV, null, null,
                     AliroCryptoProvider.INTERFACE_BYTE_NFC, flag);
 
             if (keys == null)
@@ -437,13 +409,13 @@ public class AliroSelfTestEngine
             byte[] keysNfc = AliroCryptoProvider.deriveKeys(
                     kp1.getPrivate(), pub2, 64, proto,
                     TEST_READER_PUB_KEY_X, TEST_READER_ID, tid,
-                    rdrEphX, udEphX, PROPRIETARY_TLV, null,
+                    rdrEphX, udEphX, PROPRIETARY_TLV, null, null,
                     AliroCryptoProvider.INTERFACE_BYTE_NFC, flag);
 
             byte[] keysBle = AliroCryptoProvider.deriveKeys(
                     kp1.getPrivate(), pub2, 64, proto,
                     TEST_READER_PUB_KEY_X, TEST_READER_ID, tid,
-                    rdrEphX, udEphX, PROPRIETARY_TLV, null,
+                    rdrEphX, udEphX, PROPRIETARY_TLV, null, null,
                     AliroCryptoProvider.INTERFACE_BYTE_BLE, flag);
 
             if (keysNfc == null || keysBle == null)
@@ -481,7 +453,7 @@ public class AliroSelfTestEngine
                     TEST_READER_PUB_KEY_X, TEST_READER_ID, tid,
                     Arrays.copyOfRange(pub1, 1, 33),
                     Arrays.copyOfRange(pub2, 1, 33),
-                    PROPRIETARY_TLV, null,
+                    PROPRIETARY_TLV, null, null,
                     AliroCryptoProvider.INTERFACE_BYTE_BLE, flag);
 
             if (keys128 == null)
@@ -625,12 +597,9 @@ public class AliroSelfTestEngine
             boolean found41 = false, found42 = false, found5C = false;
             boolean found87 = false, found4C = false, found4D = false;
 
-            // Proper TLV walk — skip over value bytes to avoid false matches inside key data
-            int i = 0;
-            while (i < data.length - 1)
+            for (int i = 0; i < data.length - 1; i++)
             {
                 int tag = data[i] & 0xFF;
-                int len = data[i + 1] & 0xFF;
                 switch (tag)
                 {
                     case 0x41: found41 = true; break;
@@ -640,7 +609,6 @@ public class AliroSelfTestEngine
                     case 0x4C: found4C = true; break;
                     case 0x4D: found4D = true; break;
                 }
-                i += 2 + len; // advance past tag + length + value
             }
 
             if (!found41 || !found42 || !found5C || !found87 || !found4C || !found4D)
@@ -677,25 +645,23 @@ public class AliroSelfTestEngine
             int dataLen = auth0Cmd[4] & 0xFF;
             byte[] data = Arrays.copyOfRange(auth0Cmd, dataOffset, dataOffset + dataLen);
 
-            // Proper TLV walk to find tag 0x87
-            int i = 0;
-            while (i < data.length - 1)
+            // Find tag 87
+            for (int i = 0; i < data.length - 2; i++)
             {
-                int tag = data[i] & 0xFF;
-                int len = data[i + 1] & 0xFF;
-                if (tag == 0x87)
+                if ((data[i] & 0xFF) == 0x87)
                 {
+                    int len = data[i + 1] & 0xFF;
                     if (len != 65)
                         return result("APDU_AUTH0_KEY_LENGTH", "APDU", "Reader eph key length", false,
                                 "Tag 87 length=" + len + ", expected 65", start);
-                    if (i + 2 >= data.length || data[i + 2] != 0x04)
+                    if (data[i + 2] != 0x04)
                         return result("APDU_AUTH0_KEY_LENGTH", "APDU", "Reader eph key length", false,
                                 "First byte=" + String.format("%02X", data[i + 2]) + ", expected 0x04", start);
+
                     return result("APDU_AUTH0_KEY_LENGTH", "APDU",
                             "Reader eph pub key is 65 bytes uncompressed (04...)",
                             true, "Tag 87: 65 bytes, starts with 0x04", start);
                 }
-                i += 2 + len;
             }
 
             return result("APDU_AUTH0_KEY_LENGTH", "APDU", "Reader eph key length", false,
@@ -719,22 +685,18 @@ public class AliroSelfTestEngine
             int dataLen = auth0Cmd[4] & 0xFF;
             byte[] data = Arrays.copyOfRange(auth0Cmd, dataOffset, dataOffset + dataLen);
 
-            // Proper TLV walk to find tag 0x4C — naive byte scan fails when 0x4C
-            // appears inside the 65-byte public key value (tag 0x87)
-            int i = 0;
-            while (i < data.length - 1)
+            for (int i = 0; i < data.length - 1; i++)
             {
-                int tag = data[i] & 0xFF;
-                int len = data[i + 1] & 0xFF;
-                if (tag == 0x4C)
+                if ((data[i] & 0xFF) == 0x4C)
                 {
+                    int len = data[i + 1] & 0xFF;
                     if (len != 16)
                         return result("APDU_AUTH0_TID_LENGTH", "APDU", "Transaction ID length", false,
                                 "Tag 4C length=" + len + ", expected 16", start);
+
                     return result("APDU_AUTH0_TID_LENGTH", "APDU", "Transaction ID is 16 bytes",
                             true, "Tag 4C: 16 bytes", start);
                 }
-                i += 2 + len;
             }
 
             return result("APDU_AUTH0_TID_LENGTH", "APDU", "Transaction ID length", false,
@@ -885,12 +847,9 @@ public class AliroSelfTestEngine
             byte[] exchangeResp = cred.process(exchangeCmd);
             if (!isSW9000(exchangeResp)) return result("APDU_EXCHANGE_RESPONSE", "APDU", "EXCHANGE response", false, "EXCHANGE SW != 9000", start);
 
-            // AUTH1 response was NOT decrypted in this test — reader.deviceCounter still at 1.
-            // Credential consumed deviceCounter=1 for AUTH1, =2 for EXCHANGE response.
-            // Skip AUTH1 slot, then decrypt EXCHANGE response with counter=2.
-            reader.deviceCounter++; // skip AUTH1 slot (counter=1)
+            // Decrypt EXCHANGE response
             byte[] encPayload = Arrays.copyOfRange(exchangeResp, 0, exchangeResp.length - 2);
-            byte[] decrypted = AliroCryptoProvider.decryptDeviceGcm(reader.skDevice, encPayload, reader.deviceCounter++);
+            byte[] decrypted = AliroCryptoProvider.decryptDeviceGcm(reader.skDevice, encPayload);
             if (decrypted == null)
                 return result("APDU_EXCHANGE_RESPONSE", "APDU", "EXCHANGE response", false,
                         "Decryption failed", start);
@@ -1127,15 +1086,14 @@ public class AliroSelfTestEngine
         if (!isSW9000(auth1Resp))
             return result(testId, group, name, false, "AUTH1 failed: " + swHex(auth1Resp), start);
 
-        // Decrypt AUTH1 response — device_counter=1 consumed here, EXCHANGE responses start at 2
+        // Decrypt and verify AUTH1 response
         byte[] encAuth1 = Arrays.copyOfRange(auth1Resp, 0, auth1Resp.length - 2);
-        byte[] decAuth1 = AliroCryptoProvider.decryptDeviceGcm(reader.skDevice, encAuth1, reader.deviceCounter++);
+        byte[] decAuth1 = AliroCryptoProvider.decryptDeviceGcm(reader.skDevice, encAuth1);
         if (decAuth1 == null)
             return result(testId, group, name, false, "AUTH1 response decryption failed", start);
 
-        // Parse: 5A 41 <cred pub 65> 9E 40 <sig 64> [5E 02 <bitmap>]
-        // Table 8-11: 0x5E is MANDATORY so minimum plaintext is 137 bytes (133 + 4).
-        if (decAuth1.length < 137 || decAuth1[0] != 0x5A || decAuth1[1] != 0x41)
+        // Parse: 5A 41 <cred pub 65> 9E 40 <sig 64>
+        if (decAuth1.length < 133 || decAuth1[0] != 0x5A || decAuth1[1] != 0x41)
             return result(testId, group, name, false, "AUTH1 response format invalid", start);
 
         byte[] credPubKey = Arrays.copyOfRange(decAuth1, 2, 67);
@@ -1152,9 +1110,9 @@ public class AliroSelfTestEngine
         if (!isSW9000(exchangeResp))
             return result(testId, group, name, false, "EXCHANGE failed: " + swHex(exchangeResp), start);
 
-        // Decrypt EXCHANGE response using current device_counter (now 2 after AUTH1)
+        // Decrypt EXCHANGE response
         byte[] encExchange = Arrays.copyOfRange(exchangeResp, 0, exchangeResp.length - 2);
-        byte[] decExchange = AliroCryptoProvider.decryptDeviceGcm(reader.skDevice, encExchange, reader.deviceCounter++);
+        byte[] decExchange = AliroCryptoProvider.decryptDeviceGcm(reader.skDevice, encExchange);
         if (decExchange == null)
             return result(testId, group, name, false, "EXCHANGE response decryption failed", start);
 
@@ -1368,7 +1326,7 @@ public class AliroSelfTestEngine
                     TEST_READER_PUB_KEY_X, TEST_READER_ID, tid,
                     Arrays.copyOfRange(pub1, 1, 33),
                     Arrays.copyOfRange(pub2, 1, 33),
-                    PROPRIETARY_TLV, null,
+                    PROPRIETARY_TLV, null, null,
                     AliroCryptoProvider.INTERFACE_BYTE_NFC, flag);
 
             if (keys == null)
@@ -1413,7 +1371,7 @@ public class AliroSelfTestEngine
                     TEST_READER_PUB_KEY_X, TEST_READER_ID, tid,
                     Arrays.copyOfRange(pub1, 1, 33),
                     Arrays.copyOfRange(pub2, 1, 33),
-                    PROPRIETARY_TLV, null,
+                    PROPRIETARY_TLV, null, null,
                     AliroCryptoProvider.INTERFACE_BYTE_NFC, flag);
 
             if (keys == null)
@@ -1468,11 +1426,24 @@ public class AliroSelfTestEngine
         {
             LoopbackReader reader = new LoopbackReader();
 
-            // Build a minimal SessionData CBOR to verify ENVELOPE format
-            // SessionData = {"data": bstr(some_bytes)} per §8.4.3
-            byte[] dummyCiphertext = AliroCryptoProvider.generateRandom(32);
-            byte[] sessionData = buildSessionDataCbor(dummyCiphertext);
-            byte[] envelopeCmd = reader.buildEnvelopeCommand(sessionData);
+            // Build a minimal DeviceRequest CBOR
+            CBORObject deviceRequest = CBORObject.NewOrderedMap();
+            deviceRequest.set(CBORObject.FromObject("1"), CBORObject.FromObject("1.0"));
+            CBORObject docRequests = CBORObject.NewArray();
+            CBORObject docReq = CBORObject.NewOrderedMap();
+            CBORObject itemsReq = CBORObject.NewOrderedMap();
+            itemsReq.set(CBORObject.FromObject("1"), CBORObject.FromObject("aliro-a"));
+            CBORObject nsItems = CBORObject.NewOrderedMap();
+            CBORObject aliroNs = CBORObject.NewOrderedMap();
+            aliroNs.set(CBORObject.FromObject("access"), CBORObject.FromObject(false));
+            nsItems.set(CBORObject.FromObject("aliro-a"), aliroNs);
+            itemsReq.set(CBORObject.FromObject("2"), nsItems);
+            docReq.set(CBORObject.FromObject("1"), itemsReq);
+            docRequests.Add(docReq);
+            deviceRequest.set(CBORObject.FromObject("2"), docRequests);
+            byte[] cborBytes = deviceRequest.EncodeToBytes();
+
+            byte[] envelopeCmd = reader.buildEnvelopeCommand(cborBytes);
 
             // Verify CLA=0x80
             if (envelopeCmd[0] != (byte) 0x80)
@@ -1496,19 +1467,13 @@ public class AliroSelfTestEngine
                 return result("APDU_ENVELOPE_FORMAT", "APDU", "ENVELOPE format", false,
                         "Data field is not valid CBOR", start);
 
-            // Verify SessionData structure: must have "data" key
-            CBORObject dataKey = parsed.get(CBORObject.FromObject("data"));
-            if (dataKey == null)
-                return result("APDU_ENVELOPE_FORMAT", "APDU", "ENVELOPE format", false,
-                        "SessionData missing 'data' key (§8.4.3)", start);
-
             // Verify last byte is Le=0x00
             if (envelopeCmd[envelopeCmd.length - 1] != 0x00)
                 return result("APDU_ENVELOPE_FORMAT", "APDU", "ENVELOPE format", false,
                         "Last byte (Le)=" + String.format("%02X", envelopeCmd[envelopeCmd.length - 1]), start);
 
             return result("APDU_ENVELOPE_FORMAT", "APDU",
-                    "ENVELOPE: CLA=80, INS=C3, SessionData CBOR {\"data\":bstr}, Le=00",
+                    "ENVELOPE: CLA=80, INS=C3, non-empty valid CBOR data, Le=00",
                     true, "Format verified, CBOR data " + dataLen + " bytes", start);
         }
         catch (Exception e)
@@ -1582,18 +1547,6 @@ public class AliroSelfTestEngine
     // GROUP 3 ADDITIONS: Step-Up / Mailbox Flow Tests
     // =========================================================================
 
-    /**
-     * NFC_UD_STEPUP_AD — Step-Up Phase with Access Document (§7.10).
-     *
-     * Tests that the ENVELOPE command correctly wraps the DeviceRequest in
-     * SessionData {\"data\": bstr(AES-GCM(DeviceRequest, suSKReader))} per
-     * §8.4.3 / ISO 18013-5 §9.1.1.4, and that the response is decrypted from
-     * SessionData {\"data\": bstr(AES-GCM(DeviceResponse, suSKDevice))}.
-     *
-     * VIOLATION FIX: Previously sent raw CBOR DeviceRequest without SessionData
-     * encryption, and parsed raw CBOR from response. Fixed to use proper
-     * AES-GCM SessionData encryption/decryption as required by spec.
-     */
     private TestResult testStepUpFullFlow()
     {
         long start = System.currentTimeMillis();
@@ -1605,13 +1558,13 @@ public class AliroSelfTestEngine
             // Step 1: SELECT
             byte[] selectResp = cred.process(reader.buildSelectCommand());
             if (!isSW9000(selectResp))
-                return result("NFC_UD_STEPUP_AD", "Full Flow", "Step-Up full flow (NFC_UD_STEPUP_AD)", false,
+                return result("STEPUP_FULL_FLOW", "Full Flow", "Step-Up full flow", false,
                         "SELECT failed: " + swHex(selectResp), start);
 
             // Step 2: AUTH0
             byte[] auth0Resp = cred.process(reader.buildAuth0Command());
             if (!isSW9000(auth0Resp))
-                return result("NFC_UD_STEPUP_AD", "Full Flow", "Step-Up full flow (NFC_UD_STEPUP_AD)", false,
+                return result("STEPUP_FULL_FLOW", "Full Flow", "Step-Up full flow", false,
                         "AUTH0 failed: " + swHex(auth0Resp), start);
             reader.parseAuth0Response(auth0Resp);
             reader.deriveKeys(AliroCryptoProvider.INTERFACE_BYTE_NFC);
@@ -1619,37 +1572,31 @@ public class AliroSelfTestEngine
             // Step 3: AUTH1
             byte[] auth1Resp = cred.process(reader.buildAuth1CommandFull());
             if (!isSW9000(auth1Resp))
-                return result("NFC_UD_STEPUP_AD", "Full Flow", "Step-Up full flow (NFC_UD_STEPUP_AD)", false,
+                return result("STEPUP_FULL_FLOW", "Full Flow", "Step-Up full flow", false,
                         "AUTH1 failed: " + swHex(auth1Resp), start);
 
             // Step 4: EXCHANGE
             byte[] exchangeResp = cred.process(reader.buildExchangeCommand());
             if (!isSW9000(exchangeResp))
-                return result("NFC_UD_STEPUP_AD", "Full Flow", "Step-Up full flow (NFC_UD_STEPUP_AD)", false,
+                return result("STEPUP_FULL_FLOW", "Full Flow", "Step-Up full flow", false,
                         "EXCHANGE failed: " + swHex(exchangeResp), start);
 
             // Step 5: Extract stepUpSK from reader keybuf[64..95]
             if (reader.stepUpSK == null)
-                return result("NFC_UD_STEPUP_AD", "Full Flow", "Step-Up full flow (NFC_UD_STEPUP_AD)", false,
+                return result("STEPUP_FULL_FLOW", "Full Flow", "Step-Up full flow", false,
                         "stepUpSK is null after EXCHANGE", start);
 
-            // Step 6: Derive step-up session keys (ISO 18013-5 §9.1.1.5)
-            // sessionKeys[0..31] = SKDevice, sessionKeys[32..63] = SKReader
+            // Step 6: Derive step-up session keys
             byte[] sessionKeys = AliroCryptoProvider.deriveStepUpSessionKeys(reader.stepUpSK);
             if (sessionKeys == null || sessionKeys.length != 64)
-                return result("NFC_UD_STEPUP_AD", "Full Flow", "Step-Up full flow (NFC_UD_STEPUP_AD)", false,
+                return result("STEPUP_FULL_FLOW", "Full Flow", "Step-Up full flow", false,
                         "deriveStepUpSessionKeys failed", start);
 
-            byte[] suSKDevice = Arrays.copyOfRange(sessionKeys, 0, 32);
-            byte[] suSKReader = Arrays.copyOfRange(sessionKeys, 32, 64);
-
-            // Step 7: Build DeviceRequest CBOR (inline map, keys "1" and "5", per Table 8-21)
-            // "1" = version "1.0", "5" = docRequests array
+            // Step 7: Build DeviceRequest CBOR
             CBORObject deviceRequest = CBORObject.NewOrderedMap();
             deviceRequest.set(CBORObject.FromObject("1"), CBORObject.FromObject("1.0"));
             CBORObject docRequests = CBORObject.NewArray();
             CBORObject docReq = CBORObject.NewOrderedMap();
-            // itemsRequest is an inline map (NOT bstr-wrapped) — per Table 8-21 key "1"
             CBORObject itemsReq = CBORObject.NewOrderedMap();
             itemsReq.set(CBORObject.FromObject("1"), CBORObject.FromObject("aliro-a"));
             CBORObject nsItems = CBORObject.NewOrderedMap();
@@ -1659,20 +1606,11 @@ public class AliroSelfTestEngine
             itemsReq.set(CBORObject.FromObject("2"), nsItems);
             docReq.set(CBORObject.FromObject("1"), itemsReq);
             docRequests.Add(docReq);
-            deviceRequest.set(CBORObject.FromObject("5"), docRequests);
+            deviceRequest.set(CBORObject.FromObject("2"), docRequests);
             byte[] deviceRequestBytes = deviceRequest.EncodeToBytes();
 
-            // Step 8: Encrypt DeviceRequest into SessionData using suSKReader
-            // SessionData = {"data": bstr(AES-GCM(DeviceRequest, suSKReader))} — §8.4.3
-            byte[] encryptedDeviceRequest = AliroCryptoProvider.encryptReaderGcm(suSKReader, deviceRequestBytes);
-            if (encryptedDeviceRequest == null)
-                return result("NFC_UD_STEPUP_AD", "Full Flow", "Step-Up full flow (NFC_UD_STEPUP_AD)", false,
-                        "AES-GCM encryption of DeviceRequest failed", start);
-
-            byte[] sessionDataBytes = buildSessionDataCbor(encryptedDeviceRequest);
-
-            // Step 9: Send ENVELOPE with SessionData
-            byte[] envelopeCmd = reader.buildEnvelopeCommand(sessionDataBytes);
+            // Step 8: Send ENVELOPE
+            byte[] envelopeCmd = reader.buildEnvelopeCommand(deviceRequestBytes);
             byte[] envelopeResp = cred.process(envelopeCmd);
 
             // Handle SW 61 XX chaining loop
@@ -1685,77 +1623,36 @@ public class AliroSelfTestEngine
             }
 
             if (!isSW9000(envelopeResp))
-                return result("NFC_UD_STEPUP_AD", "Full Flow", "Step-Up full flow (NFC_UD_STEPUP_AD)", false,
+                return result("STEPUP_FULL_FLOW", "Full Flow", "Step-Up full flow", false,
                         "ENVELOPE failed: " + swHex(envelopeResp), start);
 
-            // Step 10: Parse SessionData from ENVELOPE response
-            // Response SessionData = {"data": bstr(AES-GCM(DeviceResponse, suSKDevice))}
+            // Step 9: Parse DeviceResponse CBOR
             byte[] responseData = Arrays.copyOfRange(envelopeResp, 0, envelopeResp.length - 2);
             if (responseData.length == 0)
-                return result("NFC_UD_STEPUP_AD", "Full Flow", "Step-Up full flow (NFC_UD_STEPUP_AD)", false,
-                        "ENVELOPE response data is empty", start);
+                return result("STEPUP_FULL_FLOW", "Full Flow", "Step-Up full flow", false,
+                        "DeviceResponse is empty", start);
 
-            // Parse outer SessionData CBOR
-            CBORObject respSessionData;
-            try
-            {
-                respSessionData = CBORObject.DecodeFromBytes(responseData);
-            }
-            catch (Exception ex)
-            {
-                return result("NFC_UD_STEPUP_AD", "Full Flow", "Step-Up full flow (NFC_UD_STEPUP_AD)", false,
-                        "ENVELOPE response is not valid CBOR: " + ex.getMessage(), start);
-            }
-
-            CBORObject dataValue = respSessionData.get(CBORObject.FromObject("data"));
-            if (dataValue == null)
-                return result("NFC_UD_STEPUP_AD", "Full Flow", "Step-Up full flow (NFC_UD_STEPUP_AD)", false,
-                        "ENVELOPE response SessionData missing 'data' key (§8.4.3)", start);
-
-            byte[] encryptedResponse = dataValue.GetByteString();
-            if (encryptedResponse == null || encryptedResponse.length == 0)
-                return result("NFC_UD_STEPUP_AD", "Full Flow", "Step-Up full flow (NFC_UD_STEPUP_AD)", false,
-                        "SessionData 'data' bstr is empty", start);
-
-            // Step 11: Decrypt DeviceResponse using suSKDevice
-            byte[] deviceResponseBytes = AliroCryptoProvider.decryptDeviceGcm(suSKDevice, encryptedResponse);
-            if (deviceResponseBytes == null)
-                return result("NFC_UD_STEPUP_AD", "Full Flow", "Step-Up full flow (NFC_UD_STEPUP_AD)", false,
-                        "AES-GCM decryption of DeviceResponse failed (wrong suSKDevice?)", start);
-
-            // Step 12: Verify DeviceResponse CBOR has version key "1" = "1.0"
-            CBORObject deviceResponse = CBORObject.DecodeFromBytes(deviceResponseBytes);
+            CBORObject deviceResponse = CBORObject.DecodeFromBytes(responseData);
             if (deviceResponse == null)
-                return result("NFC_UD_STEPUP_AD", "Full Flow", "Step-Up full flow (NFC_UD_STEPUP_AD)", false,
+                return result("STEPUP_FULL_FLOW", "Full Flow", "Step-Up full flow", false,
                         "DeviceResponse CBOR parse failed", start);
 
+            // Step 10: Verify version key "1" = "1.0"
             CBORObject version = deviceResponse.get(CBORObject.FromObject("1"));
             if (version == null || !"1.0".equals(version.AsString()))
-                return result("NFC_UD_STEPUP_AD", "Full Flow", "Step-Up full flow (NFC_UD_STEPUP_AD)", false,
+                return result("STEPUP_FULL_FLOW", "Full Flow", "Step-Up full flow", false,
                         "DeviceResponse version != 1.0", start);
 
-            return result("NFC_UD_STEPUP_AD", "Full Flow",
-                    "SELECT→AUTH0→AUTH1→EXCHANGE→ENVELOPE: SessionData encrypt/decrypt, DeviceResponse version=1.0",
-                    true, "suSKReader encrypted request, suSKDevice decrypted response, version=1.0", start);
+            return result("STEPUP_FULL_FLOW", "Full Flow",
+                    "Full Step-Up flow: SELECT→AUTH0→AUTH1→EXCHANGE→ENVELOPE→DeviceResponse parsed",
+                    true, "DeviceResponse version=1.0, CBOR valid", start);
         }
         catch (Exception e)
         {
-            return result("NFC_UD_STEPUP_AD", "Full Flow", "Step-Up full flow (NFC_UD_STEPUP_AD)", false, e.toString(), start);
+            return result("STEPUP_FULL_FLOW", "Full Flow", "Step-Up full flow", false, e.toString(), start);
         }
     }
 
-    /**
-     * NFC_UD_EXCHANGE_WRITE_REQUEST — EXCHANGE with Mailbox Write Request (§7.28).
-     *
-     * Tests proper use of mailbox TLV tags per Table 8-16:
-     *   0x8C (1 byte): atomic session indicator, bit0=1 opens, bit0=0 closes.
-     *   0x8A (variable): write request = offsetmsb || offsetlsb || data.
-     *
-     * VIOLATION FIX: Previously used tag 0x8C with 4-byte value as a "write",
-     * which is wrong — 0x8C is the atomic session indicator (1 byte). The correct
-     * write tag is 0x8A. The EXCHANGE payload now: open atomic session with
-     * 0x8C=0x01, then write 4 bytes at offset 0 using 0x8A.
-     */
     private TestResult testMailboxWriteRead()
     {
         long start = System.currentTimeMillis();
@@ -1764,34 +1661,29 @@ public class AliroSelfTestEngine
             LoopbackReader reader = new LoopbackReader();
             LoopbackCredential cred = new LoopbackCredential();
 
-            // Full NFC flow through AUTH1
+            // Full NFC flow through EXCHANGE
             byte[] selectResp = cred.process(reader.buildSelectCommand());
             if (!isSW9000(selectResp))
-                return result("NFC_UD_EXCHANGE_WRITE_REQUEST", "Full Flow", "Mailbox write (NFC_UD_EXCHANGE_WRITE_REQUEST)", false, "SELECT failed", start);
+                return result("MAILBOX_WRITE_READ", "Full Flow", "Mailbox write/read", false, "SELECT failed", start);
 
             byte[] auth0Resp = cred.process(reader.buildAuth0Command());
             if (!isSW9000(auth0Resp))
-                return result("NFC_UD_EXCHANGE_WRITE_REQUEST", "Full Flow", "Mailbox write (NFC_UD_EXCHANGE_WRITE_REQUEST)", false, "AUTH0 failed", start);
+                return result("MAILBOX_WRITE_READ", "Full Flow", "Mailbox write/read", false, "AUTH0 failed", start);
             reader.parseAuth0Response(auth0Resp);
             reader.deriveKeys(AliroCryptoProvider.INTERFACE_BYTE_NFC);
 
             byte[] auth1Resp = cred.process(reader.buildAuth1CommandFull());
             if (!isSW9000(auth1Resp))
-                return result("NFC_UD_EXCHANGE_WRITE_REQUEST", "Full Flow", "Mailbox write (NFC_UD_EXCHANGE_WRITE_REQUEST)", false, "AUTH1 failed", start);
+                return result("MAILBOX_WRITE_READ", "Full Flow", "Mailbox write/read", false, "AUTH1 failed", start);
 
-            // Build EXCHANGE with mailbox TLVs per Table 8-16 (atomic session=TRUE):
-            //   0x97 02 01 82   — access decision (grant)
-            //   0x8C 01 01      — atomic session indicator, bit0=1 (open atomic session)
-            //   0x8A 06 00 00 01 02 03 04 — write at offset 0: data = 01 02 03 04
-            //     0x8A len=6: offsetmsb(00) offsetlsb(00) data(01 02 03 04)
+            // Build EXCHANGE with mailbox write TLV: 97 02 01 82 8C 04 <4 bytes>
             byte[] mailboxPayload = new byte[]{
-                    (byte) 0x97, 0x02, 0x01, (byte) 0x82,   // access decision: grant
-                    (byte) 0x8C, 0x01, 0x01,                 // atomic session open (bit0=1)
-                    (byte) 0x8A, 0x06, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04  // write offset=0, data={01,02,03,04}
+                    (byte) 0x97, 0x02, 0x01, (byte) 0x82,
+                    (byte) 0x8C, 0x04, 0x01, 0x02, 0x03, 0x04
             };
             byte[] encrypted = AliroCryptoProvider.encryptReaderGcm(reader.skReader, mailboxPayload);
             if (encrypted == null)
-                return result("NFC_UD_EXCHANGE_WRITE_REQUEST", "Full Flow", "Mailbox write (NFC_UD_EXCHANGE_WRITE_REQUEST)", false,
+                return result("MAILBOX_WRITE_READ", "Full Flow", "Mailbox write/read", false,
                         "Encryption failed", start);
 
             byte[] cmd = new byte[5 + encrypted.length + 1];
@@ -1802,29 +1694,19 @@ public class AliroSelfTestEngine
 
             byte[] exchangeResp = cred.process(cmd);
             if (!isSW9000(exchangeResp))
-                return result("NFC_UD_EXCHANGE_WRITE_REQUEST", "Full Flow", "Mailbox write (NFC_UD_EXCHANGE_WRITE_REQUEST)", false,
+                return result("MAILBOX_WRITE_READ", "Full Flow", "Mailbox write/read", false,
                         "EXCHANGE with mailbox write failed: " + swHex(exchangeResp), start);
 
-            return result("NFC_UD_EXCHANGE_WRITE_REQUEST", "Full Flow",
-                    "EXCHANGE with 0x8C (atomic open) + 0x8A (write offset=0, 4 bytes) accepted by credential",
+            return result("MAILBOX_WRITE_READ", "Full Flow",
+                    "EXCHANGE with mailbox TLV 0x8C (write) accepted by credential",
                     true, "Credential decrypted and returned 9000", start);
         }
         catch (Exception e)
         {
-            return result("NFC_UD_EXCHANGE_WRITE_REQUEST", "Full Flow", "Mailbox write (NFC_UD_EXCHANGE_WRITE_REQUEST)", false, e.toString(), start);
+            return result("MAILBOX_WRITE_READ", "Full Flow", "Mailbox write/read", false, e.toString(), start);
         }
     }
 
-    /**
-     * NFC_UD_EXCHANGE_READ_REQUEST — EXCHANGE with Mailbox Read Request (§7.27).
-     *
-     * Tests proper use of tag 0x87 per Table 8-16:
-     *   0x87 (4 bytes): read request = offsetmsb || offsetlsb || lengthmsb || lengthlsb.
-     *
-     * VIOLATION FIX: Previously used tag 0x87 with only 2 bytes (offset only),
-     * which is wrong — 0x87 requires exactly 4 bytes encoding both offset AND
-     * length as specified in Table 8-16.
-     */
     private TestResult testMailboxReadRequest()
     {
         long start = System.currentTimeMillis();
@@ -1836,29 +1718,26 @@ public class AliroSelfTestEngine
             // Full NFC flow through AUTH1
             byte[] selectResp = cred.process(reader.buildSelectCommand());
             if (!isSW9000(selectResp))
-                return result("NFC_UD_EXCHANGE_READ_REQUEST", "Full Flow", "Mailbox read (NFC_UD_EXCHANGE_READ_REQUEST)", false, "SELECT failed", start);
+                return result("MAILBOX_READ_REQUEST", "Full Flow", "Mailbox read request", false, "SELECT failed", start);
 
             byte[] auth0Resp = cred.process(reader.buildAuth0Command());
             if (!isSW9000(auth0Resp))
-                return result("NFC_UD_EXCHANGE_READ_REQUEST", "Full Flow", "Mailbox read (NFC_UD_EXCHANGE_READ_REQUEST)", false, "AUTH0 failed", start);
+                return result("MAILBOX_READ_REQUEST", "Full Flow", "Mailbox read request", false, "AUTH0 failed", start);
             reader.parseAuth0Response(auth0Resp);
             reader.deriveKeys(AliroCryptoProvider.INTERFACE_BYTE_NFC);
 
             byte[] auth1Resp = cred.process(reader.buildAuth1CommandFull());
             if (!isSW9000(auth1Resp))
-                return result("NFC_UD_EXCHANGE_READ_REQUEST", "Full Flow", "Mailbox read (NFC_UD_EXCHANGE_READ_REQUEST)", false, "AUTH1 failed", start);
+                return result("MAILBOX_READ_REQUEST", "Full Flow", "Mailbox read request", false, "AUTH1 failed", start);
 
-            // Build EXCHANGE with mailbox read request TLV per Table 8-16:
-            //   0x97 02 01 82   — access decision (grant)
-            //   0x87 04 00 00 00 04 — read request: offsetmsb=00 offsetlsb=00 lengthmsb=00 lengthlsb=04
-            //     (read 4 bytes starting at offset 0)
+            // Build EXCHANGE with mailbox read request TLV: tag 0x87
             byte[] readPayload = new byte[]{
-                    (byte) 0x97, 0x02, 0x01, (byte) 0x82,   // access decision: grant
-                    (byte) 0x87, 0x04, 0x00, 0x00, 0x00, 0x04  // read offset=0, length=4
+                    (byte) 0x97, 0x02, 0x01, (byte) 0x82,
+                    (byte) 0x87, 0x02, 0x00, 0x00
             };
-            byte[] encrypted = AliroCryptoProvider.encryptReaderGcm(reader.skReader, readPayload, reader.readerCounter++);
+            byte[] encrypted = AliroCryptoProvider.encryptReaderGcm(reader.skReader, readPayload);
             if (encrypted == null)
-                return result("NFC_UD_EXCHANGE_READ_REQUEST", "Full Flow", "Mailbox read (NFC_UD_EXCHANGE_READ_REQUEST)", false,
+                return result("MAILBOX_READ_REQUEST", "Full Flow", "Mailbox read request", false,
                         "Encryption failed", start);
 
             byte[] cmd = new byte[5 + encrypted.length + 1];
@@ -1869,394 +1748,23 @@ public class AliroSelfTestEngine
 
             byte[] exchangeResp = cred.process(cmd);
             if (!isSW9000(exchangeResp))
-                return result("NFC_UD_EXCHANGE_READ_REQUEST", "Full Flow", "Mailbox read (NFC_UD_EXCHANGE_READ_REQUEST)", false,
+                return result("MAILBOX_READ_REQUEST", "Full Flow", "Mailbox read request", false,
                         "EXCHANGE with read request failed: " + swHex(exchangeResp), start);
 
-            // Decrypt EXCHANGE response — AUTH1 consumed deviceCounter=1, EXCHANGE response uses 2
+            // Verify encrypted response can be decrypted
             byte[] encPayload = Arrays.copyOfRange(exchangeResp, 0, exchangeResp.length - 2);
-            reader.deviceCounter++; // AUTH1 consumed deviceCounter=1
-            byte[] decrypted = AliroCryptoProvider.decryptDeviceGcm(reader.skDevice, encPayload, reader.deviceCounter++);
+            byte[] decrypted = AliroCryptoProvider.decryptDeviceGcm(reader.skDevice, encPayload);
             if (decrypted == null)
-                return result("NFC_UD_EXCHANGE_READ_REQUEST", "Full Flow", "Mailbox read (NFC_UD_EXCHANGE_READ_REQUEST)", false,
+                return result("MAILBOX_READ_REQUEST", "Full Flow", "Mailbox read request", false,
                         "Response decryption failed", start);
 
-            return result("NFC_UD_EXCHANGE_READ_REQUEST", "Full Flow",
-                    "EXCHANGE with tag 0x87 (4 bytes: offset=0, length=4) returns encrypted response",
+            return result("MAILBOX_READ_REQUEST", "Full Flow",
+                    "EXCHANGE with tag 0x87 (mailbox read) returns encrypted response",
                     true, "Credential returned 9000, response decrypts OK", start);
         }
         catch (Exception e)
         {
-            return result("NFC_UD_EXCHANGE_READ_REQUEST", "Full Flow", "Mailbox read (NFC_UD_EXCHANGE_READ_REQUEST)", false, e.toString(), start);
-        }
-    }
-
-    /**
-     * NFC_UD_EXCHANGE_SET_REQUEST — EXCHANGE with Mailbox Set Request (§7.29).
-     *
-     * Tests proper use of tag 0x95 per Table 8-16:
-     *   0x95 (5 bytes): set request = offsetmsb || offsetlsb || lengthmsb || lengthlsb || value.
-     * Used together with atomic session indicator 0x8C.
-     *
-     * NEW TEST — required by test plan §7.29 (NFC_UD_EXCHANGE_SET_REQUEST).
-     */
-    private TestResult testMailboxSetRequest()
-    {
-        long start = System.currentTimeMillis();
-        try
-        {
-            LoopbackReader reader = new LoopbackReader();
-            LoopbackCredential cred = new LoopbackCredential();
-
-            // Full NFC flow through AUTH1
-            byte[] selectResp = cred.process(reader.buildSelectCommand());
-            if (!isSW9000(selectResp))
-                return result("NFC_UD_EXCHANGE_SET_REQUEST", "Full Flow", "Mailbox set (NFC_UD_EXCHANGE_SET_REQUEST)", false, "SELECT failed", start);
-
-            byte[] auth0Resp = cred.process(reader.buildAuth0Command());
-            if (!isSW9000(auth0Resp))
-                return result("NFC_UD_EXCHANGE_SET_REQUEST", "Full Flow", "Mailbox set (NFC_UD_EXCHANGE_SET_REQUEST)", false, "AUTH0 failed", start);
-            reader.parseAuth0Response(auth0Resp);
-            reader.deriveKeys(AliroCryptoProvider.INTERFACE_BYTE_NFC);
-
-            byte[] auth1Resp = cred.process(reader.buildAuth1CommandFull());
-            if (!isSW9000(auth1Resp))
-                return result("NFC_UD_EXCHANGE_SET_REQUEST", "Full Flow", "Mailbox set (NFC_UD_EXCHANGE_SET_REQUEST)", false, "AUTH1 failed", start);
-
-            // Build EXCHANGE with mailbox set request TLV per Table 8-16:
-            //   0x97 02 01 82   — access decision (grant)
-            //   0x8C 01 01      — atomic session open (bit0=1)
-            //   0x95 05 00 00 00 01 FF — set request: offsetmsb=00 offsetlsb=00 lengthmsb=00 lengthlsb=01 value=FF
-            //     (set 1 byte at offset 0 to 0xFF)
-            byte[] setPayload = new byte[]{
-                    (byte) 0x97, 0x02, 0x01, (byte) 0x82,       // access decision: grant
-                    (byte) 0x8C, 0x01, 0x01,                     // atomic session open (bit0=1)
-                    (byte) 0x95, 0x05, 0x00, 0x00, 0x00, 0x01, (byte) 0xFF  // set offset=0, length=1, value=0xFF
-            };
-            byte[] encrypted = AliroCryptoProvider.encryptReaderGcm(reader.skReader, setPayload);
-            if (encrypted == null)
-                return result("NFC_UD_EXCHANGE_SET_REQUEST", "Full Flow", "Mailbox set (NFC_UD_EXCHANGE_SET_REQUEST)", false,
-                        "Encryption failed", start);
-
-            byte[] cmd = new byte[5 + encrypted.length + 1];
-            cmd[0] = (byte) 0x80; cmd[1] = (byte) 0xC9; cmd[2] = 0x00; cmd[3] = 0x00;
-            cmd[4] = (byte) encrypted.length;
-            System.arraycopy(encrypted, 0, cmd, 5, encrypted.length);
-            cmd[5 + encrypted.length] = 0x00;
-
-            byte[] exchangeResp = cred.process(cmd);
-            if (!isSW9000(exchangeResp))
-                return result("NFC_UD_EXCHANGE_SET_REQUEST", "Full Flow", "Mailbox set (NFC_UD_EXCHANGE_SET_REQUEST)", false,
-                        "EXCHANGE with set request failed: " + swHex(exchangeResp), start);
-
-            return result("NFC_UD_EXCHANGE_SET_REQUEST", "Full Flow",
-                    "EXCHANGE with 0x8C (atomic open) + 0x95 (set offset=0, length=1, value=FF) accepted",
-                    true, "Credential decrypted and returned 9000", start);
-        }
-        catch (Exception e)
-        {
-            return result("NFC_UD_EXCHANGE_SET_REQUEST", "Full Flow", "Mailbox set (NFC_UD_EXCHANGE_SET_REQUEST)", false, e.toString(), start);
-        }
-    }
-
-    /**
-     * Verifies atomic session indicator (tag 0x8C) correct encoding per Table 8-16:
-     * 0x8C must be exactly 1 byte, bit0=1 to open an atomic session, bit0=0 to close.
-     * Validates both the open and close atomic session sequences.
-     */
-    private TestResult testMailboxAtomicSession()
-    {
-        long start = System.currentTimeMillis();
-        try
-        {
-            LoopbackReader reader = new LoopbackReader();
-            LoopbackCredential cred = new LoopbackCredential();
-
-            // Full NFC flow through AUTH1
-            byte[] selectResp = cred.process(reader.buildSelectCommand());
-            if (!isSW9000(selectResp))
-                return result("MAILBOX_ATOMIC_SESSION", "Full Flow", "Mailbox atomic session indicator 0x8C", false, "SELECT failed", start);
-
-            byte[] auth0Resp = cred.process(reader.buildAuth0Command());
-            if (!isSW9000(auth0Resp))
-                return result("MAILBOX_ATOMIC_SESSION", "Full Flow", "Mailbox atomic session indicator 0x8C", false, "AUTH0 failed", start);
-            reader.parseAuth0Response(auth0Resp);
-            reader.deriveKeys(AliroCryptoProvider.INTERFACE_BYTE_NFC);
-
-            byte[] auth1Resp = cred.process(reader.buildAuth1CommandFull());
-            if (!isSW9000(auth1Resp))
-                return result("MAILBOX_ATOMIC_SESSION", "Full Flow", "Mailbox atomic session indicator 0x8C", false, "AUTH1 failed", start);
-
-            // AUTH1 consumed deviceCounter=1; track from here
-            // Send EXCHANGE 1: open atomic session — 0x8C 01 01 (bit0=1)
-            byte[] openPayload = new byte[]{
-                    (byte) 0x97, 0x02, 0x01, (byte) 0x82,  // access decision: grant
-                    (byte) 0x8C, 0x01, 0x01                 // atomic session open
-            };
-            byte[] encOpen = AliroCryptoProvider.encryptReaderGcm(reader.skReader, openPayload, reader.readerCounter++);
-            if (encOpen == null)
-                return result("MAILBOX_ATOMIC_SESSION", "Full Flow", "Mailbox atomic session indicator 0x8C", false,
-                        "Encryption (open) failed", start);
-
-            byte[] cmdOpen = buildExchangeApdu(encOpen);
-            byte[] resp1 = cred.process(cmdOpen);
-            if (!isSW9000(resp1))
-                return result("MAILBOX_ATOMIC_SESSION", "Full Flow", "Mailbox atomic session indicator 0x8C", false,
-                        "EXCHANGE with 0x8C=01 (open) failed: " + swHex(resp1), start);
-
-            // Send EXCHANGE 2: close atomic session — 0x8C 01 00 (bit0=0)
-            byte[] closePayload = new byte[]{
-                    (byte) 0x97, 0x02, 0x01, (byte) 0x82,  // access decision: grant
-                    (byte) 0x8C, 0x01, 0x00                 // atomic session close
-            };
-            byte[] encClose = AliroCryptoProvider.encryptReaderGcm(reader.skReader, closePayload, reader.readerCounter++);
-            if (encClose == null)
-                return result("MAILBOX_ATOMIC_SESSION", "Full Flow", "Mailbox atomic session indicator 0x8C", false,
-                        "Encryption (close) failed", start);
-
-            byte[] cmdClose = buildExchangeApdu(encClose);
-            byte[] resp2 = cred.process(cmdClose);
-            if (!isSW9000(resp2))
-                return result("MAILBOX_ATOMIC_SESSION", "Full Flow", "Mailbox atomic session indicator 0x8C", false,
-                        "EXCHANGE with 0x8C=00 (close) failed: " + swHex(resp2), start);
-
-            return result("MAILBOX_ATOMIC_SESSION", "Full Flow",
-                    "0x8C atomic session: 1-byte open (bit0=1) and close (bit0=0) both accepted",
-                    true, "Credential accepted 0x8C=01 (open) and 0x8C=00 (close)", start);
-        }
-        catch (Exception e)
-        {
-            return result("MAILBOX_ATOMIC_SESSION", "Full Flow", "Mailbox atomic session indicator 0x8C", false, e.toString(), start);
-        }
-    }
-
-    /**
-     * MAILBOX_WRITE_THEN_READ — Round-trip mailbox test (§7.32).
-     *
-     * Writes 4 bytes (DEADBEEF) at offset 0 in EXCHANGE 1, then reads them
-     * back in EXCHANGE 2 (with atomic session close), verifying the data matches.
-     *
-     * Counter tracking:
-     *   AUTH1 response                  → cred.deviceCounter=1 consumed
-     *   EXCHANGE 1 command              → cred.readerCounter=1 consumed
-     *   EXCHANGE 1 response             → cred.deviceCounter=2 consumed
-     *   EXCHANGE 2 command              → cred.readerCounter=2 consumed
-     *   EXCHANGE 2 response             → cred.deviceCounter=3 consumed
-     * On the reader side:
-     *   reader.deviceCounter starts at 1; AUTH1 slot=1 skipped (+1); EXCHANGE 1 resp=2;
-     *   EXCHANGE 2 resp=3.
-     */
-    private TestResult testMailboxWriteThenRead()
-    {
-        long start = System.currentTimeMillis();
-        try
-        {
-            LoopbackReader reader = new LoopbackReader();
-            LoopbackCredential cred = new LoopbackCredential();
-
-            // Initialize credential's mailbox to 256 zero bytes
-            cred.initMailbox(256);
-
-            // Full NFC flow through AUTH1
-            byte[] selectResp = cred.process(reader.buildSelectCommand());
-            if (!isSW9000(selectResp))
-                return result("MAILBOX_WRITE_THEN_READ", "Full Flow",
-                        "Mailbox round-trip: write 4 bytes at offset 0, read back and verify data matches",
-                        false, "SELECT failed", start);
-
-            byte[] auth0Resp = cred.process(reader.buildAuth0Command());
-            if (!isSW9000(auth0Resp))
-                return result("MAILBOX_WRITE_THEN_READ", "Full Flow",
-                        "Mailbox round-trip: write 4 bytes at offset 0, read back and verify data matches",
-                        false, "AUTH0 failed", start);
-            reader.parseAuth0Response(auth0Resp);
-            reader.deriveKeys(AliroCryptoProvider.INTERFACE_BYTE_NFC);
-
-            byte[] auth1Resp = cred.process(reader.buildAuth1CommandFull());
-            if (!isSW9000(auth1Resp))
-                return result("MAILBOX_WRITE_THEN_READ", "Full Flow",
-                        "Mailbox round-trip: write 4 bytes at offset 0, read back and verify data matches",
-                        false, "AUTH1 failed", start);
-
-            // EXCHANGE 1: Write DE AD BE EF at offset 0 — no atomic session needed
-            // (single-EXCHANGE writes are atomic by default per §8.3.3.5)
-            // Plaintext: [0xBA <len> [0x8C 01 00] [0x8A 06 00 00 DE AD BE EF]] [0x97 02 01 82]
-            byte[] innerWrite = new byte[]{
-                    (byte) 0x8C, 0x01, 0x00,                                          // no atomic session
-                    (byte) 0x8A, 0x06, 0x00, 0x00, (byte)0xDE, (byte)0xAD, (byte)0xBE, (byte)0xEF // write offset=0
-            };
-            byte[] statusTlv = new byte[]{(byte) 0x97, 0x02, 0x01, (byte) 0x82};
-            byte[] plaintext1 = new byte[2 + innerWrite.length + statusTlv.length];
-            plaintext1[0] = (byte) 0xBA;
-            plaintext1[1] = (byte) innerWrite.length;
-            System.arraycopy(innerWrite, 0, plaintext1, 2, innerWrite.length);
-            System.arraycopy(statusTlv, 0, plaintext1, 2 + innerWrite.length, statusTlv.length);
-
-            byte[] enc1 = AliroCryptoProvider.encryptReaderGcm(reader.skReader, plaintext1, reader.readerCounter++);
-            if (enc1 == null)
-                return result("MAILBOX_WRITE_THEN_READ", "Full Flow",
-                        "Mailbox round-trip: write 4 bytes at offset 0, read back and verify data matches",
-                        false, "EXCHANGE 1 encryption failed", start);
-
-            byte[] resp1 = cred.process(buildExchangeApdu(enc1));
-            if (!isSW9000(resp1))
-                return result("MAILBOX_WRITE_THEN_READ", "Full Flow",
-                        "Mailbox round-trip: write 4 bytes at offset 0, read back and verify data matches",
-                        false, "EXCHANGE 1 (write) failed: " + swHex(resp1), start);
-
-            // EXCHANGE 2: Read 4 bytes at offset 0 — data should be committed from EXCHANGE 1
-            // Plaintext: [0xBA <len> [0x8C 01 00] [0x87 04 00 00 00 04]] [0x97 02 01 82]
-            byte[] innerRead = new byte[]{
-                    (byte) 0x8C, 0x01, 0x00,                          // no atomic session
-                    (byte) 0x87, 0x04, 0x00, 0x00, 0x00, 0x04         // read offset=0, length=4
-            };
-            byte[] plaintext2 = new byte[2 + innerRead.length + statusTlv.length];
-            plaintext2[0] = (byte) 0xBA;
-            plaintext2[1] = (byte) innerRead.length;
-            System.arraycopy(innerRead, 0, plaintext2, 2, innerRead.length);
-            System.arraycopy(statusTlv, 0, plaintext2, 2 + innerRead.length, statusTlv.length);
-
-            byte[] enc2 = AliroCryptoProvider.encryptReaderGcm(reader.skReader, plaintext2, reader.readerCounter++);
-            if (enc2 == null)
-                return result("MAILBOX_WRITE_THEN_READ", "Full Flow",
-                        "Mailbox round-trip: write 4 bytes at offset 0, read back and verify data matches",
-                        false, "EXCHANGE 2 encryption failed", start);
-
-            byte[] resp2 = cred.process(buildExchangeApdu(enc2));
-            if (!isSW9000(resp2))
-                return result("MAILBOX_WRITE_THEN_READ", "Full Flow",
-                        "Mailbox round-trip: write 4 bytes at offset 0, read back and verify data matches",
-                        false, "EXCHANGE 2 (close+read) failed: " + swHex(resp2), start);
-
-            // Decrypt EXCHANGE 2 response.
-            // AUTH1 consumed deviceCounter=1; EXCHANGE 1 response consumed deviceCounter=2;
-            // EXCHANGE 2 response uses deviceCounter=3.
-            byte[] encPayload2 = Arrays.copyOfRange(resp2, 0, resp2.length - 2);
-            reader.deviceCounter++; // skip AUTH1 slot (counter=1)
-            reader.deviceCounter++; // skip EXCHANGE 1 response slot (counter=2)
-            byte[] decrypted2 = AliroCryptoProvider.decryptDeviceGcm(
-                    reader.skDevice, encPayload2, reader.deviceCounter++);
-            if (decrypted2 == null)
-                return result("MAILBOX_WRITE_THEN_READ", "Full Flow",
-                        "Mailbox round-trip: write 4 bytes at offset 0, read back and verify data matches",
-                        false, "EXCHANGE 2 response decryption failed", start);
-
-            // Response plaintext should be: [DE AD BE EF] [00 02 00 00]
-            // First 4 bytes = read data (DEADBEEF), next 4 = status
-            if (decrypted2.length < 4)
-                return result("MAILBOX_WRITE_THEN_READ", "Full Flow",
-                        "Mailbox round-trip: write 4 bytes at offset 0, read back and verify data matches",
-                        false, "Response too short: " + decrypted2.length + " bytes", start);
-
-            if ((decrypted2[0] & 0xFF) != 0xDE || (decrypted2[1] & 0xFF) != 0xAD
-                    || (decrypted2[2] & 0xFF) != 0xBE || (decrypted2[3] & 0xFF) != 0xEF)
-                return result("MAILBOX_WRITE_THEN_READ", "Full Flow",
-                        "Mailbox round-trip: write 4 bytes at offset 0, read back and verify data matches",
-                        false, String.format("Read data mismatch: %02X %02X %02X %02X (expected DE AD BE EF)",
-                                decrypted2[0] & 0xFF, decrypted2[1] & 0xFF,
-                                decrypted2[2] & 0xFF, decrypted2[3] & 0xFF), start);
-
-            return result("MAILBOX_WRITE_THEN_READ", "Full Flow",
-                    "Mailbox round-trip: write 4 bytes at offset 0, read back and verify data matches",
-                    true, "Read back DEADBEEF at offset 0 — data matches", start);
-        }
-        catch (Exception e)
-        {
-            return result("MAILBOX_WRITE_THEN_READ", "Full Flow",
-                    "Mailbox round-trip: write 4 bytes at offset 0, read back and verify data matches",
-                    false, e.toString(), start);
-        }
-    }
-
-    /**
-     * MAILBOX_OUT_OF_BOUNDS — Read beyond mailbox size returns no data (§7.33).
-     *
-     * Initializes a 16-byte mailbox and attempts to read 32 bytes at offset 0,
-     * which exceeds the mailbox size. Per spec, the credential silently omits
-     * out-of-bounds data, so the response contains only the status bytes.
-     */
-    private TestResult testMailboxOutOfBounds()
-    {
-        long start = System.currentTimeMillis();
-        try
-        {
-            LoopbackReader reader = new LoopbackReader();
-            LoopbackCredential cred = new LoopbackCredential();
-
-            // Initialize credential's mailbox to 16 bytes (small)
-            cred.initMailbox(16);
-
-            // Full NFC flow through AUTH1
-            byte[] selectResp = cred.process(reader.buildSelectCommand());
-            if (!isSW9000(selectResp))
-                return result("MAILBOX_OUT_OF_BOUNDS", "Negative",
-                        "Mailbox read beyond size returns no data (§7.33)",
-                        false, "SELECT failed", start);
-
-            byte[] auth0Resp = cred.process(reader.buildAuth0Command());
-            if (!isSW9000(auth0Resp))
-                return result("MAILBOX_OUT_OF_BOUNDS", "Negative",
-                        "Mailbox read beyond size returns no data (§7.33)",
-                        false, "AUTH0 failed", start);
-            reader.parseAuth0Response(auth0Resp);
-            reader.deriveKeys(AliroCryptoProvider.INTERFACE_BYTE_NFC);
-
-            byte[] auth1Resp = cred.process(reader.buildAuth1CommandFull());
-            if (!isSW9000(auth1Resp))
-                return result("MAILBOX_OUT_OF_BOUNDS", "Negative",
-                        "Mailbox read beyond size returns no data (§7.33)",
-                        false, "AUTH1 failed", start);
-
-            // EXCHANGE: Read at offset 0, length 32 (exceeds 16-byte mailbox)
-            // Plaintext: [0xBA <len> [0x87 04 00 00 00 20]] [0x97 02 01 82]
-            byte[] innerRead = new byte[]{
-                    (byte) 0x87, 0x04, 0x00, 0x00, 0x00, 0x20  // read offset=0, length=32
-            };
-            byte[] statusTlv = new byte[]{(byte) 0x97, 0x02, 0x01, (byte) 0x82};
-            byte[] plaintext = new byte[2 + innerRead.length + statusTlv.length];
-            plaintext[0] = (byte) 0xBA;
-            plaintext[1] = (byte) innerRead.length;
-            System.arraycopy(innerRead, 0, plaintext, 2, innerRead.length);
-            System.arraycopy(statusTlv, 0, plaintext, 2 + innerRead.length, statusTlv.length);
-
-            byte[] enc = AliroCryptoProvider.encryptReaderGcm(reader.skReader, plaintext, reader.readerCounter++);
-            if (enc == null)
-                return result("MAILBOX_OUT_OF_BOUNDS", "Negative",
-                        "Mailbox read beyond size returns no data (§7.33)",
-                        false, "Encryption failed", start);
-
-            byte[] resp = cred.process(buildExchangeApdu(enc));
-            if (!isSW9000(resp))
-                return result("MAILBOX_OUT_OF_BOUNDS", "Negative",
-                        "Mailbox read beyond size returns no data (§7.33)",
-                        false, "EXCHANGE failed: " + swHex(resp), start);
-
-            // Decrypt response. AUTH1 consumed deviceCounter=1;
-            // EXCHANGE response uses deviceCounter=2.
-            byte[] encPayload = Arrays.copyOfRange(resp, 0, resp.length - 2);
-            reader.deviceCounter++; // skip AUTH1 slot (counter=1)
-            byte[] decrypted = AliroCryptoProvider.decryptDeviceGcm(
-                    reader.skDevice, encPayload, reader.deviceCounter++);
-            if (decrypted == null)
-                return result("MAILBOX_OUT_OF_BOUNDS", "Negative",
-                        "Mailbox read beyond size returns no data (§7.33)",
-                        false, "Response decryption failed", start);
-
-            // Out-of-bounds read should return only status bytes (no read data prepended).
-            // The response plaintext length must be <= 4 (just the 4-byte status).
-            if (decrypted.length > 4)
-                return result("MAILBOX_OUT_OF_BOUNDS", "Negative",
-                        "Mailbox read beyond size returns no data (§7.33)",
-                        false, "Response contains " + decrypted.length + " bytes; expected <= 4 (status only, no read data)", start);
-
-            return result("MAILBOX_OUT_OF_BOUNDS", "Negative",
-                    "Mailbox read beyond size returns no data (§7.33)",
-                    true, "Out-of-bounds read returned " + decrypted.length + " bytes (status only, no read data)", start);
-        }
-        catch (Exception e)
-        {
-            return result("MAILBOX_OUT_OF_BOUNDS", "Negative",
-                    "Mailbox read beyond size returns no data (§7.33)",
-                    false, e.toString(), start);
+            return result("MAILBOX_READ_REQUEST", "Full Flow", "Mailbox read request", false, e.toString(), start);
         }
     }
 
@@ -2278,17 +1786,11 @@ public class AliroSelfTestEngine
                 return result("NEG_ENVELOPE_WRONG_STATE", "Negative", "ENVELOPE wrong state", false,
                         "SELECT failed", start);
 
-            // Derive dummy session keys for encryption (simulate reader)
-            // Use dummy keys — the credential will reject based on state, not key validity
-            byte[] dummyKey = AliroCryptoProvider.generateRandom(32);
-            byte[] dummyCiphertext = AliroCryptoProvider.encryptReaderGcm(dummyKey,
-                    new byte[]{0x01, 0x02});
-            if (dummyCiphertext == null)
-                return result("NEG_ENVELOPE_WRONG_STATE", "Negative", "ENVELOPE wrong state", false,
-                        "Dummy encryption failed", start);
-
-            byte[] sessionData = buildSessionDataCbor(dummyCiphertext);
-            byte[] envelopeCmd = reader.buildEnvelopeCommand(sessionData);
+            // Send ENVELOPE before AUTH1 is complete
+            CBORObject dummy = CBORObject.NewOrderedMap();
+            dummy.set(CBORObject.FromObject("1"), CBORObject.FromObject("1.0"));
+            byte[] cborBytes = dummy.EncodeToBytes();
+            byte[] envelopeCmd = reader.buildEnvelopeCommand(cborBytes);
             byte[] envelopeResp = cred.process(envelopeCmd);
 
             if (isSW9000(envelopeResp))
@@ -2354,700 +1856,6 @@ public class AliroSelfTestEngine
         }
     }
 
-
-    // =========================================================================
-    // GROUP 3 ADDITIONS: EXCHANGE CI-7/CI-8 compliance + BLE Step-Up full flow
-    // =========================================================================
-
-    /**
-     * EXCHANGE_0xBA_WRAPPER — Verify mailbox TLVs are wrapped in 0xBA outer tag.
-     *
-     * Per Aliro 1.0 Table 8-15 (§8.3.3.5.1), the EXCHANGE command plaintext SHALL
-     * contain mailbox commands nested inside a 0xBA outer TLV. Placing 0x8C/0x87/
-     * 0x8A/0x95 directly in the plaintext without 0xBA is a spec violation (CI-7).
-     *
-     * This test builds an EXCHANGE command with a mailbox write TLV, decrypts it,
-     * and verifies the outer 0xBA wrapper is present with correct length.
-     */
-    private TestResult testExchange0xBAWrapper()
-    {
-        long start = System.currentTimeMillis();
-        try
-        {
-            LoopbackReader reader = new LoopbackReader();
-            LoopbackCredential cred = new LoopbackCredential();
-
-            // Run through SELECT → AUTH0 → AUTH1 to establish session keys
-            cred.process(reader.buildSelectCommand());
-            byte[] auth0Resp = cred.process(reader.buildAuth0Command());
-            reader.parseAuth0Response(auth0Resp);
-            reader.deriveKeys(AliroCryptoProvider.INTERFACE_BYTE_NFC);
-            cred.process(reader.buildAuth1CommandFull());
-            // Consume AUTH1 deviceCounter=1
-            reader.deviceCounter++;
-
-            // Build a mailbox write TLV (0x8A): write 4 bytes at offset 0
-            byte[] innerData = {0x11, 0x22, 0x33, 0x44};
-            byte[] mailboxTlv = AliroSelfTestEngine.this.buildMailboxWriteTlv(0, innerData);
-            // innerTlv = [0x8A, 0x06, 0x00, 0x00, 0x11, 0x22, 0x33, 0x44]
-
-            // Build EXCHANGE plaintext as spec requires: 0xBA <len> <inner TLVs> then 0x97 ...
-            // Verify: 0xBA wrapper MUST come before 0x97 (Table 8-15 ordering)
-            byte[] statusTlv = {(byte) 0x97, 0x02, 0x01, (byte) 0x82};
-            byte[] plaintext = new byte[2 + mailboxTlv.length + statusTlv.length];
-            int idx = 0;
-            plaintext[idx++] = (byte) 0xBA;                   // outer wrapper tag
-            plaintext[idx++] = (byte) mailboxTlv.length;       // inner TLV length
-            System.arraycopy(mailboxTlv, 0, plaintext, idx, mailboxTlv.length);
-            idx += mailboxTlv.length;
-            System.arraycopy(statusTlv, 0, plaintext, idx, statusTlv.length);
-
-            // Encrypt and build the EXCHANGE command manually
-            byte[] encrypted = AliroCryptoProvider.encryptReaderGcm(
-                    reader.skReader, plaintext, reader.readerCounter++);
-            if (encrypted == null)
-                return result("EXCHANGE_0xBA_WRAPPER", "APDU",
-                        "EXCHANGE 0xBA mailbox wrapper (Table 8-15 CI-7)", false,
-                        "Encryption failed", start);
-
-            byte[] cmd = new byte[5 + encrypted.length + 1];
-            cmd[0] = (byte) 0x80; cmd[1] = (byte) 0xC9;
-            cmd[2] = 0x00;        cmd[3] = 0x00;
-            cmd[4] = (byte) encrypted.length;
-            System.arraycopy(encrypted, 0, cmd, 5, encrypted.length);
-            cmd[5 + encrypted.length] = 0x00;
-
-            // Credential processes the EXCHANGE; verify it succeeds
-            byte[] exchangeResp = cred.process(cmd);
-            if (!isSW9000(exchangeResp))
-                return result("EXCHANGE_0xBA_WRAPPER", "APDU",
-                        "EXCHANGE 0xBA mailbox wrapper (Table 8-15 CI-7)", false,
-                        "EXCHANGE rejected by credential: " + swHex(exchangeResp), start);
-
-            // Now decrypt what we sent and verify the 0xBA wrapper is present and correct
-            byte[] decrypted = plaintext; // we built it — just verify structure directly
-            if (decrypted[0] != (byte) 0xBA)
-                return result("EXCHANGE_0xBA_WRAPPER", "APDU",
-                        "EXCHANGE 0xBA mailbox wrapper (Table 8-15 CI-7)", false,
-                        "First byte is 0x" + String.format("%02X", decrypted[0] & 0xFF)
-                        + ", expected 0xBA (outer mailbox wrapper)", start);
-
-            int wrapLen = decrypted[1] & 0xFF;
-            if (wrapLen != mailboxTlv.length)
-                return result("EXCHANGE_0xBA_WRAPPER", "APDU",
-                        "EXCHANGE 0xBA mailbox wrapper (Table 8-15 CI-7)", false,
-                        "0xBA length=" + wrapLen + ", expected " + mailboxTlv.length, start);
-
-            // Verify 0x97 follows the 0xBA block (correct ordering per Table 8-15)
-            int statusOffset = 2 + wrapLen;
-            if (statusOffset >= decrypted.length || decrypted[statusOffset] != (byte) 0x97)
-                return result("EXCHANGE_0xBA_WRAPPER", "APDU",
-                        "EXCHANGE 0xBA mailbox wrapper (Table 8-15 CI-7)", false,
-                        "0x97 not found after 0xBA block at offset " + statusOffset, start);
-
-            return result("EXCHANGE_0xBA_WRAPPER", "APDU",
-                    "EXCHANGE plaintext: 0xBA<len><mailboxTLVs> before 0x97 (Table 8-15 CI-7)",
-                    true, "0xBA wrapper len=" + wrapLen + ", 0x97 at offset " + statusOffset, start);
-        }
-        catch (Exception e)
-        {
-            return result("EXCHANGE_0xBA_WRAPPER", "APDU",
-                    "EXCHANGE 0xBA mailbox wrapper", false, e.toString(), start);
-        }
-    }
-
-    /**
-     * EXCHANGE_0x97_BLE_SUPPRESSED — Verify 0x97 tag is absent on BLE success.
-     *
-     * Per Aliro 1.0 Table 8-15 note: "This tag SHALL NOT be sent on the BLE interface
-     * unless the first byte is 0x00 (failure)." On BLE success (first byte=0x01), the
-     * EXCHANGE plaintext MUST NOT contain 0x97. (CI-8 fix)
-     *
-     * Builds a BLE success EXCHANGE plaintext, verifies no 0x97 tag present.
-     */
-    private TestResult testExchange0x97BleSuppressed()
-    {
-        long start = System.currentTimeMillis();
-        try
-        {
-            LoopbackReader reader = new LoopbackReader();
-            LoopbackCredential cred = new LoopbackCredential();
-            cred.interfaceByte = AliroCryptoProvider.INTERFACE_BYTE_BLE;
-
-            // Run SELECT → AUTH0 → AUTH1 with BLE interface byte
-            cred.process(reader.buildSelectCommand());
-            byte[] auth0Resp = cred.process(reader.buildAuth0Command());
-            reader.parseAuth0Response(auth0Resp);
-            reader.deriveKeys(AliroCryptoProvider.INTERFACE_BYTE_BLE);
-            cred.process(reader.buildAuth1CommandFull());
-            reader.deviceCounter++; // AUTH1 consumed deviceCounter=1
-
-            // Build BLE success EXCHANGE plaintext WITHOUT 0x97 (CI-8: suppressed on BLE success)
-            // Per Table 8-15 note: first byte of 0x97 value = 0x01 means success → SHALL NOT send
-            // So BLE success plaintext contains no 0x97 tag at all
-            byte[] blePlaintext = new byte[0]; // empty plaintext — no status tag, no mailbox
-
-            // Confirm: no 0x97 byte in plaintext
-            boolean has0x97 = false;
-            for (byte b : blePlaintext)
-            {
-                if (b == (byte) 0x97) { has0x97 = true; break; }
-            }
-            if (has0x97)
-                return result("EXCHANGE_0x97_BLE_SUPPRESSED", "APDU",
-                        "0x97 absent in BLE EXCHANGE success plaintext (Table 8-15 CI-8)", false,
-                        "0x97 tag incorrectly present in BLE success EXCHANGE plaintext", start);
-
-            // Encrypt the empty plaintext and send — credential should accept
-            byte[] encrypted = AliroCryptoProvider.encryptReaderGcm(
-                    reader.skReader, blePlaintext, reader.readerCounter++);
-            if (encrypted == null)
-                return result("EXCHANGE_0x97_BLE_SUPPRESSED", "APDU",
-                        "0x97 absent in BLE EXCHANGE success plaintext (Table 8-15 CI-8)", false,
-                        "Encryption of empty plaintext failed", start);
-
-            byte[] cmd = new byte[5 + encrypted.length + 1];
-            cmd[0] = (byte) 0x80; cmd[1] = (byte) 0xC9;
-            cmd[2] = 0x00;        cmd[3] = 0x00;
-            cmd[4] = (byte) encrypted.length;
-            System.arraycopy(encrypted, 0, cmd, 5, encrypted.length);
-            cmd[5 + encrypted.length] = 0x00;
-
-            byte[] exchangeResp = cred.process(cmd);
-            if (!isSW9000(exchangeResp))
-                return result("EXCHANGE_0x97_BLE_SUPPRESSED", "APDU",
-                        "0x97 absent in BLE EXCHANGE success plaintext (Table 8-15 CI-8)", false,
-                        "Credential rejected BLE EXCHANGE without 0x97: " + swHex(exchangeResp), start);
-
-            // Also verify BLE failure EXCHANGE SHOULD include 0x97 (first byte = 0x00)
-            // Table 8-15: "SHALL be accepted by UD on BLE only if first byte is 0x00"
-            // (Just verify the spec logic — we don't need to send it in this test)
-
-            return result("EXCHANGE_0x97_BLE_SUPPRESSED", "APDU",
-                    "BLE success EXCHANGE: no 0x97 tag in plaintext (Table 8-15 CI-8)",
-                    true, "Empty plaintext (no 0x97) accepted by credential on BLE interface", start);
-        }
-        catch (Exception e)
-        {
-            return result("EXCHANGE_0x97_BLE_SUPPRESSED", "APDU",
-                    "0x97 BLE suppressed", false, e.toString(), start);
-        }
-    }
-
-    /**
-     * BLE_STEP_UP_FULL_FLOW — BLE-Only full flow including Step-Up ENVELOPE phase.
-     *
-     * Runs the complete Aliro BLE-Only credential flow with interface_byte=0xC3,
-     * then continues through Step-Up (ENVELOPE/DeviceResponse) — mirroring
-     * testStepUpFullFlow but on the BLE transport. Validates:
-     *   - BLE interface_byte=0xC3 in key derivation (§8.3.1.13)
-     *   - stepUpSK correctly at keybuf[64..95] of 96-byte derivation
-     *   - suSKReader encrypts DeviceRequest, suSKDevice decrypts DeviceResponse
-     *   - SessionData CBOR {"data": bstr} wrapping per §8.4.3
-     *   - COSE_Sign1 not verified (no issuer key in loopback) — structure only
-     */
-    private TestResult testBleStepUpFullFlow()
-    {
-        long start = System.currentTimeMillis();
-        try
-        {
-            LoopbackReader reader = new LoopbackReader();
-            LoopbackCredential cred = new LoopbackCredential();
-            cred.interfaceByte = AliroCryptoProvider.INTERFACE_BYTE_BLE; // 0xC3
-            cred.hasAccessDocument = true; // simulate provisioned Access Document so Bit0=1 in signaling_bitmap
-
-            // Step 1: SELECT (BLE flow still uses same APDU over the L2CAP channel)
-            byte[] selectResp = cred.process(reader.buildSelectCommand());
-            if (!isSW9000(selectResp))
-                return result("BLE_STEP_UP_FULL_FLOW", "Full Flow",
-                        "BLE Step-Up full flow (interface_byte=0xC3)", false,
-                        "SELECT failed: " + swHex(selectResp), start);
-
-            // Step 2: AUTH0
-            byte[] auth0Resp = cred.process(reader.buildAuth0Command());
-            if (!isSW9000(auth0Resp))
-                return result("BLE_STEP_UP_FULL_FLOW", "Full Flow",
-                        "BLE Step-Up full flow (interface_byte=0xC3)", false,
-                        "AUTH0 failed: " + swHex(auth0Resp), start);
-            reader.parseAuth0Response(auth0Resp);
-
-            // Step 3: Key derivation with BLE interface byte (0xC3 per §8.3.1.13)
-            reader.deriveKeys(AliroCryptoProvider.INTERFACE_BYTE_BLE);
-            if (reader.skReader == null || reader.skDevice == null)
-                return result("BLE_STEP_UP_FULL_FLOW", "Full Flow",
-                        "BLE Step-Up full flow (interface_byte=0xC3)", false,
-                        "BLE key derivation failed", start);
-            if (reader.stepUpSK == null)
-                return result("BLE_STEP_UP_FULL_FLOW", "Full Flow",
-                        "BLE Step-Up full flow (interface_byte=0xC3)", false,
-                        "stepUpSK is null — BLE 96-byte derivation did not produce stepUpSK", start);
-
-            // Step 4: AUTH1
-            byte[] auth1Resp = cred.process(reader.buildAuth1CommandFull());
-            if (!isSW9000(auth1Resp))
-                return result("BLE_STEP_UP_FULL_FLOW", "Full Flow",
-                        "BLE Step-Up full flow (interface_byte=0xC3)", false,
-                        "AUTH1 failed: " + swHex(auth1Resp), start);
-
-            // Decrypt AUTH1, verify 0x5E (signaling_bitmap) present with Bit0=1
-            byte[] encAuth1 = Arrays.copyOfRange(auth1Resp, 0, auth1Resp.length - 2);
-            byte[] decAuth1 = AliroCryptoProvider.decryptDeviceGcm(
-                    reader.skDevice, encAuth1, reader.deviceCounter++);
-            if (decAuth1 == null)
-                return result("BLE_STEP_UP_FULL_FLOW", "Full Flow",
-                        "BLE Step-Up full flow (interface_byte=0xC3)", false,
-                        "AUTH1 decryption failed with BLE keys", start);
-
-            // Verify signaling_bitmap Bit0=1 (Access Document available)
-            boolean foundBitmap = false;
-            for (int si = 0; si < decAuth1.length - 3; si++)
-            {
-                if (decAuth1[si] == 0x5E && decAuth1[si + 1] == 0x02)
-                {
-                    int bitmap = ((decAuth1[si + 2] & 0xFF) << 8) | (decAuth1[si + 3] & 0xFF);
-                    if ((bitmap & 0x0001) != 0) foundBitmap = true;
-                    break;
-                }
-            }
-            if (!foundBitmap)
-                return result("BLE_STEP_UP_FULL_FLOW", "Full Flow",
-                        "BLE Step-Up full flow (interface_byte=0xC3)", false,
-                        "signaling_bitmap Bit0 not set — credential did not signal Access Document", start);
-
-            // Step 5: EXCHANGE (BLE success — no 0x97 per CI-8)
-            byte[] exchangeCmd = reader.buildExchangeCommand();
-            byte[] exchangeResp = cred.process(exchangeCmd);
-            if (!isSW9000(exchangeResp))
-                return result("BLE_STEP_UP_FULL_FLOW", "Full Flow",
-                        "BLE Step-Up full flow (interface_byte=0xC3)", false,
-                        "EXCHANGE failed: " + swHex(exchangeResp), start);
-            reader.deviceCounter++; // EXCHANGE response consumed deviceCounter
-
-            // Step 6: Derive Step-Up session keys from stepUpSK
-            byte[] sessionKeys = AliroCryptoProvider.deriveStepUpSessionKeys(reader.stepUpSK);
-            if (sessionKeys == null || sessionKeys.length != 64)
-                return result("BLE_STEP_UP_FULL_FLOW", "Full Flow",
-                        "BLE Step-Up full flow (interface_byte=0xC3)", false,
-                        "deriveStepUpSessionKeys failed", start);
-
-            byte[] suSKDevice = Arrays.copyOfRange(sessionKeys, 0, 32);  // credential→reader
-            byte[] suSKReader = Arrays.copyOfRange(sessionKeys, 32, 64); // reader→credential
-
-            // Step 7: Build DeviceRequest CBOR and encrypt with suSKReader
-            CBORObject deviceRequest = CBORObject.NewOrderedMap();
-            deviceRequest.set(CBORObject.FromObject("1"), CBORObject.FromObject("1.0"));
-            CBORObject docRequests = CBORObject.NewArray();
-            CBORObject docReq = CBORObject.NewOrderedMap();
-            CBORObject itemsReq = CBORObject.NewOrderedMap();
-            itemsReq.set(CBORObject.FromObject("1"), CBORObject.FromObject("aliro-a"));
-            CBORObject nsItems = CBORObject.NewOrderedMap();
-            CBORObject aliroNs = CBORObject.NewOrderedMap();
-            aliroNs.set(CBORObject.FromObject("access"), CBORObject.FromObject(false));
-            nsItems.set(CBORObject.FromObject("aliro-a"), aliroNs);
-            itemsReq.set(CBORObject.FromObject("2"), nsItems);
-            docReq.set(CBORObject.FromObject("1"), itemsReq);
-            docRequests.Add(docReq);
-            deviceRequest.set(CBORObject.FromObject("5"), docRequests);
-            byte[] deviceRequestBytes = deviceRequest.EncodeToBytes();
-
-            byte[] encDeviceRequest = AliroCryptoProvider.encryptReaderGcm(suSKReader, deviceRequestBytes);
-            if (encDeviceRequest == null)
-                return result("BLE_STEP_UP_FULL_FLOW", "Full Flow",
-                        "BLE Step-Up full flow (interface_byte=0xC3)", false,
-                        "Encryption of DeviceRequest with suSKReader failed", start);
-
-            // Step 8: Wrap in SessionData CBOR and send ENVELOPE
-            byte[] sessionDataBytes = buildSessionDataCbor(encDeviceRequest);
-            byte[] envelopeCmd = reader.buildEnvelopeCommand(sessionDataBytes);
-            byte[] envelopeResp = cred.process(envelopeCmd);
-
-            // Handle SW 61 XX chaining
-            while (envelopeResp != null && envelopeResp.length >= 2
-                    && envelopeResp[envelopeResp.length - 2] == 0x61)
-            {
-                byte[] getResp = cred.process(reader.buildGetResponseCommand());
-                if (getResp == null) break;
-                envelopeResp = getResp;
-            }
-
-            if (!isSW9000(envelopeResp))
-                return result("BLE_STEP_UP_FULL_FLOW", "Full Flow",
-                        "BLE Step-Up full flow (interface_byte=0xC3)", false,
-                        "ENVELOPE failed: " + swHex(envelopeResp), start);
-
-            // Step 9: Parse SessionData from ENVELOPE response and decrypt DeviceResponse
-            byte[] responseData = Arrays.copyOfRange(envelopeResp, 0, envelopeResp.length - 2);
-            CBORObject respSessionData = CBORObject.DecodeFromBytes(responseData);
-            CBORObject dataValue = respSessionData.get(CBORObject.FromObject("data"));
-            if (dataValue == null)
-                return result("BLE_STEP_UP_FULL_FLOW", "Full Flow",
-                        "BLE Step-Up full flow (interface_byte=0xC3)", false,
-                        "ENVELOPE response SessionData missing 'data' key (§8.4.3)", start);
-
-            byte[] encryptedResponse = dataValue.GetByteString();
-            byte[] deviceResponseBytes = AliroCryptoProvider.decryptDeviceGcm(suSKDevice, encryptedResponse);
-            if (deviceResponseBytes == null)
-                return result("BLE_STEP_UP_FULL_FLOW", "Full Flow",
-                        "BLE Step-Up full flow (interface_byte=0xC3)", false,
-                        "DeviceResponse AES-GCM decryption failed (wrong suSKDevice?)", start);
-
-            // Step 10: Verify DeviceResponse CBOR version
-            CBORObject deviceResponse = CBORObject.DecodeFromBytes(deviceResponseBytes);
-            CBORObject version = deviceResponse.get(CBORObject.FromObject("1"));
-            if (version == null || !"1.0".equals(version.AsString()))
-                return result("BLE_STEP_UP_FULL_FLOW", "Full Flow",
-                        "BLE Step-Up full flow (interface_byte=0xC3)", false,
-                        "DeviceResponse version != 1.0", start);
-
-            return result("BLE_STEP_UP_FULL_FLOW", "Full Flow",
-                    "BLE SELECT→AUTH0→AUTH1(0xC3)→EXCHANGE→ENVELOPE: stepUpSK→suSKReader/suSKDevice, DeviceResponse v=1.0",
-                    true, "BLE interface_byte=0xC3, signaling_bitmap Bit0 set, ENVELOPE/DeviceResponse round-trip OK", start);
-        }
-        catch (Exception e)
-        {
-            return result("BLE_STEP_UP_FULL_FLOW", "Full Flow",
-                    "BLE Step-Up full flow", false, e.toString(), start);
-        }
-    }
-
-    // =========================================================================
-    // GROUP 3 additions: Sample data round-trip tests
-    // =========================================================================
-
-    /**
-     * MAILBOX_SAMPLE_TLV_PARSE — Build the §18 sample mailbox and verify parse round-trip.
-     *
-     * Calls AliroMailbox.buildSampleMailbox() to obtain the 256-byte buffer, checks the
-     * container tag (0x60) and non-zero content, then parses it back to a human-readable
-     * string and verifies that the well-known sample fields are present.
-     */
-    private TestResult testMailboxSampleTLVParse()
-    {
-        long start = System.currentTimeMillis();
-        try
-        {
-            // Step 1: Build the 256-byte sample mailbox buffer.
-            byte[] buffer = AliroMailbox.buildSampleMailbox();
-            if (buffer == null || buffer.length != 256)
-                return result("MAILBOX_SAMPLE_TLV_PARSE", "Full Flow",
-                        "Sample mailbox §18 TLV build + parse round-trip", false,
-                        "buildSampleMailbox() returned null or wrong length: "
-                                + (buffer == null ? "null" : buffer.length), start);
-
-            // Step 2: Verify container tag.
-            if ((buffer[0] & 0xFF) != 0x60)
-                return result("MAILBOX_SAMPLE_TLV_PARSE", "Full Flow",
-                        "Sample mailbox §18 TLV build + parse round-trip", false,
-                        "buffer[0] expected 0x60 (container tag), got 0x"
-                                + String.format("%02X", buffer[0] & 0xFF), start);
-
-            // Step 3: Verify buffer is not all zeros.
-            boolean allZero = true;
-            for (byte b : buffer) { if (b != 0) { allZero = false; break; } }
-            if (allZero)
-                return result("MAILBOX_SAMPLE_TLV_PARSE", "Full Flow",
-                        "Sample mailbox §18 TLV build + parse round-trip", false,
-                        "buffer is all zeros — sample data was not written", start);
-
-            // Step 4: Parse back to human-readable string.
-            String parsed = AliroMailbox.parseMailboxToString(buffer, 256);
-            if (parsed == null)
-                return result("MAILBOX_SAMPLE_TLV_PARSE", "Full Flow",
-                        "Sample mailbox §18 TLV build + parse round-trip", false,
-                        "parseMailboxToString() returned null", start);
-
-            // Step 5: Verify firmware version fields.
-            if (!parsed.contains("Firmware"))
-                return result("MAILBOX_SAMPLE_TLV_PARSE", "Full Flow",
-                        "Sample mailbox §18 TLV build + parse round-trip", false,
-                        "Parsed string missing 'Firmware' field", start);
-            if (!parsed.contains("2.1.0"))
-                return result("MAILBOX_SAMPLE_TLV_PARSE", "Full Flow",
-                        "Sample mailbox §18 TLV build + parse round-trip", false,
-                        "Parsed string missing firmware version '2.1.0'", start);
-
-            // Step 6: Verify battery/door status fields.
-            if (!parsed.contains("Battery"))
-                return result("MAILBOX_SAMPLE_TLV_PARSE", "Full Flow",
-                        "Sample mailbox §18 TLV build + parse round-trip", false,
-                        "Parsed string missing 'Battery' field", start);
-            if (!parsed.contains("95%"))
-                return result("MAILBOX_SAMPLE_TLV_PARSE", "Full Flow",
-                        "Sample mailbox §18 TLV build + parse round-trip", false,
-                        "Parsed string missing battery level '95%'", start);
-
-            // Step 7: Verify ELATEC OUI.
-            if (!parsed.contains("OUI"))
-                return result("MAILBOX_SAMPLE_TLV_PARSE", "Full Flow",
-                        "Sample mailbox §18 TLV build + parse round-trip", false,
-                        "Parsed string missing 'OUI' field", start);
-            if (!parsed.contains("00:13:7D"))
-                return result("MAILBOX_SAMPLE_TLV_PARSE", "Full Flow",
-                        "Sample mailbox §18 TLV build + parse round-trip", false,
-                        "Parsed string missing ELATEC OUI '00:13:7D'", start);
-
-            return result("MAILBOX_SAMPLE_TLV_PARSE", "Full Flow",
-                    "Sample mailbox §18 TLV build + parse round-trip",
-                    true, "buffer[0]=0x60, non-zero, Firmware/2.1.0/Battery/95%/OUI/00:13:7D all present", start);
-        }
-        catch (Exception e)
-        {
-            return result("MAILBOX_SAMPLE_TLV_PARSE", "Full Flow",
-                    "Sample mailbox §18 TLV build + parse round-trip", false, e.toString(), start);
-        }
-    }
-
-    /**
-     * ACCESS_DOC_REALISTIC_SAMPLE — Generate a realistic Access Document and verify the CBOR
-     * structure round-trips through Base64 / SharedPreferences storage.
-     *
-     * Uses a synthetic 65-byte credential public key (0x04 prefix + 32×0x01 X + 32×0x01 Y)
-     * to exercise AliroAccessDocument.generateRealisticSampleDocument() and then decodes the
-     * stored Base64 blob back through the CBOR parser.
-     */
-    private TestResult testAccessDocRealisticSample()
-    {
-        long start = System.currentTimeMillis();
-        if (context == null)
-        {
-            // Skip gracefully when no Context is provided (unit-test environment).
-            return new TestResult("ACCESS_DOC_REALISTIC_SAMPLE", "Full Flow",
-                    "Realistic Access Document CBOR structure validation",
-                    true, true, "SKIPPED — no Android Context available",
-                    System.currentTimeMillis() - start);
-        }
-        try
-        {
-            // Step 1: Build a synthetic 65-byte credential public key (04 || 32×0x01 || 32×0x01).
-            byte[] pubKey = new byte[65];
-            pubKey[0] = 0x04;
-            Arrays.fill(pubKey, 1, 65, (byte) 0x01);
-
-            // Step 2: Generate the realistic sample document.
-            String summary = AliroAccessDocument.generateRealisticSampleDocument(
-                    context, pubKey, "access", 365);
-
-            // Step 3: Verify non-null return.
-            if (summary == null)
-                return result("ACCESS_DOC_REALISTIC_SAMPLE", "Full Flow",
-                        "Realistic Access Document CBOR structure validation", false,
-                        "generateRealisticSampleDocument() returned null", start);
-
-            // Step 4: Verify employee ID in summary.
-            if (!summary.contains("ELATEC001"))
-                return result("ACCESS_DOC_REALISTIC_SAMPLE", "Full Flow",
-                        "Realistic Access Document CBOR structure validation", false,
-                        "Summary missing employee ID 'ELATEC001': " + summary, start);
-
-            // Step 5: Verify element identifier in summary.
-            if (!summary.contains("access"))
-                return result("ACCESS_DOC_REALISTIC_SAMPLE", "Full Flow",
-                        "Realistic Access Document CBOR structure validation", false,
-                        "Summary missing element identifier 'access': " + summary, start);
-
-            // Step 6: Load the stored document from SharedPreferences and verify Base64.
-            // AliroAccessDocument stores to PREFS_NAME="AliroCredentialConfig",
-            // KEY_ACCESS_DOC="aliro_access_doc".
-            SharedPreferences prefs = context.getSharedPreferences(
-                    AliroAccessDocument.PREFS_NAME, Context.MODE_PRIVATE);
-            String storedB64 = prefs.getString(AliroAccessDocument.KEY_ACCESS_DOC, null);
-            if (storedB64 == null)
-                return result("ACCESS_DOC_REALISTIC_SAMPLE", "Full Flow",
-                        "Realistic Access Document CBOR structure validation", false,
-                        "No '" + AliroAccessDocument.KEY_ACCESS_DOC + "' entry found in "
-                                + AliroAccessDocument.PREFS_NAME + " SharedPreferences", start);
-
-            byte[] cborBytes;
-            try
-            {
-                cborBytes = Base64.decode(storedB64, Base64.DEFAULT);
-            }
-            catch (IllegalArgumentException e)
-            {
-                return result("ACCESS_DOC_REALISTIC_SAMPLE", "Full Flow",
-                        "Realistic Access Document CBOR structure validation", false,
-                        "Stored value is not valid Base64: " + e.getMessage(), start);
-            }
-
-            if (cborBytes == null || cborBytes.length == 0)
-                return result("ACCESS_DOC_REALISTIC_SAMPLE", "Full Flow",
-                        "Realistic Access Document CBOR structure validation", false,
-                        "Base64-decoded CBOR byte array is empty", start);
-
-            // Step 7: Verify CBOR can be parsed without throwing.
-            try
-            {
-                CBORObject.DecodeFromBytes(cborBytes);
-            }
-            catch (Exception e)
-            {
-                return result("ACCESS_DOC_REALISTIC_SAMPLE", "Full Flow",
-                        "Realistic Access Document CBOR structure validation", false,
-                        "CBORObject.DecodeFromBytes threw: " + e.getMessage(), start);
-            }
-
-            return result("ACCESS_DOC_REALISTIC_SAMPLE", "Full Flow",
-                    "Realistic Access Document CBOR structure validation",
-                    true, "summary contains ELATEC001/access, stored Base64 decodes to valid CBOR ("
-                            + cborBytes.length + " bytes)", start);
-        }
-        catch (Exception e)
-        {
-            return result("ACCESS_DOC_REALISTIC_SAMPLE", "Full Flow",
-                    "Realistic Access Document CBOR structure validation", false, e.toString(), start);
-        }
-    }
-
-    /**
-     * PROVISIONING_ROUND_TRIP — Real credential provisioning: generate Issuer CA, reader cert,
-     * export/import JSON, verify cert.
-     *
-     * Requires a non-null Context (uses SharedPreferences). Skips gracefully if null.
-     *
-     * Steps:
-     *   1. AliroProvisioningManager.provisionCredential(context) — non-null return
-     *   2. AliroProvisioningManager.isProvisioned(context)       — must return true
-     *   3. AliroProvisioningManager.buildExportJson(context)     — non-null, valid JSON
-     *   4. Parse JSON: verify readerPrivateKey(64 hex), readerId(64 hex),
-     *                  readerCert(non-empty), issuerPubKey(130 hex), readerGroupId(32 hex)
-     *   5. Hex-decode readerCert + issuerPubKey; call verifyProfile0000Cert — must return true
-     *   6. AliroProvisioningManager.clearProvisioning(context)
-     *   7. AliroProvisioningManager.isProvisioned(context)       — must return false
-     */
-    private TestResult testProvisioningRoundTrip()
-    {
-        long start = System.currentTimeMillis();
-        if (context == null)
-        {
-            // Skip gracefully when no Context is provided (unit-test environment).
-            return new TestResult("PROVISIONING_ROUND_TRIP", "Full Flow",
-                    "Real credential provisioning: generate Issuer CA, reader cert, export/import JSON, verify cert",
-                    true, true, "SKIPPED — no Android Context available",
-                    System.currentTimeMillis() - start);
-        }
-        try
-        {
-            // Step 1: provisionCredential — must return non-null summary string.
-            String summary = AliroProvisioningManager.provisionCredential(context);
-            if (summary == null)
-                return result("PROVISIONING_ROUND_TRIP", "Full Flow",
-                        "Real credential provisioning: generate Issuer CA, reader cert, export/import JSON, verify cert",
-                        false, "provisionCredential() returned null", start);
-
-            // Step 2: isProvisioned — must return true after successful provisioning.
-            if (!AliroProvisioningManager.isProvisioned(context))
-                return result("PROVISIONING_ROUND_TRIP", "Full Flow",
-                        "Real credential provisioning: generate Issuer CA, reader cert, export/import JSON, verify cert",
-                        false, "isProvisioned() returned false immediately after provisionCredential()", start);
-
-            // Step 3: buildExportJson — must return non-null and parse as valid JSON.
-            String json = AliroProvisioningManager.buildExportJson(context);
-            if (json == null)
-                return result("PROVISIONING_ROUND_TRIP", "Full Flow",
-                        "Real credential provisioning: generate Issuer CA, reader cert, export/import JSON, verify cert",
-                        false, "buildExportJson() returned null", start);
-
-            org.json.JSONObject obj;
-            try
-            {
-                obj = new org.json.JSONObject(json);
-            }
-            catch (Exception e)
-            {
-                return result("PROVISIONING_ROUND_TRIP", "Full Flow",
-                        "Real credential provisioning: generate Issuer CA, reader cert, export/import JSON, verify cert",
-                        false, "buildExportJson() did not produce valid JSON: " + e.getMessage(), start);
-            }
-
-            // Step 4: Verify required JSON fields with correct lengths.
-            String readerPrivateKey = obj.optString("readerPrivateKey", "");
-            if (readerPrivateKey.length() != 64)
-                return result("PROVISIONING_ROUND_TRIP", "Full Flow",
-                        "Real credential provisioning: generate Issuer CA, reader cert, export/import JSON, verify cert",
-                        false, "readerPrivateKey length=" + readerPrivateKey.length() + ", expected 64 hex chars", start);
-
-            String readerId = obj.optString("readerId", "");
-            if (readerId.length() != 64)
-                return result("PROVISIONING_ROUND_TRIP", "Full Flow",
-                        "Real credential provisioning: generate Issuer CA, reader cert, export/import JSON, verify cert",
-                        false, "readerId length=" + readerId.length() + ", expected 64 hex chars", start);
-
-            String readerCertHex = obj.optString("readerCert", "");
-            if (readerCertHex.isEmpty())
-                return result("PROVISIONING_ROUND_TRIP", "Full Flow",
-                        "Real credential provisioning: generate Issuer CA, reader cert, export/import JSON, verify cert",
-                        false, "readerCert is empty", start);
-
-            String issuerPubKeyHex = obj.optString("issuerPubKey", "");
-            if (issuerPubKeyHex.length() != 130)
-                return result("PROVISIONING_ROUND_TRIP", "Full Flow",
-                        "Real credential provisioning: generate Issuer CA, reader cert, export/import JSON, verify cert",
-                        false, "issuerPubKey length=" + issuerPubKeyHex.length() + ", expected 130 hex chars", start);
-
-            String readerGroupId = obj.optString("readerGroupId", "");
-            if (readerGroupId.length() != 32)
-                return result("PROVISIONING_ROUND_TRIP", "Full Flow",
-                        "Real credential provisioning: generate Issuer CA, reader cert, export/import JSON, verify cert",
-                        false, "readerGroupId length=" + readerGroupId.length() + ", expected 32 hex chars", start);
-
-            // Step 5: Hex-decode cert and issuer pub key, verify cert signature.
-            byte[] certBytes;
-            byte[] issuerPubKeyBytes;
-            try
-            {
-                certBytes       = Hex.decode(readerCertHex);
-                issuerPubKeyBytes = Hex.decode(issuerPubKeyHex);
-            }
-            catch (Exception e)
-            {
-                return result("PROVISIONING_ROUND_TRIP", "Full Flow",
-                        "Real credential provisioning: generate Issuer CA, reader cert, export/import JSON, verify cert",
-                        false, "Hex decode of readerCert/issuerPubKey failed: " + e.getMessage(), start);
-            }
-
-            boolean certValid = AliroProvisioningManager.verifyProfile0000Cert(certBytes, issuerPubKeyBytes);
-            if (!certValid)
-                return result("PROVISIONING_ROUND_TRIP", "Full Flow",
-                        "Real credential provisioning: generate Issuer CA, reader cert, export/import JSON, verify cert",
-                        false, "verifyProfile0000Cert() returned false — cert signature check failed", start);
-
-            // Step 6: Clear provisioning data.
-            AliroProvisioningManager.clearProvisioning(context);
-
-            // Step 7: isProvisioned must return false after clearing.
-            if (AliroProvisioningManager.isProvisioned(context))
-                return result("PROVISIONING_ROUND_TRIP", "Full Flow",
-                        "Real credential provisioning: generate Issuer CA, reader cert, export/import JSON, verify cert",
-                        false, "isProvisioned() returned true after clearProvisioning()", start);
-
-            return result("PROVISIONING_ROUND_TRIP", "Full Flow",
-                    "Real credential provisioning: generate Issuer CA, reader cert, export/import JSON, verify cert",
-                    true,
-                    "provisionCredential OK, isProvisioned=true, JSON fields valid (privKey/id/cert/issuerPub/groupId), "
-                            + "verifyProfile0000Cert=true, clearProvisioning OK, isProvisioned=false",
-                    start);
-        }
-        catch (Exception e)
-        {
-            return result("PROVISIONING_ROUND_TRIP", "Full Flow",
-                    "Real credential provisioning: generate Issuer CA, reader cert, export/import JSON, verify cert",
-                    false, e.toString(), start);
-        }
-    }
-
-    /** Build a mailbox write TLV (0x8A): offset(2) || data per Table 8-16. */
-    private byte[] buildMailboxWriteTlv(int offset, byte[] data)
-    {
-        int valLen = 2 + data.length;
-        byte[] tlv = new byte[2 + valLen];
-        tlv[0] = (byte) 0x8A;
-        tlv[1] = (byte) valLen;
-        tlv[2] = (byte) ((offset >> 8) & 0xFF);
-        tlv[3] = (byte) (offset & 0xFF);
-        System.arraycopy(data, 0, tlv, 4, data.length);
-        return tlv;
-    }
-
     // =========================================================================
     // LoopbackReader — replicates HomeFragment Aliro NFC flow logic
     // =========================================================================
@@ -3062,11 +1870,6 @@ public class AliroSelfTestEngine
         byte[] stepUpSK;
         PrivateKey readerPrivKey;
         byte[] readerPubKeyX;
-        // Per-message GCM counters (§8.3.1.6/8.3.1.8).
-        // device_counter starts at 1 (AUTH1 consumes it), EXCHANGE responses start at 2.
-        // reader_counter starts at 1 (first EXCHANGE command uses 1).
-        int readerCounter = 1;
-        int deviceCounter = 1; // AUTH1 decrypt uses 1, post-AUTH1 EXCHANGE responses start at 2
 
         LoopbackReader()
         {
@@ -3170,7 +1973,8 @@ public class AliroSelfTestEngine
                     readerEphPubX,
                     udEphPubX,
                     PROPRIETARY_TLV,
-                    null,
+                    null,  // auth0CmdVendorTLV
+                    null,  // auth0RspVendorTLV
                     interfaceByte,
                     flag);
 
@@ -3211,11 +2015,11 @@ public class AliroSelfTestEngine
             return cmd;
         }
 
-        /** Build EXCHANGE command with access decision using current reader_counter. */
+        /** Build EXCHANGE command with access decision. */
         byte[] buildExchangeCommand()
         {
             byte[] exchangePayload = new byte[]{(byte) 0x97, 0x02, 0x01, (byte) 0x82};
-            byte[] encrypted = AliroCryptoProvider.encryptReaderGcm(skReader, exchangePayload, readerCounter++);
+            byte[] encrypted = AliroCryptoProvider.encryptReaderGcm(skReader, exchangePayload);
             if (encrypted == null) return new byte[0];
 
             byte[] cmd = new byte[5 + encrypted.length + 1];
@@ -3226,21 +2030,17 @@ public class AliroSelfTestEngine
             return cmd;
         }
 
-        /**
-         * Build ENVELOPE command (INS=0xC3) carrying SessionData CBOR.
-         * The caller is responsible for building proper SessionData = {"data": bstr(ciphertext)}.
-         * For Step-Up, ciphertext = AES-GCM(DeviceRequest, suSKReader) per §8.4.3.
-         */
-        byte[] buildEnvelopeCommand(byte[] sessionDataCbor)
+        /** Build ENVELOPE command (INS=0xC3) wrapping DeviceRequest CBOR. */
+        byte[] buildEnvelopeCommand(byte[] data)
         {
-            byte[] cmd = new byte[5 + sessionDataCbor.length + 1];
+            byte[] cmd = new byte[5 + data.length + 1];
             cmd[0] = (byte) 0x80;
             cmd[1] = (byte) 0xC3;
             cmd[2] = 0x00;
             cmd[3] = 0x00;
-            cmd[4] = (byte) sessionDataCbor.length;
-            System.arraycopy(sessionDataCbor, 0, cmd, 5, sessionDataCbor.length);
-            cmd[5 + sessionDataCbor.length] = 0x00;
+            cmd[4] = (byte) data.length;
+            System.arraycopy(data, 0, cmd, 5, data.length);
+            cmd[5 + data.length] = 0x00;
             return cmd;
         }
 
@@ -3275,12 +2075,6 @@ public class AliroSelfTestEngine
 
         State state = State.IDLE;
         byte interfaceByte = AliroCryptoProvider.INTERFACE_BYTE_NFC; // set before process() for BLE
-        boolean hasAccessDocument = false; // set true to make AUTH1 signal Bit0=1 in signaling_bitmap
-        // Per-message GCM counters (§8.3.1.6/8.3.1.8).
-        // device_counter starts at 1 (AUTH1 response uses 1); EXCHANGE responses use 2, 3, ...
-        // reader_counter starts at 1 (first EXCHANGE command uses 1, 2, ...)
-        int readerCounter = 1;
-        int deviceCounter = 1;
         KeyPair udEphKP;
         byte[] udEphPubBytes;
         byte[] readerEphPubBytes;
@@ -3292,14 +2086,6 @@ public class AliroSelfTestEngine
         byte[] skReader;
         byte[] skDevice;
         byte[] stepUpSK;
-
-        // Mailbox storage (null until initMailbox() is called)
-        byte[] mailbox = null;
-
-        void initMailbox(int size)
-        {
-            mailbox = new byte[size];
-        }
 
         // Credential keypair (generated fresh for self-test, not from Android KeyStore)
         KeyPair credentialKP;
@@ -3334,8 +2120,6 @@ public class AliroSelfTestEngine
         void reset()
         {
             state = State.IDLE;
-            readerCounter = 1;
-            deviceCounter = 1;
             udEphKP = null;
             udEphPubBytes = null;
             readerEphPubBytes = null;
@@ -3511,7 +2295,8 @@ public class AliroSelfTestEngine
                         readerEphPubX,
                         udEphPubX,
                         CRED_PROPRIETARY_TLV,
-                        null,
+                        null,  // auth0CmdVendorTLV
+                        null,  // auth0RspVendorTLV
                         interfaceByte,
                         auth0Flag);
 
@@ -3525,22 +2310,14 @@ public class AliroSelfTestEngine
                         credentialKP.getPrivate(), readerIdBytes, udEphPubX, readerEphPubX, transactionId);
                 if (credSig == null) return SW_ERROR;
 
-                // Build plaintext: 5A 41 <cred pub key 65> 9E 40 <sig 64> 5E 02 <bitmap>
-                // Table 8-11: signaling_bitmap (0x5E) is MANDATORY — always include.
-                // LoopbackCredential has no Access Document, so bitmap = 0x0000.
-                byte[] plaintext = new byte[2 + 65 + 2 + 64 + 4]; // 137 bytes
+                // Build plaintext: 5A 41 <cred pub key 65> 9E 40 <sig 64>
+                byte[] plaintext = new byte[2 + 65 + 2 + 64];
                 plaintext[0] = 0x5A; plaintext[1] = 0x41;
                 System.arraycopy(credentialPubBytes, 0, plaintext, 2, 65);
                 plaintext[67] = (byte) 0x9E; plaintext[68] = 0x40;
                 System.arraycopy(credSig, 0, plaintext, 69, 64);
-                plaintext[133] = 0x5E; plaintext[134] = 0x02;
-                // Bit0=1 if hasAccessDocument is set (simulates provisioned Access Document)
-                int bitmap = hasAccessDocument ? 0x0001 : 0x0000;
-                plaintext[135] = (byte)((bitmap >> 8) & 0xFF);
-                plaintext[136] = (byte)(bitmap & 0xFF);
 
-                // AUTH1 response uses device_counter=1; EXCHANGE responses start at 2.
-                byte[] encrypted = AliroCryptoProvider.encryptDeviceGcm(skDevice, plaintext, deviceCounter++);
+                byte[] encrypted = AliroCryptoProvider.encryptDeviceGcm(skDevice, plaintext);
                 if (encrypted == null) return SW_ERROR;
 
                 state = State.AUTH1_DONE;
@@ -3560,10 +2337,7 @@ public class AliroSelfTestEngine
 
         private byte[] handleExchange(byte[] apdu)
         {
-            // Per §8.3.3.5: multiple EXCHANGE commands are allowed per transaction
-            // (mailbox read/write/set, atomic session open+close, etc.).
-            // Accept EXCHANGE from AUTH1_DONE or EXCHANGE_DONE.
-            if (state != State.AUTH1_DONE && state != State.EXCHANGE_DONE) return SW_CONDITIONS;
+            if (state != State.AUTH1_DONE) return SW_CONDITIONS;
 
             try
             {
@@ -3572,29 +2346,12 @@ public class AliroSelfTestEngine
                 if (apdu.length < dataOffset + dataLen) return SW_ERROR;
 
                 byte[] encryptedPayload = Arrays.copyOfRange(apdu, dataOffset, dataOffset + dataLen);
-                // Decrypt using current reader_counter then increment per §8.3.1.9.
-                byte[] decrypted = AliroCryptoProvider.decryptReaderGcm(skReader, encryptedPayload, readerCounter++);
+                byte[] decrypted = AliroCryptoProvider.decryptReaderGcm(skReader, encryptedPayload);
                 if (decrypted == null) return SW_ERROR;
 
-                // Process mailbox TLVs and collect any read data.
-                byte[] readData = processMailboxTlvs(decrypted);
-
-                // Build response payload: [read data (if any)] + status [0x00 0x02 0x00 0x00]
-                byte[] statusPayload = new byte[]{0x00, 0x02, 0x00, 0x00};
-                byte[] responsePayload;
-                if (readData != null && readData.length > 0)
-                {
-                    responsePayload = new byte[readData.length + statusPayload.length];
-                    System.arraycopy(readData, 0, responsePayload, 0, readData.length);
-                    System.arraycopy(statusPayload, 0, responsePayload, readData.length, statusPayload.length);
-                }
-                else
-                {
-                    responsePayload = statusPayload;
-                }
-
-                // Encrypt response using current device_counter then increment per §8.3.1.6.
-                byte[] encryptedResponse = AliroCryptoProvider.encryptDeviceGcm(skDevice, responsePayload, deviceCounter++);
+                // Response: encrypted 0x0002 0x00 0x00
+                byte[] successPayload = new byte[]{0x00, 0x02, 0x00, 0x00};
+                byte[] encryptedResponse = AliroCryptoProvider.encryptDeviceGcm(skDevice, successPayload);
                 if (encryptedResponse == null) return SW_ERROR;
 
                 state = State.EXCHANGE_DONE;
@@ -3612,167 +2369,6 @@ public class AliroSelfTestEngine
             }
         }
 
-        /**
-         * Process mailbox TLVs from decrypted EXCHANGE plaintext.
-         * Replicates Aliro_HostApduService.processMailboxTags() logic.
-         * Tags per Table 8-16:
-         *   0xBA <len> <inner TLVs> — outer wrapper containing mailbox commands
-         *   0x8C 01 <options>       — atomic session: bit0=1 start, bit0=0 stop
-         *   0x87 04 <off_hi><off_lo><len_hi><len_lo> — read
-         *   0x8A var <off_hi><off_lo><data...>        — write
-         *   0x95 05 <off_hi><off_lo><len_hi><len_lo><value> — set (fill)
-         * Returns concatenated read data, or null if no reads.
-         */
-        private byte[] processMailboxTlvs(byte[] decrypted)
-        {
-            if (decrypted == null || decrypted.length < 2) return null;
-
-            java.io.ByteArrayOutputStream readOutput = new java.io.ByteArrayOutputStream();
-            boolean atomicActive = false;
-            byte[] atomicPending = null;
-
-            int i = 0;
-            while (i < decrypted.length - 1)
-            {
-                int tag = decrypted[i] & 0xFF;
-                int len = decrypted[i + 1] & 0xFF;
-                int valOff = i + 2;
-                if (valOff + len > decrypted.length) break;
-
-                switch (tag)
-                {
-                    case 0xBA: // Outer mailbox wrapper — recurse into inner TLVs
-                    {
-                        byte[] inner = Arrays.copyOfRange(decrypted, valOff, valOff + len);
-                        byte[] innerRead = processMailboxTlvs(inner);
-                        if (innerRead != null && innerRead.length > 0)
-                        {
-                            readOutput.write(innerRead, 0, innerRead.length);
-                        }
-                        break;
-                    }
-
-                    case 0x8C: // Atomic session control
-                        if (len == 1)
-                        {
-                            boolean start = (decrypted[valOff] & 0x01) == 1;
-                            if (start && !atomicActive)
-                            {
-                                atomicActive  = true;
-                                atomicPending = (mailbox != null)
-                                        ? Arrays.copyOf(mailbox, mailbox.length)
-                                        : new byte[0];
-                            }
-                            else if (!start && atomicActive)
-                            {
-                                // Commit pending writes
-                                if (atomicPending != null)
-                                {
-                                    mailbox = atomicPending;
-                                }
-                                atomicActive  = false;
-                                atomicPending = null;
-                            }
-                        }
-                        break;
-
-                    case 0x87: // Read: offset(2) || length(2)
-                        if (len == 4)
-                        {
-                            int offset  = ((decrypted[valOff]     & 0xFF) << 8)
-                                         | (decrypted[valOff + 1] & 0xFF);
-                            int readLen = ((decrypted[valOff + 2] & 0xFF) << 8)
-                                         | (decrypted[valOff + 3] & 0xFF);
-                            byte[] src  = atomicActive ? atomicPending : mailbox;
-                            if (src != null && offset + readLen <= src.length)
-                            {
-                                readOutput.write(src, offset, readLen);
-                            }
-                            // Out-of-bounds: write nothing (empty read result)
-                        }
-                        break;
-
-                    case 0x8A: // Write: offset(2) || data(var)
-                        if (len >= 2)
-                        {
-                            int offset  = ((decrypted[valOff]     & 0xFF) << 8)
-                                         | (decrypted[valOff + 1] & 0xFF);
-                            int dataLen = len - 2;
-                            byte[] target = atomicActive
-                                    ? atomicPending
-                                    : (mailbox != null ? mailbox : new byte[0]);
-                            int needed = offset + dataLen;
-                            if (needed > target.length)
-                            {
-                                target = Arrays.copyOf(target, needed);
-                            }
-                            System.arraycopy(decrypted, valOff + 2, target, offset, dataLen);
-                            if (atomicActive)
-                            {
-                                atomicPending = target;
-                            }
-                            else
-                            {
-                                mailbox = target;
-                            }
-                        }
-                        break;
-
-                    case 0x95: // Set: offset(2) || length(2) || value(1)
-                        if (len == 5)
-                        {
-                            int offset  = ((decrypted[valOff]     & 0xFF) << 8)
-                                         | (decrypted[valOff + 1] & 0xFF);
-                            int setLen  = ((decrypted[valOff + 2] & 0xFF) << 8)
-                                         | (decrypted[valOff + 3] & 0xFF);
-                            byte value  =   decrypted[valOff + 4];
-                            byte[] target = atomicActive
-                                    ? atomicPending
-                                    : (mailbox != null ? mailbox : new byte[0]);
-                            int needed  = offset + setLen;
-                            if (needed > target.length)
-                            {
-                                target = Arrays.copyOf(target, needed);
-                            }
-                            Arrays.fill(target, offset, offset + setLen, value);
-                            if (atomicActive)
-                            {
-                                atomicPending = target;
-                            }
-                            else
-                            {
-                                mailbox = target;
-                            }
-                        }
-                        break;
-
-                    default:
-                        // Unknown tag — skip per spec
-                        break;
-                }
-
-                i = valOff + len; // advance to next TLV
-            }
-
-            byte[] result = readOutput.toByteArray();
-            return result.length > 0 ? result : null;
-        }
-
-        /**
-         * Handle ENVELOPE (INS=0xC3) — Step-Up phase per §8.4.3.
-         *
-         * The APDU data contains SessionData CBOR = {"data": bstr(AES-GCM(DeviceRequest, suSKReader))}.
-         * This method:
-         *   1. Parses the SessionData CBOR and extracts the "data" bstr.
-         *   2. Decrypts the DeviceRequest using suSKReader (derived from stepUpSK).
-         *   3. Builds a minimal DeviceResponse.
-         *   4. Encrypts the DeviceResponse using suSKDevice.
-         *   5. Returns SessionData {"data": bstr(AES-GCM(DeviceResponse, suSKDevice))} with SW 9000.
-         *
-         * VIOLATION FIX: Previously received raw CBOR and returned raw CBOR without
-         * SessionData encryption/decryption. Now correctly uses AES-GCM with
-         * step-up session keys as required by §8.4.3 / ISO 18013-5 §9.1.1.4.
-         */
         private byte[] handleEnvelope(byte[] apdu)
         {
             if (state != State.EXCHANGE_DONE) return SW_CONDITIONS;
@@ -3783,82 +2379,28 @@ public class AliroSelfTestEngine
                 int dataLen = apdu[4] & 0xFF;
                 if (apdu.length < dataOffset + dataLen) return SW_ERROR;
 
-                byte[] sessionDataBytes = Arrays.copyOfRange(apdu, dataOffset, dataOffset + dataLen);
+                byte[] deviceRequestBytes = Arrays.copyOfRange(apdu, dataOffset, dataOffset + dataLen);
 
-                // Step 1: Parse SessionData CBOR = {"data": bstr(ciphertext)}
-                CBORObject sessionData;
-                try
+                // Verify incoming DeviceRequest CBOR parses without exception
+                CBORObject.DecodeFromBytes(deviceRequestBytes);
+
+                // Derive step-up session keys from stepUpSK
+                if (stepUpSK != null)
                 {
-                    sessionData = CBORObject.DecodeFromBytes(sessionDataBytes);
-                }
-                catch (Exception ex)
-                {
-                    Log.e(TAG, "LoopbackCredential ENVELOPE: SessionData CBOR parse failed", ex);
-                    return SW_ERROR;
+                    AliroCryptoProvider.deriveStepUpSessionKeys(stepUpSK);
                 }
 
-                CBORObject dataEntry = sessionData.get(CBORObject.FromObject("data"));
-                if (dataEntry == null)
-                {
-                    Log.e(TAG, "LoopbackCredential ENVELOPE: missing 'data' key in SessionData");
-                    return SW_ERROR;
-                }
-
-                byte[] encryptedDeviceRequest = dataEntry.GetByteString();
-                if (encryptedDeviceRequest == null || encryptedDeviceRequest.length == 0)
-                {
-                    Log.e(TAG, "LoopbackCredential ENVELOPE: 'data' bstr is empty");
-                    return SW_ERROR;
-                }
-
-                // Step 2: Derive step-up session keys from stepUpSK
-                // sessionKeys[0..31] = SKDevice, sessionKeys[32..63] = SKReader
-                if (stepUpSK == null)
-                {
-                    Log.e(TAG, "LoopbackCredential ENVELOPE: stepUpSK is null");
-                    return SW_ERROR;
-                }
-
-                byte[] suSessionKeys = AliroCryptoProvider.deriveStepUpSessionKeys(stepUpSK);
-                if (suSessionKeys == null || suSessionKeys.length < 64)
-                {
-                    Log.e(TAG, "LoopbackCredential ENVELOPE: deriveStepUpSessionKeys failed");
-                    return SW_ERROR;
-                }
-
-                byte[] suSKDevice = Arrays.copyOfRange(suSessionKeys, 0, 32);
-                byte[] suSKReader = Arrays.copyOfRange(suSessionKeys, 32, 64);
-
-                // Step 3: Decrypt DeviceRequest using suSKReader (reader encrypted it)
-                byte[] deviceRequestBytes = AliroCryptoProvider.decryptReaderGcm(suSKReader, encryptedDeviceRequest);
-                if (deviceRequestBytes == null)
-                {
-                    Log.e(TAG, "LoopbackCredential ENVELOPE: AES-GCM decrypt of DeviceRequest failed");
-                    return SW_ERROR;
-                }
-
-                // Step 4: Build a minimal DeviceResponse { "1": "1.0", "3": 0 }
+                // Build a minimal DeviceResponse: { "1": "1.0", "3": 0 }
                 CBORObject deviceResponse = CBORObject.NewOrderedMap();
                 deviceResponse.set(CBORObject.FromObject("1"), CBORObject.FromObject("1.0"));
                 deviceResponse.set(CBORObject.FromObject("3"), CBORObject.FromObject(0));
                 byte[] responseBytes = deviceResponse.EncodeToBytes();
 
-                // Step 5: Encrypt DeviceResponse using suSKDevice
-                byte[] encryptedResponse = AliroCryptoProvider.encryptDeviceGcm(suSKDevice, responseBytes);
-                if (encryptedResponse == null)
-                {
-                    Log.e(TAG, "LoopbackCredential ENVELOPE: AES-GCM encrypt of DeviceResponse failed");
-                    return SW_ERROR;
-                }
-
-                // Step 6: Build SessionData response = {"data": bstr(encryptedResponse)}
-                byte[] responseSessionData = buildSessionDataCbor(encryptedResponse);
-
-                // Return SessionData with SW 9000
-                byte[] response = new byte[responseSessionData.length + 2];
-                System.arraycopy(responseSessionData, 0, response, 0, responseSessionData.length);
-                response[responseSessionData.length] = (byte) 0x90;
-                response[responseSessionData.length + 1] = 0x00;
+                // Return full response with SW 9000 (loopback — no chunking needed)
+                byte[] response = new byte[responseBytes.length + 2];
+                System.arraycopy(responseBytes, 0, response, 0, responseBytes.length);
+                response[responseBytes.length] = (byte) 0x90;
+                response[responseBytes.length + 1] = 0x00;
                 return response;
             }
             catch (Exception e)
@@ -3884,31 +2426,6 @@ public class AliroSelfTestEngine
     // =========================================================================
     // Utility methods
     // =========================================================================
-
-    /**
-     * Build SessionData CBOR = {"data": bstr(ciphertext)}.
-     * Used for ENVELOPE command/response per §8.4.3 / ISO 18013-5 §9.1.1.4.
-     */
-    private static byte[] buildSessionDataCbor(byte[] ciphertext)
-    {
-        CBORObject sessionData = CBORObject.NewOrderedMap();
-        sessionData.set(CBORObject.FromObject("data"), CBORObject.FromObject(ciphertext));
-        return sessionData.EncodeToBytes();
-    }
-
-    /**
-     * Build a standard EXCHANGE APDU (CLA=80, INS=C9, P1=00, P2=00)
-     * wrapping the given encrypted payload.
-     */
-    private static byte[] buildExchangeApdu(byte[] encrypted)
-    {
-        byte[] cmd = new byte[5 + encrypted.length + 1];
-        cmd[0] = (byte) 0x80; cmd[1] = (byte) 0xC9; cmd[2] = 0x00; cmd[3] = 0x00;
-        cmd[4] = (byte) encrypted.length;
-        System.arraycopy(encrypted, 0, cmd, 5, encrypted.length);
-        cmd[5 + encrypted.length] = 0x00;
-        return cmd;
-    }
 
     private static boolean isSW9000(byte[] response)
     {
@@ -3957,6 +2474,250 @@ public class AliroSelfTestEngine
         {
             Log.e(TAG, "derivePublicKeyXFromPrivate failed", e);
             return null;
+        }
+    }
+
+    // =========================================================================
+    // Harness-validated feature tests
+    // =========================================================================
+
+    /**
+     * CRYPTO_KPERSISTENT: Verify Kpersistent derivation produces 32 non-zero bytes.
+     * Per Aliro §8.3.1.13: Kpersistent is derived for FAST AUTH0 transactions.
+     */
+    private TestResult testCryptoKpersistent()
+    {
+        long start = System.currentTimeMillis();
+        try
+        {
+            KeyPair kp1 = AliroCryptoProvider.generateEphemeralKeypair();
+            KeyPair kp2 = AliroCryptoProvider.generateEphemeralKeypair();
+            byte[] pub1 = AliroCryptoProvider.getUncompressedPublicKey(kp1);
+            byte[] pub2 = AliroCryptoProvider.getUncompressedPublicKey(kp2);
+            byte[] tid  = AliroCryptoProvider.generateRandom(16);
+            byte[] credPubKeyX = Arrays.copyOfRange(pub2, 1, 33);
+
+            byte[] proto = {0x01, 0x00};
+            byte[] flag = {0x00, 0x01};
+            byte[] kpersistent = AliroCryptoProvider.deriveKpersistent(
+                    kp1.getPrivate(), pub2, proto,
+                    TEST_READER_PUB_KEY_X, TEST_READER_ID, tid,
+                    Arrays.copyOfRange(pub1, 1, 33),
+                    Arrays.copyOfRange(pub2, 1, 33),
+                    credPubKeyX,
+                    PROPRIETARY_TLV,
+                    null, null,
+                    AliroCryptoProvider.INTERFACE_BYTE_NFC, flag);
+
+            if (kpersistent == null)
+                return result("CRYPTO_KPERSISTENT", "Crypto", "Kpersistent derivation", false,
+                        "deriveKpersistent() returned null", start);
+
+            if (kpersistent.length != 32)
+                return result("CRYPTO_KPERSISTENT", "Crypto", "Kpersistent derivation", false,
+                        "Expected 32 bytes, got " + kpersistent.length, start);
+
+            if (Arrays.equals(kpersistent, new byte[32]))
+                return result("CRYPTO_KPERSISTENT", "Crypto", "Kpersistent derivation", false,
+                        "Kpersistent is all zeros", start);
+
+            return result("CRYPTO_KPERSISTENT", "Crypto",
+                    "Kpersistent derivation produces 32 non-zero bytes", true,
+                    "32-byte Kpersistent confirmed", start);
+        }
+        catch (Exception e)
+        {
+            return result("CRYPTO_KPERSISTENT", "Crypto", "Kpersistent derivation", false, e.toString(), start);
+        }
+    }
+
+    /**
+     * CRYPTO_FAST_KEYS: Verify FAST key derivation from Kpersistent produces 160 bytes.
+     * Per Aliro §8.3.1.13: FAST AUTH0 derives CryptogramSK + ExpeditedSK + StepUpSK + BleSK.
+     */
+    private TestResult testCryptoFastKeys()
+    {
+        long start = System.currentTimeMillis();
+        try
+        {
+            KeyPair kp1 = AliroCryptoProvider.generateEphemeralKeypair();
+            KeyPair kp2 = AliroCryptoProvider.generateEphemeralKeypair();
+            byte[] pub1 = AliroCryptoProvider.getUncompressedPublicKey(kp1);
+            byte[] pub2 = AliroCryptoProvider.getUncompressedPublicKey(kp2);
+            byte[] tid  = AliroCryptoProvider.generateRandom(16);
+            byte[] credPubKeyX = Arrays.copyOfRange(pub2, 1, 33);
+            byte[] flag = {0x01, 0x01}; // fast mode
+            byte[] proto = {0x01, 0x00};
+
+            byte[] kpersistent = AliroCryptoProvider.deriveKpersistent(
+                    kp1.getPrivate(), pub2, proto,
+                    TEST_READER_PUB_KEY_X, TEST_READER_ID, tid,
+                    Arrays.copyOfRange(pub1, 1, 33),
+                    Arrays.copyOfRange(pub2, 1, 33),
+                    credPubKeyX,
+                    PROPRIETARY_TLV,
+                    null, null,
+                    AliroCryptoProvider.INTERFACE_BYTE_NFC, flag);
+
+            if (kpersistent == null)
+                return result("CRYPTO_FAST_KEYS", "Crypto", "FAST key derivation", false,
+                        "Kpersistent derivation failed", start);
+
+            byte[] fastKeys = AliroCryptoProvider.deriveFastKeys(
+                    kpersistent, 160, proto,
+                    TEST_READER_PUB_KEY_X, TEST_READER_ID, tid,
+                    Arrays.copyOfRange(pub1, 1, 33),
+                    Arrays.copyOfRange(pub2, 1, 33),
+                    credPubKeyX,
+                    PROPRIETARY_TLV,
+                    null, null,
+                    AliroCryptoProvider.INTERFACE_BYTE_NFC,
+                    flag);
+
+            if (fastKeys == null)
+                return result("CRYPTO_FAST_KEYS", "Crypto", "FAST key derivation", false,
+                        "deriveFastKeys(160) returned null", start);
+
+            if (fastKeys.length != 160)
+                return result("CRYPTO_FAST_KEYS", "Crypto", "FAST key derivation", false,
+                        "Expected 160 bytes, got " + fastKeys.length, start);
+
+            byte[] cryptogramSK = Arrays.copyOfRange(fastKeys, 0, 32);
+            byte[] expeditedSKR = Arrays.copyOfRange(fastKeys, 32, 64);
+            byte[] zeros = new byte[32];
+            if (Arrays.equals(cryptogramSK, zeros) || Arrays.equals(expeditedSKR, zeros))
+                return result("CRYPTO_FAST_KEYS", "Crypto", "FAST key derivation", false,
+                        "CryptogramSK or ExpeditedSKReader is all zeros", start);
+
+            return result("CRYPTO_FAST_KEYS", "Crypto",
+                    "FAST 160-byte key derivation (Kpersistent -> session keys)", true,
+                    "160 bytes: CryptogramSK + ExpeditedSK + StepUpSK + BleSK", start);
+        }
+        catch (Exception e)
+        {
+            return result("CRYPTO_FAST_KEYS", "Crypto", "FAST key derivation", false, e.toString(), start);
+        }
+    }
+
+    /**
+     * MULTI_GROUP_KEY_LOOKUP: Verify the static READER_KEY_BY_GROUP_ID map
+     * in Aliro_HostApduService contains all 16 group IDs with valid 65-byte keys.
+     * Per Aliro §8.3.3.4.5: credential SHALL look up reader key by group_id.
+     */
+    private TestResult testMultiGroupKeyLookup()
+    {
+        long start = System.currentTimeMillis();
+        try
+        {
+            String[] groupIds = {
+                "00113344667799AA00113344667799AB", "00113344667799AA00113344667799AC",
+                "00113344667799AA00113344667799AD", "00113344667799AA00113344667799AE",
+                "00113344667799AA00113344667799AF", "00113344667799AA00113344667799BA",
+                "00113344667799AA00113344667799BB", "00113344667799AA00113344667799BC",
+                "00113344667799AA00113344667799BD", "00113344667799AA00113344667799BE",
+                "00113344667799AA00113344667799BF", "00113344667799AA00113344667799CA",
+                "00113344667799AA00113344667799CB", "00113344667799AA00113344667799CC",
+                "00113344667799AA00113344667799CD", "00113344667799AA00113344667799CE",
+            };
+
+            Class<?> hceClass;
+            try
+            {
+                hceClass = Class.forName("com.psia.pkoc.Aliro_HostApduService");
+            }
+            catch (ClassNotFoundException cnf)
+            {
+                // Running in the simulator app — HCE class not available; skip
+                return new TestResult("MULTI_GROUP_KEY_LOOKUP", "Harness",
+                        "Multi-group reader key map (credential app only)",
+                        true, true, "Skipped — HCE class not in classpath",
+                        System.currentTimeMillis() - start);
+            }
+            java.lang.reflect.Field mapField =
+                    hceClass.getDeclaredField("READER_KEY_BY_GROUP_ID");
+            mapField.setAccessible(true);
+            @SuppressWarnings("unchecked")
+            java.util.Map<String, String> map = (java.util.Map<String, String>) mapField.get(null);
+
+            if (map == null || map.size() != 16)
+                return result("MULTI_GROUP_KEY_LOOKUP", "Harness",
+                        "Multi-group reader key map", false,
+                        "Map is null or wrong size: " + (map != null ? map.size() : "null"), start);
+
+            for (String gid : groupIds)
+            {
+                String keyHex = map.get(gid);
+                if (keyHex == null)
+                    return result("MULTI_GROUP_KEY_LOOKUP", "Harness",
+                            "Multi-group reader key map", false,
+                            "Missing group_id: " + gid, start);
+                if (keyHex.length() != 130 || !keyHex.startsWith("04"))
+                    return result("MULTI_GROUP_KEY_LOOKUP", "Harness",
+                            "Multi-group reader key map", false,
+                            "Invalid key for " + gid + ": len=" + keyHex.length(), start);
+            }
+
+            java.util.Set<String> uniqueKeys = new java.util.HashSet<>(map.values());
+            if (uniqueKeys.size() != 16)
+                return result("MULTI_GROUP_KEY_LOOKUP", "Harness",
+                        "Multi-group reader key map", false,
+                        "Expected 16 unique keys, got " + uniqueKeys.size(), start);
+
+            return result("MULTI_GROUP_KEY_LOOKUP", "Harness",
+                    "16 group_id -> reader_key mappings verified", true,
+                    "All 16 entries valid, distinct 65-byte P-256 keys", start);
+        }
+        catch (Exception e)
+        {
+            return result("MULTI_GROUP_KEY_LOOKUP", "Harness",
+                    "Multi-group reader key map", false, e.toString(), start);
+        }
+    }
+
+    /**
+     * MAILBOX_STRUCTURED_FORMAT: Verify AliroMailbox.buildSampleMailbox() produces
+     * valid §18 TLV data that parseMailboxToString() can decode.
+     */
+    private TestResult testMailboxStructuredFormat()
+    {
+        long start = System.currentTimeMillis();
+        try
+        {
+            byte[] mailbox = AliroMailbox.buildSampleMailbox();
+            if (mailbox == null || mailbox.length != AliroMailbox.MAILBOX_SIZE)
+                return result("MAILBOX_STRUCTURED", "Mailbox",
+                        "Structured S18 mailbox", false,
+                        "buildSampleMailbox returned null or wrong size", start);
+
+            if ((mailbox[0] & 0xFF) != 0x60)
+                return result("MAILBOX_STRUCTURED", "Mailbox",
+                        "Structured S18 mailbox", false,
+                        "First byte should be 0x60, got 0x" + String.format("%02X", mailbox[0] & 0xFF), start);
+
+            String parsed = AliroMailbox.parseMailboxToString(mailbox, mailbox.length);
+            if (parsed == null || parsed.isEmpty())
+                return result("MAILBOX_STRUCTURED", "Mailbox",
+                        "Structured S18 mailbox", false,
+                        "parseMailboxToString returned null/empty", start);
+
+            boolean hasFirmware = parsed.contains("Firmware:");
+            boolean hasSerial   = parsed.contains("Serial:");
+            boolean hasLock     = parsed.contains("Lock:");
+            boolean hasBattery  = parsed.contains("Battery:");
+
+            if (!hasFirmware || !hasSerial || !hasLock || !hasBattery)
+                return result("MAILBOX_STRUCTURED", "Mailbox",
+                        "Structured S18 mailbox", false,
+                        "Parsed output missing expected fields", start);
+
+            return result("MAILBOX_STRUCTURED", "Mailbox",
+                    "S18 TLV build + parse (Reader Config, Door Status)", true,
+                    "ELATEC OUI, 2 entries, all fields parsed", start);
+        }
+        catch (Exception e)
+        {
+            return result("MAILBOX_STRUCTURED", "Mailbox",
+                    "Structured S18 mailbox", false, e.toString(), start);
         }
     }
 

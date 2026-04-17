@@ -1008,7 +1008,8 @@ public class AliroBleCredentialService extends Service
                     readerEphPubX,
                     udEphPubX,
                     PROPRIETARY_TLV,
-                    null,
+                    null,  // auth0CmdVendorTLV
+                    null,  // auth0RspVendorTLV
                     AliroCryptoProvider.INTERFACE_BYTE_BLE,
                     auth0Flag);
 

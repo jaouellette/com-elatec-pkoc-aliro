@@ -858,6 +858,11 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
             readerImageView.setVisibility(View.VISIBLE);
             keypadLayout.setVisibility(View.VISIBLE);
             pinDisplay.setText("");
+
+            // Reset font in case diagnostic mode changed it to monospace
+            textView.setTextSize(16);
+            textView.setTypeface(android.graphics.Typeface.DEFAULT);
+
             isDisplayingResult = false;
         });
     }
@@ -2123,18 +2128,240 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
             }
 
             // ------------------------------------------------------------------
-            // Step 2: SELECT certificate EF (file ID 0x0001)
+            // Step 2: SELECT certificate EF
+            // Try DUOX file ID (E103) first, then fallback to 0001.
+            // If both fail, run diagnostic probes.
             // ------------------------------------------------------------------
-            byte[] fileId   = LeafVerifiedManager.LEAF_CERT_FILE_ID;
-            byte[] selectEF = { 0x00, (byte)0xA4, 0x02, 0x00, 0x02, fileId[0], fileId[1] };
-            Log.d(TAG, "LEAF SELECT EF: " + Hex.toHexString(selectEF));
-            byte[] selectEFResp = isoDep.transceive(selectEF);
-            Log.d(TAG, "LEAF SELECT EF response: " + Hex.toHexString(selectEFResp));
-
-            if (!isSW9000(selectEFResp))
+            byte[][] efCandidates = {
+                    LeafVerifiedManager.LEAF_CERT_FILE_ID,
+                    LeafVerifiedManager.LEAF_CERT_FILE_ID_ALT
+            };
+            byte[] selectEFResp = null;
+            byte[] usedFileId = null;
+            for (byte[] fid : efCandidates)
             {
-                Log.e(TAG, "LEAF: SELECT EF failed, SW=" + swHex(selectEFResp));
-                showLeafError("LEAF SELECT EF failed: " + swHex(selectEFResp));
+                byte[] selectEF = { 0x00, (byte)0xA4, 0x02, 0x00, 0x02, fid[0], fid[1] };
+                Log.d(TAG, "LEAF SELECT EF: " + Hex.toHexString(selectEF));
+                selectEFResp = isoDep.transceive(selectEF);
+                Log.d(TAG, "LEAF SELECT EF response: " + Hex.toHexString(selectEFResp));
+                if (isSW9000(selectEFResp))
+                {
+                    usedFileId = fid;
+                    Log.d(TAG, "LEAF: EF " + Hex.toHexString(fid) + " selected successfully");
+                    break;
+                }
+                Log.d(TAG, "LEAF: EF " + Hex.toHexString(fid) + " failed (" + swHex(selectEFResp) + "), trying next...");
+            }
+
+            if (usedFileId == null)
+            {
+                Log.w(TAG, "LEAF: SELECT EF 0001 failed (" + swHex(selectEFResp)
+                        + ") — running diagnostic probes...");
+
+                // === DIAGNOSTIC: Probe the card's file structure ===
+                StringBuilder diag = new StringBuilder();
+                diag.append("LEAF Verified Diagnostic Report\n");
+                diag.append("================================\n\n");
+                diag.append("AID SELECT: OK (" + Hex.toHexString(selectResp) + ")\n");
+                diag.append("SELECT EF 0001: FAILED (" + swHex(selectEFResp) + ")\n\n");
+
+                // Probe 1: DESFire GetFileIDs (native cmd 0x6F, wrapped)
+                diag.append("--- Probe 1: DESFire GetFileIDs (90 6F 00 00 00) ---\n");
+                try
+                {
+                    byte[] getFileIDs = { (byte)0x90, 0x6F, 0x00, 0x00, 0x00 };
+                    byte[] fileIDsResp = isoDep.transceive(getFileIDs);
+                    String fileIDsHex = Hex.toHexString(fileIDsResp);
+                    diag.append("Response: ").append(fileIDsHex).append("\n");
+                    Log.d(TAG, "LEAF DIAG GetFileIDs: " + fileIDsHex);
+                    if (fileIDsResp.length > 2)
+                    {
+                        diag.append("File numbers: ");
+                        for (int i = 0; i < fileIDsResp.length - 2; i++)
+                            diag.append(String.format("0x%02X ", fileIDsResp[i]));
+                        diag.append("\n");
+                    }
+                }
+                catch (Exception e)
+                {
+                    diag.append("Error: ").append(e.getMessage()).append("\n");
+                    Log.w(TAG, "LEAF DIAG GetFileIDs failed", e);
+                }
+
+                // Probe 2: DESFire GetISOFileIDs (native cmd 0x61, wrapped)
+                diag.append("\n--- Probe 2: DESFire GetISOFileIDs (90 61 00 00 00) ---\n");
+                try
+                {
+                    byte[] getISOFileIDs = { (byte)0x90, 0x61, 0x00, 0x00, 0x00 };
+                    byte[] isoFileIDsResp = isoDep.transceive(getISOFileIDs);
+                    String isoFileIDsHex = Hex.toHexString(isoFileIDsResp);
+                    diag.append("Response: ").append(isoFileIDsHex).append("\n");
+                    Log.d(TAG, "LEAF DIAG GetISOFileIDs: " + isoFileIDsHex);
+                    if (isoFileIDsResp.length > 2)
+                    {
+                        diag.append("ISO File IDs: ");
+                        for (int i = 0; i < isoFileIDsResp.length - 2; i += 2)
+                        {
+                            if (i + 1 < isoFileIDsResp.length - 2)
+                                diag.append(String.format("0x%02X%02X ",
+                                        isoFileIDsResp[i], isoFileIDsResp[i + 1]));
+                        }
+                        diag.append("\n");
+                    }
+                }
+                catch (Exception e)
+                {
+                    diag.append("Error: ").append(e.getMessage()).append("\n");
+                    Log.w(TAG, "LEAF DIAG GetISOFileIDs failed", e);
+                }
+
+                // Probe 3: DESFire GetFileSettings for file 0 (native cmd 0xF5, wrapped)
+                diag.append("\n--- Probe 3: DESFire GetFileSettings file 0 (90 F5 00 00 01 00 00) ---\n");
+                try
+                {
+                    byte[] getSettings = { (byte)0x90, (byte)0xF5, 0x00, 0x00, 0x01, 0x00, 0x00 };
+                    byte[] settingsResp = isoDep.transceive(getSettings);
+                    String settingsHex = Hex.toHexString(settingsResp);
+                    diag.append("Response: ").append(settingsHex).append("\n");
+                    Log.d(TAG, "LEAF DIAG GetFileSettings(0): " + settingsHex);
+                    if (settingsResp.length > 2 && settingsResp[settingsResp.length - 2] == (byte)0x91
+                            && settingsResp[settingsResp.length - 1] == 0x00)
+                    {
+                        diag.append("File type: ").append(String.format("0x%02X", settingsResp[0]));
+                        if (settingsResp[0] == 0x00) diag.append(" (Standard Data File)");
+                        else if (settingsResp[0] == 0x01) diag.append(" (Backup Data File)");
+                        diag.append("\n");
+                        if (settingsResp.length >= 7)
+                        {
+                            int fileSize = (settingsResp[4] & 0xFF)
+                                    | ((settingsResp[5] & 0xFF) << 8)
+                                    | ((settingsResp[6] & 0xFF) << 16);
+                            diag.append("File size: ").append(fileSize).append(" bytes\n");
+                        }
+                    }
+                }
+                catch (Exception e)
+                {
+                    diag.append("Error: ").append(e.getMessage()).append("\n");
+                    Log.w(TAG, "LEAF DIAG GetFileSettings failed", e);
+                }
+
+                // Probe 4: Try common EF IDs via ISO SELECT
+                diag.append("\n--- Probe 4: ISO SELECT EF scan ---\n");
+                int[][] diagEfCandidates = {
+                    {0x00, 0x01}, {0x00, 0x02}, {0x00, 0x03},
+                    {0x01, 0x00}, {0x01, 0x01}, {0x01, 0x02},
+                    {0x02, 0x00}, {0x02, 0x01},
+                    {0xE1, 0x01}, {0xE1, 0x02}, {0xE1, 0x03}, {0xE1, 0x04},
+                    {0x3F, 0x00}, {0x3F, 0x01},
+                    {0x00, 0x00},
+                };
+                for (int[] ef : diagEfCandidates)
+                {
+                    try
+                    {
+                        byte[] tryEF = { 0x00, (byte)0xA4, 0x02, 0x00, 0x02,
+                                (byte)ef[0], (byte)ef[1] };
+                        byte[] tryResp = isoDep.transceive(tryEF);
+                        String efHex = String.format("%02X%02X", ef[0], ef[1]);
+                        String respHex = Hex.toHexString(tryResp);
+                        String sw = swHex(tryResp);
+                        if (isSW9000(tryResp) || tryResp.length > 2)
+                        {
+                            diag.append("  EF ").append(efHex).append(": ✅ ").append(sw);
+                            if (tryResp.length > 2)
+                                diag.append(" FCI=").append(respHex);
+                            diag.append("\n");
+                            Log.d(TAG, "LEAF DIAG EF " + efHex + ": FOUND — " + respHex);
+                        }
+                        else
+                        {
+                            Log.d(TAG, "LEAF DIAG EF " + efHex + ": " + sw);
+                        }
+                    }
+                    catch (Exception e)
+                    {
+                        Log.w(TAG, "LEAF DIAG EF scan exception", e);
+                    }
+                }
+
+                // Probe 5: Try READ BINARY with short EF IDs (P1 bit 7 set)
+                diag.append("\n--- Probe 5: READ BINARY with short EF IDs ---\n");
+                for (int shortEF = 1; shortEF <= 5; shortEF++)
+                {
+                    try
+                    {
+                        // P1 = 0x80 | (shortEF << 3), P2 = 0x00, Le = 0x04 (read 4 bytes)
+                        byte p1 = (byte)(0x80 | (shortEF & 0x1F));
+                        byte[] readCmd = { 0x00, (byte)0xB0, p1, 0x00, 0x04 };
+                        byte[] readResp = isoDep.transceive(readCmd);
+                        String sw = swHex(readResp);
+                        if (readResp.length > 2)
+                        {
+                            diag.append("  Short EF ").append(shortEF)
+                                    .append(": ✅ ").append(sw)
+                                    .append(" data=").append(Hex.toHexString(readResp))
+                                    .append("\n");
+                            Log.d(TAG, "LEAF DIAG ShortEF " + shortEF + ": "
+                                    + Hex.toHexString(readResp));
+                        }
+                    }
+                    catch (Exception e)
+                    {
+                        Log.w(TAG, "LEAF DIAG ShortEF scan exception", e);
+                    }
+                }
+
+                // Probe 6: GET DATA for FCI template
+                diag.append("\n--- Probe 6: GET DATA (00 CA 00 6E) ---\n");
+                try
+                {
+                    byte[] getData = { 0x00, (byte)0xCA, 0x00, 0x6E, 0x00 };
+                    byte[] gdResp = isoDep.transceive(getData);
+                    diag.append("Response: ").append(Hex.toHexString(gdResp)).append("\n");
+                    Log.d(TAG, "LEAF DIAG GET DATA 006E: " + Hex.toHexString(gdResp));
+                }
+                catch (Exception e)
+                {
+                    diag.append("Error: ").append(e.getMessage()).append("\n");
+                }
+
+                String diagReport = diag.toString();
+                Log.i(TAG, "\n" + diagReport);
+
+                // Display diagnostic on screen
+                final String finalDiag = diagReport;
+                requireActivity().runOnUiThread(() ->
+                {
+                    if (!isAdded()) return;
+                    readerImageView.setVisibility(View.GONE);
+                    keypadLayout.setVisibility(View.GONE);
+                    requireView().findViewById(R.id.protocolModeGroup).setVisibility(View.GONE);
+
+                    Button rdrBtn = requireView().findViewById(R.id.rdrButton);
+                    rdrBtn.setVisibility(View.GONE);
+
+                    textView.setText(finalDiag);
+                    textView.setTextSize(11);
+                    textView.setTypeface(android.graphics.Typeface.MONOSPACE);
+
+                    readerLocationUUIDView.setVisibility(View.GONE);
+                    readerSiteUUIDView.setVisibility(View.GONE);
+                    sitePublicKeyView.setVisibility(View.GONE);
+                    nfcAdvertisingStatusView.setVisibility(View.GONE);
+                    bleAdvertisingStatusView.setVisibility(View.GONE);
+
+                    Button scanButton = requireView().findViewById(R.id.scanButton);
+                    scanButton.setVisibility(View.VISIBLE);
+                    scanButton.setOnClickListener(v -> resetToScanScreen());
+
+                    Button emailButton = requireView().findViewById(R.id.emailButton);
+                    emailButton.setVisibility(View.VISIBLE);
+                    emailButton.setOnClickListener(v -> sendEmail());
+
+                    isDisplayingResult = true;
+                });
+
                 return true;
             }
 
@@ -2525,6 +2752,7 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                     readerEphPubX,
                     udEphPubX,
                     selectProprietaryTLV,
+                    null,                                    // auth0CmdVendorTLV
                     auth0RspVendorTLV,
                     AliroCryptoProvider.INTERFACE_BYTE_NFC,
                     auth0Flag);
@@ -2793,16 +3021,29 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                                 if (readDataLen > 0)
                                 {
                                     byte[] mailboxReadData = Arrays.copyOfRange(exchangeDecrypted, 0, readDataLen);
-                                    // Parse §18 TLV if data starts with 0x60, else fall back to hex
-                                    if (readDataLen > 0 && (mailboxReadData[0] & 0xFF) == 0x60)
+                                    // Find the §18 container tag 0x60 within the first few bytes.
+                                    // The EXCHANGE mailbox read response may have a 2-byte prefix
+                                    // (read offset echo) before the actual mailbox content.
+                                    int tlvStart = -1;
+                                    for (int s = 0; s < Math.min(4, readDataLen); s++)
                                     {
+                                        if ((mailboxReadData[s] & 0xFF) == 0x60) { tlvStart = s; break; }
+                                    }
+                                    if (tlvStart >= 0)
+                                    {
+                                        byte[] tlvData = Arrays.copyOfRange(mailboxReadData, tlvStart, readDataLen);
                                         mailboxResultHex = AliroMailbox.parseMailboxToString(
-                                                mailboxReadData, readDataLen);
+                                                tlvData, tlvData.length);
                                     }
                                     else
                                     {
-                                        mailboxResultHex = "Read " + readDataLen + "B: "
-                                                + Hex.toHexString(mailboxReadData);
+                                        // Show a clean summary with truncated hex for readability
+                                        String fullHex = Hex.toHexString(mailboxReadData);
+                                        String preview = (fullHex.length() > 64)
+                                                ? fullHex.substring(0, 64) + "..."
+                                                : fullHex;
+                                        mailboxResultHex = "Read " + readDataLen + " bytes\n"
+                                                + "  Preview: " + preview;
                                     }
                                     Log.d(TAG, "Mailbox READ response (" + readDataLen + " bytes): "
                                             + Hex.toHexString(mailboxReadData));
@@ -2885,23 +3126,42 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                     stepUpResult = "Step-Up failed: " + e.getMessage();
                 }
 
-                // Send final EXCHANGE with 0x97 (reader status) to close the transaction
+                // Send final EXCHANGE with 0x97 (reader status) to close the transaction.
                 // This must come AFTER step-up because 0x97 signals end-of-transaction.
-                Log.d(TAG, "Sending final EXCHANGE with 0x97 (post step-up)");
-                byte[] finalEncrypted = AliroCryptoProvider.encryptReaderGcm(skReader, statusTlv, readerCounter++);
-                if (finalEncrypted != null)
+                // Per Aliro §8.3.3.5: post-ENVELOPE EXCHANGE uses StepUpSKReader/StepUpSKDevice,
+                // NOT the expedited SKReader/SKDevice. Counter starts at 2 (ENVELOPE used 1).
+                byte[] suKeys = AliroCryptoProvider.deriveStepUpSessionKeys(stepUpSK);
+                if (suKeys == null)
                 {
-                    byte[] finalCmd = buildExchangeCommand(finalEncrypted);
-                    byte[] finalResp = isoDep.transceive(finalCmd);
-                    Log.d(TAG, "Final EXCHANGE response: " + Hex.toHexString(finalResp));
-                    // Decrypt response (increment deviceCounter)
-                    if (isSW9000(finalResp) && finalResp.length > 2)
+                    Log.e(TAG, "Post step-up: failed to derive step-up session keys for EXCHANGE");
+                }
+                else
+                {
+                    byte[] postSuSKReader = Arrays.copyOfRange(suKeys, 32, 64);
+                    byte[] postSuSKDevice = Arrays.copyOfRange(suKeys, 0,  32);
+                    int suReaderCounter = 2; // ENVELOPE used counter 1
+                    int suDeviceCounter = 2;
+
+                    Log.d(TAG, "Sending final EXCHANGE with 0x97 (post step-up, using StepUpSK)");
+                    byte[] finalEncrypted = AliroCryptoProvider.encryptReaderGcm(
+                            postSuSKReader, statusTlv, suReaderCounter++);
+                    if (finalEncrypted != null)
                     {
-                        byte[] finalEnc = Arrays.copyOfRange(finalResp, 0, finalResp.length - 2);
-                        byte[] finalDec = AliroCryptoProvider.decryptDeviceGcm(skDevice, finalEnc, deviceCounter++);
-                        if (finalDec != null)
-                            Log.d(TAG, "Final EXCHANGE decrypted: " + Hex.toHexString(finalDec));
+                        byte[] finalCmd = buildExchangeCommand(finalEncrypted);
+                        byte[] finalResp = isoDep.transceive(finalCmd);
+                        Log.d(TAG, "Final EXCHANGE response: " + Hex.toHexString(finalResp));
+                        // Decrypt response with step-up device key
+                        if (isSW9000(finalResp) && finalResp.length > 2)
+                        {
+                            byte[] finalEnc = Arrays.copyOfRange(finalResp, 0, finalResp.length - 2);
+                            byte[] finalDec = AliroCryptoProvider.decryptDeviceGcm(
+                                    postSuSKDevice, finalEnc, suDeviceCounter++);
+                            if (finalDec != null)
+                                Log.d(TAG, "Final EXCHANGE decrypted: " + Hex.toHexString(finalDec));
+                        }
                     }
+                    java.util.Arrays.fill(postSuSKReader, (byte)0);
+                    java.util.Arrays.fill(postSuSKDevice, (byte)0);
                 }
             }
             else if (!stepUpElementId.isEmpty() && !accessDocAvailable)
@@ -3320,8 +3580,27 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
             // 6. Unwrap SessionData response and decrypt with StepUpSKDevice
             //    per Aliro §8.4.3 + ISO 18013-5 §9.1.1.5
             //    Device encrypts with IV = 0x0000000000000001 || device_counter (counter=1)
+            //
+            //    The credential wraps the ENVELOPE response in BER-TLV tag 0x53
+            //    per Aliro Table 10-7. Strip the 0x53 TLV header to get the CBOR SessionData.
+            byte[] sessionDataBytes2 = rawResponse;
+            if (rawResponse.length > 2 && (rawResponse[0] & 0xFF) == 0x53)
+            {
+                int valOffset;
+                int lenByte = rawResponse[1] & 0xFF;
+                if (lenByte < 0x80)
+                    valOffset = 2;
+                else if (lenByte == 0x81)
+                    valOffset = 3;
+                else if (lenByte == 0x82)
+                    valOffset = 4;
+                else
+                    valOffset = 2; // fallback
+                sessionDataBytes2 = Arrays.copyOfRange(rawResponse, valOffset, rawResponse.length);
+                Log.d(TAG, "Step-Up: stripped 0x53 TLV header (" + valOffset + " bytes), CBOR payload = " + sessionDataBytes2.length + " bytes");
+            }
             com.upokecenter.cbor.CBORObject sessionDataIn =
-                    com.upokecenter.cbor.CBORObject.DecodeFromBytes(rawResponse);
+                    com.upokecenter.cbor.CBORObject.DecodeFromBytes(sessionDataBytes2);
             com.upokecenter.cbor.CBORObject dataField =
                     sessionDataIn.get(com.upokecenter.cbor.CBORObject.FromObject("data"));
             if (dataField == null)
@@ -3583,7 +3862,21 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                     com.upokecenter.cbor.CBORObject.FromObject("aliro-a"));
             if (items == null || items.size() == 0) return null;
 
+            // Try to find the requested elementId first; if not found, use the first
+            // element available in the document (handles config mismatch gracefully).
+            int matchIndex = -1;
             for (int i = 0; i < items.size(); i++)
+            {
+                byte[] ib = items.get(i).GetByteString();
+                com.upokecenter.cbor.CBORObject it =
+                        com.upokecenter.cbor.CBORObject.DecodeFromBytes(ib);
+                com.upokecenter.cbor.CBORObject e =
+                        it.get(com.upokecenter.cbor.CBORObject.FromObject("3"));
+                if (e != null && elementId.equals(e.AsString())) { matchIndex = i; break; }
+            }
+            if (matchIndex < 0) matchIndex = 0; // fallback to first element
+
+            for (int i = matchIndex; i <= matchIndex; i++)
             {
                 // Each item is a bstr wrapping an IssuerSignedItem CBOR map
                 byte[] itemBytes = items.get(i).GetByteString();
@@ -3591,7 +3884,8 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                         com.upokecenter.cbor.CBORObject.DecodeFromBytes(itemBytes);
                 com.upokecenter.cbor.CBORObject eid =
                         item.get(com.upokecenter.cbor.CBORObject.FromObject("3"));
-                if (eid == null || !elementId.equals(eid.AsString())) continue;
+                // Use the actual element ID from the document
+                if (eid != null) elementId = eid.AsString();
 
                 com.upokecenter.cbor.CBORObject val =
                         item.get(com.upokecenter.cbor.CBORObject.FromObject("4"));
@@ -3791,6 +4085,11 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
 
         if (stepUpResult != null)
         {
+            // Determine step-up success from the result string
+            boolean stepUpSuccess = stepUpResult.contains("Signature Valid")
+                    || stepUpResult.contains("sig not verified")
+                    || stepUpResult.contains("Element:");
+            sb.append("\n\nSTEP-UP: ").append(stepUpSuccess ? "Success" : "Failed");
             sb.append("\n\nACCESS DOCUMENT\n");
             // Each line of stepUpResult is already indented with leading spaces
             // (produced by extractAccessDataSummary). Append as-is.
@@ -3802,7 +4101,7 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
 
         if (mailboxResult != null)
         {
-            sb.append("\nMAILBOX (").append(AliroMailbox.MAILBOX_SIZE).append(" bytes)\n");
+            sb.append("\n\nMAILBOX\n");
             for (String line : mailboxResult.split("\n", -1))
             {
                 sb.append(line).append("\n");

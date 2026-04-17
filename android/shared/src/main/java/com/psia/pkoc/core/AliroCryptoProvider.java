@@ -72,6 +72,18 @@ public class AliroCryptoProvider
         0x2A, 0x2A, 0x2A, 0x2A
     };
 
+    // HKDF salt string "Persistent**" (hex: 50657273697374656E742A2A) — §8.3.1.13
+    private static final byte[] HKDF_PERSISTENT = {
+        0x50, 0x65, 0x72, 0x73, 0x69, 0x73, 0x74, 0x65,
+        0x6E, 0x74, 0x2A, 0x2A
+    };
+
+    // HKDF salt string "VolatileFast" (hex: 566F6C6174696C6546617374) — §8.3.1.12
+    private static final byte[] HKDF_VOLATILE_FAST = {
+        0x56, 0x6F, 0x6C, 0x61, 0x74, 0x69, 0x6C, 0x65,
+        0x46, 0x61, 0x73, 0x74
+    };
+
     private static final int READER_ID_SIZE  = 32;
     private static final int TRANSACTION_ID_SIZE = 16;
     private static final int GCM_TAG_LENGTH  = 16; // bytes (128 bits)
@@ -318,6 +330,7 @@ public class AliroCryptoProvider
      * @param readerEphPubKeyX        32-byte X of reader ephemeral public key
      * @param udEphPubKeyX            32-byte X of UD ephemeral public key
      * @param selectProprietaryTLV    Full proprietary TLV from SELECT response
+     * @param auth0CmdVendorTLV       Vendor extension TLV from AUTH0 command (may be null)
      * @param auth0RspVendorTLV       Vendor extension TLV from AUTH0 response (may be null)
      * @return byte[] of length outputSize, or null on failure
      */
@@ -332,6 +345,7 @@ public class AliroCryptoProvider
             byte[] readerEphPubKeyX,
             byte[] udEphPubKeyX,
             byte[] selectProprietaryTLV,
+            byte[] auth0CmdVendorTLV,
             byte[] auth0RspVendorTLV,
             byte interfaceByte,
             byte[] flag)
@@ -379,6 +393,7 @@ public class AliroCryptoProvider
             // Step 2.6: HKDF-Expand
             // T(n) = HMAC-SHA256(PRK, T(n-1) || info || n)
             // info = udEphPubKeyX || [auth0CmdVendorTLV] || [auth0RspVendorTLV]
+            // Per §8.3.1.13: info includes vendor extension TLVs if present
             byte[] output = new byte[outputSize];
             byte[] prev = new byte[0];
             int idx = 0;
@@ -387,6 +402,7 @@ public class AliroCryptoProvider
             {
                 // Build HMAC input: prev || info || n
                 int infoLen = 32 // udEphPubKeyX
+                        + (auth0CmdVendorTLV != null ? auth0CmdVendorTLV.length : 0)
                         + (auth0RspVendorTLV != null ? auth0RspVendorTLV.length : 0);
                 byte[] hmacInput = new byte[prev.length + infoLen + 1];
                 int pos = 0;
@@ -394,6 +410,11 @@ public class AliroCryptoProvider
                 pos += prev.length;
                 arraycopy(udEphPubKeyX, 0, hmacInput, pos, 32);
                 pos += 32;
+                if (auth0CmdVendorTLV != null && auth0CmdVendorTLV.length > 0)
+                {
+                    arraycopy(auth0CmdVendorTLV, 0, hmacInput, pos, auth0CmdVendorTLV.length);
+                    pos += auth0CmdVendorTLV.length;
+                }
                 if (auth0RspVendorTLV != null && auth0RspVendorTLV.length > 0)
                 {
                     arraycopy(auth0RspVendorTLV, 0, hmacInput, pos, auth0RspVendorTLV.length);
@@ -416,6 +437,275 @@ public class AliroCryptoProvider
             Log.e(TAG, "deriveKeys failed", e);
             return null;
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Key derivation: Kpersistent (§8.3.1.13)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Derive Kpersistent after a successful AUTH1.
+     *
+     * This uses the same ECDH → X9.63 KDF → HKDF pattern as deriveKeys() but:
+     *   - salt uses "Persistent**" instead of "Volatile****"
+     *   - salt_persistent appends credentialPubKeyX (32 bytes) at the end
+     *   - output is exactly 32 bytes
+     *
+     * Per Aliro §8.3.1.13:
+     *   salt_persistent = SHA-256(
+     *     readerPubKeyX || "Persistent**" || readerID || interfaceByte ||
+     *     0x5C 0x02 || protocolVersion || readerEphPubKeyX || transactionID ||
+     *     flag || selectProprietaryTLV || credentialPubKeyX)
+     *   IKM = Kdh (same ECDH shared secret as deriveKeys)
+     *   info = udEphPubKeyX || [vendor extensions]
+     *   output = 32 bytes
+     *
+     * @param ourEphPrivate           UD ephemeral private key
+     * @param theirEphPublic          65-byte reader ephemeral public key
+     * @param selectedProtocolVersion 2-byte protocol version chosen in AUTH0
+     * @param readerPubKeyX           32-byte X of reader static public key
+     * @param readerID                32-byte reader identifier
+     * @param transactionID           16-byte transaction ID
+     * @param readerEphPubKeyX        32-byte X of reader ephemeral public key
+     * @param udEphPubKeyX            32-byte X of UD ephemeral public key
+     * @param credentialPubKeyX       32-byte X of credential static public key
+     * @param selectProprietaryTLV    Full proprietary TLV from SELECT response
+     * @param auth0CmdVendorTLV       Vendor extension TLV from AUTH0 command (may be null)
+     * @param auth0RspVendorTLV       Vendor extension TLV from AUTH0 response (may be null)
+     * @param interfaceByte           0x5E=NFC or 0xC3=BLE
+     * @param flag                    command_parameters || authentication_policy from AUTH0
+     * @return 32-byte Kpersistent, or null on failure
+     */
+    public static byte[] deriveKpersistent(
+            PrivateKey ourEphPrivate,
+            byte[] theirEphPublic,
+            byte[] selectedProtocolVersion,
+            byte[] readerPubKeyX,
+            byte[] readerID,
+            byte[] transactionID,
+            byte[] readerEphPubKeyX,
+            byte[] udEphPubKeyX,
+            byte[] credentialPubKeyX,
+            byte[] selectProprietaryTLV,
+            byte[] auth0CmdVendorTLV,
+            byte[] auth0RspVendorTLV,
+            byte interfaceByte,
+            byte[] flag)
+    {
+        try
+        {
+            // Step 1: ECDH shared secret X (same Kdh as deriveKeys)
+            byte[] sharedX = ecdhSharedSecretX(ourEphPrivate, theirEphPublic);
+            if (sharedX == null) return null;
+
+            // Step 1.5: X9.63 KDF
+            // SHA-256(sharedX || 0x00000001 || transactionID)
+            MessageDigest sha256 = MessageDigest.getInstance("SHA-256");
+            sha256.update(sharedX);
+            sha256.update(new byte[]{0x00, 0x00, 0x00, 0x01}); // counter = 1
+            sha256.update(transactionID);
+            byte[] z = sha256.digest(); // 32 bytes
+
+            // Step 2.3: HKDF-Extract with salt_persistent
+            // salt_persistent = SHA-256(
+            //   readerPubKeyX || "Persistent**" || readerID || interfaceByte ||
+            //   0x5C 0x02 || protocolVersion || readerEphPubKeyX || transactionID ||
+            //   flag || selectProprietaryTLV || credentialPubKeyX)
+            sha256.reset();
+            sha256.update(readerPubKeyX);           // reader group identifier key X
+            sha256.update(HKDF_PERSISTENT);          // "Persistent**"
+            sha256.update(readerID);                 // reader_identifier
+            sha256.update(interfaceByte);            // 0x5E=NFC, 0xC3=BLE
+            sha256.update(new byte[]{0x5C, 0x02});  // tag + len for protocol version
+            sha256.update(selectedProtocolVersion);  // 2-byte protocol version
+            sha256.update(readerEphPubKeyX);         // reader eph pub key X
+            sha256.update(transactionID);            // transaction_identifier
+            sha256.update(flag);                     // command_parameters || auth_policy
+            sha256.update(selectProprietaryTLV);     // 0xA5 proprietary TLV
+            sha256.update(credentialPubKeyX);        // credential static pub key X (differs from volatile)
+            byte[] saltHash = sha256.digest(); // 32-byte salt
+
+            // HMAC-SHA256(saltHash, z) → PRK
+            byte[] prk = hmacSha256(saltHash, z);
+            if (prk == null) return null;
+
+            // Step 2.6: HKDF-Expand — output 32 bytes (one block, n=1)
+            // info = udEphPubKeyX || [auth0CmdVendorTLV] || [auth0RspVendorTLV]
+            int infoLen = 32
+                    + (auth0CmdVendorTLV != null ? auth0CmdVendorTLV.length : 0)
+                    + (auth0RspVendorTLV != null ? auth0RspVendorTLV.length : 0);
+            byte[] hmacInput = new byte[infoLen + 1]; // prev=empty for n=1
+            int pos = 0;
+            arraycopy(udEphPubKeyX, 0, hmacInput, pos, 32); pos += 32;
+            if (auth0CmdVendorTLV != null && auth0CmdVendorTLV.length > 0)
+            {
+                arraycopy(auth0CmdVendorTLV, 0, hmacInput, pos, auth0CmdVendorTLV.length);
+                pos += auth0CmdVendorTLV.length;
+            }
+            if (auth0RspVendorTLV != null && auth0RspVendorTLV.length > 0)
+            {
+                arraycopy(auth0RspVendorTLV, 0, hmacInput, pos, auth0RspVendorTLV.length);
+                pos += auth0RspVendorTLV.length;
+            }
+            hmacInput[pos] = 0x01; // n=1
+
+            byte[] kpersistent = hmacSha256(prk, hmacInput);
+            Log.d(TAG, "deriveKpersistent: 32 bytes derived");
+            return kpersistent;
+        }
+        catch (Exception e)
+        {
+            Log.e(TAG, "deriveKpersistent failed", e);
+            return null;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Key derivation: FAST AUTH0 session keys from Kpersistent (§8.3.1.12)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Derive session keys during FAST AUTH0 from Kpersistent (no ECDH).
+     *
+     * Per Aliro §8.3.1.12:
+     *   salt_fast = SHA-256(
+     *     readerPubKeyX || "VolatileFast" || readerID || interfaceByte ||
+     *     0x5C 0x02 || protocolVersion || readerEphPubKeyX || transactionID ||
+     *     flag || selectProprietaryTLV || credentialPubKeyX)
+     *   IKM = Kpersistent (NOT Kdh — no ECDH is performed)
+     *   info = udEphPubKeyX || [vendor extensions]
+     *   output = 160 bytes:
+     *     [0..31]   CryptogramSK
+     *     [32..63]  ExpeditedSKReader
+     *     [64..95]  ExpeditedSKDevice
+     *     [96..127] StepUpSK
+     *     [128..159] BleSK
+     *
+     * @param kpersistent             32-byte Kpersistent from a prior AUTH1
+     * @param outputSize              Bytes to produce (typically 160)
+     * @param selectedProtocolVersion 2-byte protocol version chosen in AUTH0
+     * @param readerPubKeyX           32-byte X of reader static public key
+     * @param readerID                32-byte reader identifier
+     * @param transactionID           16-byte transaction ID
+     * @param readerEphPubKeyX        32-byte X of reader ephemeral public key
+     * @param udEphPubKeyX            32-byte X of UD ephemeral public key
+     * @param credentialPubKeyX       32-byte X of credential static public key
+     * @param selectProprietaryTLV    Full proprietary TLV from SELECT response
+     * @param auth0CmdVendorTLV       Vendor extension TLV from AUTH0 command (may be null)
+     * @param auth0RspVendorTLV       Vendor extension TLV from AUTH0 response (may be null)
+     * @param interfaceByte           0x5E=NFC or 0xC3=BLE
+     * @param flag                    command_parameters || authentication_policy from AUTH0
+     * @return byte[] of length outputSize, or null on failure
+     */
+    public static byte[] deriveFastKeys(
+            byte[] kpersistent,
+            int outputSize,
+            byte[] selectedProtocolVersion,
+            byte[] readerPubKeyX,
+            byte[] readerID,
+            byte[] transactionID,
+            byte[] readerEphPubKeyX,
+            byte[] udEphPubKeyX,
+            byte[] credentialPubKeyX,
+            byte[] selectProprietaryTLV,
+            byte[] auth0CmdVendorTLV,
+            byte[] auth0RspVendorTLV,
+            byte interfaceByte,
+            byte[] flag)
+    {
+        try
+        {
+            // Build salt_fast = SHA-256(
+            //   readerPubKeyX || "VolatileFast" || readerID || interfaceByte ||
+            //   0x5C 0x02 || protocolVersion || readerEphPubKeyX || transactionID ||
+            //   flag || selectProprietaryTLV || credentialPubKeyX)
+            MessageDigest sha256 = MessageDigest.getInstance("SHA-256");
+            sha256.update(readerPubKeyX);
+            sha256.update(HKDF_VOLATILE_FAST);       // "VolatileFast" (12 bytes, no asterisks)
+            sha256.update(readerID);
+            sha256.update(interfaceByte);
+            sha256.update(new byte[]{0x5C, 0x02});
+            sha256.update(selectedProtocolVersion);
+            sha256.update(readerEphPubKeyX);
+            sha256.update(transactionID);
+            sha256.update(flag);
+            sha256.update(selectProprietaryTLV);
+            sha256.update(credentialPubKeyX);
+            byte[] saltHash = sha256.digest(); // 32-byte salt
+
+            // HKDF-Extract: PRK = HMAC-SHA256(salt_fast_hash, Kpersistent)
+            // IKM is Kpersistent directly — no ECDH
+            byte[] prk = hmacSha256(saltHash, kpersistent);
+            if (prk == null) return null;
+
+            // HKDF-Expand: T(n) = HMAC-SHA256(PRK, T(n-1) || info || n)
+            // info = udEphPubKeyX || [auth0CmdVendorTLV] || [auth0RspVendorTLV]
+            byte[] output = new byte[outputSize];
+            byte[] prev = new byte[0];
+            int idx = 0;
+            byte n = 1;
+            while (idx < outputSize)
+            {
+                int infoLen = 32
+                        + (auth0CmdVendorTLV != null ? auth0CmdVendorTLV.length : 0)
+                        + (auth0RspVendorTLV != null ? auth0RspVendorTLV.length : 0);
+                byte[] hmacInput = new byte[prev.length + infoLen + 1];
+                int pos = 0;
+                arraycopy(prev, 0, hmacInput, pos, prev.length);
+                pos += prev.length;
+                arraycopy(udEphPubKeyX, 0, hmacInput, pos, 32); pos += 32;
+                if (auth0CmdVendorTLV != null && auth0CmdVendorTLV.length > 0)
+                {
+                    arraycopy(auth0CmdVendorTLV, 0, hmacInput, pos, auth0CmdVendorTLV.length);
+                    pos += auth0CmdVendorTLV.length;
+                }
+                if (auth0RspVendorTLV != null && auth0RspVendorTLV.length > 0)
+                {
+                    arraycopy(auth0RspVendorTLV, 0, hmacInput, pos, auth0RspVendorTLV.length);
+                    pos += auth0RspVendorTLV.length;
+                }
+                hmacInput[pos] = n;
+
+                prev = hmacSha256(prk, hmacInput);
+                if (prev == null) return null;
+
+                int toCopy = Math.min(32, outputSize - idx);
+                arraycopy(prev, 0, output, idx, toCopy);
+                idx += 32;
+                n++;
+            }
+            Log.d(TAG, "deriveFastKeys: " + outputSize + " bytes derived");
+            return output;
+        }
+        catch (Exception e)
+        {
+            Log.e(TAG, "deriveFastKeys failed", e);
+            return null;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Cryptogram encryption for FAST AUTH0 response (§8.3.1.10)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Encrypt a cryptogram payload using AES-256-GCM.
+     *
+     * Per Aliro §8.3.1.10:
+     *   - Key: CryptogramSK (32 bytes from deriveFastKeys offset 0)
+     *   - IV: 12 zero bytes
+     *   - No AAD (additional authenticated data)
+     *   - Returns ciphertext || 16-byte GCM tag (total = payload.length + 16)
+     *
+     * @param key     32-byte CryptogramSK
+     * @param payload Plaintext to encrypt (48 bytes per Table 8-6)
+     * @return ciphertext || 16-byte tag (payload.length + 16), or null on failure
+     */
+    public static byte[] encryptCryptogram(byte[] key, byte[] payload)
+    {
+        // IV = 12 zero bytes
+        byte[] iv = new byte[12];
+        return gcm(true, key, iv, payload);
     }
 
     // -------------------------------------------------------------------------
@@ -810,7 +1100,7 @@ public class AliroCryptoProvider
     /**
      * Convert a DER-encoded ECDSA signature to raw 64-byte R||S.
      */
-    private static byte[] derToRawSignature(byte[] der)
+    public static byte[] derToRawSignature(byte[] der)
     {
         ASN1Sequence seq = ASN1Sequence.getInstance(der);
         byte[] r = BigIntegers.asUnsignedByteArray(

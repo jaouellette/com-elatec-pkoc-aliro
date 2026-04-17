@@ -70,6 +70,7 @@ public class AliroProvisioningManager
     private static final String KEY_READER_GROUP_ID = "reader_group_id";
     private static final String KEY_PROVISIONED     = "provisioned";
     private static final String KEY_STRICT_MODE     = "strict_mode";
+    private static final String KEY_READER_PUB_KEY  = "test_harness_reader_pub_key";
 
     // BouncyCastle OIDs
     private static final String OID_SECP256R1          = "1.2.840.10045.3.1.7";
@@ -302,6 +303,72 @@ public class AliroProvisioningManager
                 .edit()
                 .putBoolean(KEY_STRICT_MODE, enabled)
                 .apply();
+    }
+
+    /**
+     * Override the authorized Reader Group ID for test harness testing.
+     * Allows a credential to accept AUTH0 from a test harness reader
+     * without re-provisioning the entire credential.
+     *
+     * @param groupIdHex 32-char hex (16 bytes) Reader Group Identifier
+     */
+    public static void setAuthorizedReaderGroupId(Context context, String groupIdHex)
+    {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putString(KEY_READER_GROUP_ID, groupIdHex.toLowerCase(java.util.Locale.US))
+                .apply();
+    }
+
+    /**
+     * Override the Issuer CA public key for test harness testing.
+     *
+     * @param issuerPubHex 130-char hex (65 bytes, uncompressed EC P-256)
+     */
+    public static void setIssuerCAPubKey(Context context, String issuerPubHex)
+    {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putString(KEY_ISSUER_CA_PUB, issuerPubHex.toLowerCase(java.util.Locale.US))
+                .apply();
+    }
+
+    /** Get the authorized Reader Group ID as a hex string, or empty if not set. */
+    public static String getAuthorizedReaderGroupIdHex(Context context)
+    {
+        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .getString(KEY_READER_GROUP_ID, "");
+    }
+
+    /** Get the Issuer CA public key as a hex string, or empty if not set. */
+    public static String getIssuerCAPubKeyHex(Context context)
+    {
+        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .getString(KEY_ISSUER_CA_PUB, "");
+    }
+
+    /** Set the test harness reader public key for AUTH1 signature verification. */
+    public static void setTestHarnessReaderPubKey(Context context, String pubKeyHex)
+    {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putString(KEY_READER_PUB_KEY, pubKeyHex.toLowerCase(java.util.Locale.US))
+                .apply();
+    }
+
+    /** Get the test harness reader public key hex, or empty if not set. */
+    public static String getTestHarnessReaderPubKeyHex(Context context)
+    {
+        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .getString(KEY_READER_PUB_KEY, "");
+    }
+
+    /** Get the test harness reader public key as 65-byte array, or null. */
+    public static byte[] getTestHarnessReaderPubKey(Context context)
+    {
+        String hex = getTestHarnessReaderPubKeyHex(context);
+        if (hex == null || hex.length() != 130) return null;
+        return Hex.decode(hex);
     }
 
     /**

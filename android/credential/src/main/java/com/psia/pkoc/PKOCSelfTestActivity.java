@@ -1,4 +1,4 @@
-package com.pkoc.readersimulator;
+package com.psia.pkoc;
 
 import android.content.Intent;
 import android.net.Uri;
@@ -19,8 +19,8 @@ import androidx.core.content.FileProvider;
 import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
 
-import com.psia.pkoc.core.AliroSelfTestEngine;
-import com.psia.pkoc.core.AliroSelfTestEngine.TestResult;
+import com.psia.pkoc.core.PKOCSelfTestEngine;
+import com.psia.pkoc.core.PKOCSelfTestEngine.TestResult;
 
 import java.io.File;
 import java.io.FileWriter;
@@ -31,10 +31,10 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * Activity displaying the Aliro 1.0 Self-Test results in a RecyclerView.
- * Accessible via the overflow menu "Aliro Self-Test".
+ * Activity displaying the PKOC Self-Test results in a RecyclerView.
+ * Accessible via the overflow menu "PKOC Self-Test".
  */
-public class AliroSelfTestActivity extends AppCompatActivity
+public class PKOCSelfTestActivity extends AppCompatActivity
 {
     private RecyclerView recyclerTests;
     private Button btnRunTests;
@@ -48,16 +48,28 @@ public class AliroSelfTestActivity extends AppCompatActivity
     protected void onCreate(Bundle savedInstanceState)
     {
         super.onCreate(savedInstanceState);
-        setContentView(R.layout.activity_aliro_self_test);
+        setContentView(R.layout.activity_pkoc_self_test);
 
         Toolbar toolbar = findViewById(R.id.toolbar);
         setSupportActionBar(toolbar);
         if (getSupportActionBar() != null)
         {
             getSupportActionBar().setDisplayHomeAsUpEnabled(true);
-            getSupportActionBar().setTitle("Aliro Self-Test");
+            getSupportActionBar().setTitle("PKOC Self-Test");
         }
-        setupViews();
+
+        recyclerTests = findViewById(R.id.recyclerTests);  // keep existing setup below
+        btnRunTests = findViewById(R.id.btnRunTests);
+        btnShareReport = findViewById(R.id.btnShareReport);
+        progressBar = findViewById(R.id.progressBar);
+
+        adapter = new TestResultAdapter(results);
+        recyclerTests.setLayoutManager(new LinearLayoutManager(this));
+        recyclerTests.setAdapter(adapter);
+
+        btnRunTests.setOnClickListener(v -> runTests());
+        btnShareReport.setOnClickListener(v -> shareReport());
+        btnShareReport.setEnabled(false);
     }
 
     @Override
@@ -73,22 +85,6 @@ public class AliroSelfTestActivity extends AppCompatActivity
     {
         if (item.getItemId() == android.R.id.home) { finish(); return true; }
         return super.onOptionsItemSelected(item);
-    }
-
-    private void setupViews() {
-
-        recyclerTests = findViewById(R.id.recyclerTests);
-        btnRunTests = findViewById(R.id.btnRunTests);
-        btnShareReport = findViewById(R.id.btnShareReport);
-        progressBar = findViewById(R.id.progressBar);
-
-        adapter = new TestResultAdapter(results);
-        recyclerTests.setLayoutManager(new LinearLayoutManager(this));
-        recyclerTests.setAdapter(adapter);
-
-        btnRunTests.setOnClickListener(v -> runTests());
-        btnShareReport.setOnClickListener(v -> shareReport());
-        btnShareReport.setEnabled(false);
     }
 
     @Override
@@ -108,8 +104,8 @@ public class AliroSelfTestActivity extends AppCompatActivity
 
         new Thread(() ->
         {
-            AliroSelfTestEngine engine = new AliroSelfTestEngine();
-            engine.runAll(new AliroSelfTestEngine.Callback()
+            PKOCSelfTestEngine engine = new PKOCSelfTestEngine();
+            engine.runAll(new PKOCSelfTestEngine.Callback()
             {
                 @Override
                 public void onTestComplete(TestResult result)
@@ -133,7 +129,7 @@ public class AliroSelfTestActivity extends AppCompatActivity
                     });
                 }
             });
-        }, "AliroSelfTest").start();
+        }, "PKOCSelfTest").start();
     }
 
     private void shareReport()
@@ -147,9 +143,9 @@ public class AliroSelfTestActivity extends AppCompatActivity
             String appVersion = getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
             String date = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(new Date());
 
-            String html = AliroSelfTestReportGenerator.generate(results, date, deviceInfo, appVersion);
+            String html = PKOCSelfTestReportGenerator.generate(results, date, deviceInfo, appVersion);
 
-            String filename = "aliro_compliance_report_" + System.currentTimeMillis() + ".html";
+            String filename = "pkoc_compliance_report_" + System.currentTimeMillis() + ".html";
             File cacheDir = getExternalCacheDir() != null ? getExternalCacheDir() : getCacheDir();
             File reportFile = new File(cacheDir, filename);
             FileWriter writer = new FileWriter(reportFile);
@@ -162,8 +158,8 @@ public class AliroSelfTestActivity extends AppCompatActivity
             Intent shareIntent = new Intent(Intent.ACTION_SEND);
             shareIntent.setType("application/octet-stream");
             shareIntent.putExtra(Intent.EXTRA_STREAM, uri);
-            shareIntent.putExtra(Intent.EXTRA_SUBJECT, "Aliro 1.0 Compliance Report — " + date);
-            shareIntent.putExtra(Intent.EXTRA_TEXT, "Aliro 1.0 self-test compliance report attached.");
+            shareIntent.putExtra(Intent.EXTRA_SUBJECT, "PKOC Compliance Report — " + date);
+            shareIntent.putExtra(Intent.EXTRA_TEXT, "PKOC self-test compliance report attached.");
             shareIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
             startActivity(Intent.createChooser(shareIntent, "Share Compliance Report"));
         }
@@ -224,7 +220,7 @@ public class AliroSelfTestActivity extends AppCompatActivity
             if (r.detail != null && !r.detail.isEmpty())
             {
                 holder.textDetail.setText(r.detail);
-                holder.textDetail.setVisibility(View.GONE); // collapsed by default
+                holder.textDetail.setVisibility(View.GONE);
                 holder.itemView.setOnClickListener(v ->
                 {
                     boolean visible = holder.textDetail.getVisibility() == View.VISIBLE;

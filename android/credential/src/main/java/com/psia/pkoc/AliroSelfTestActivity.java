@@ -1,4 +1,4 @@
-package com.pkoc.readersimulator;
+package com.psia.pkoc;
 
 import android.content.Intent;
 import android.net.Uri;

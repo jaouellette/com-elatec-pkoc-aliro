@@ -1,4 +1,4 @@
-package com.pkoc.readersimulator;
+package com.psia.pkoc;
 
 import android.content.Intent;
 import android.net.Uri;
@@ -19,8 +19,9 @@ import androidx.core.content.FileProvider;
 import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
 
-import com.psia.pkoc.core.AliroSelfTestEngine;
-import com.psia.pkoc.core.AliroSelfTestEngine.TestResult;
+import com.psia.pkoc.core.LeafSelfTestEngine;
+import com.psia.pkoc.core.LeafSelfTestEngine.TestResult;
+import com.psia.pkoc.core.LeafSelfTestReportGenerator;
 
 import java.io.File;
 import java.io.FileWriter;
@@ -31,10 +32,13 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * Activity displaying the Aliro 1.0 Self-Test results in a RecyclerView.
- * Accessible via the overflow menu "Aliro Self-Test".
+ * Activity displaying the LEAF Verified Self-Test results in a RecyclerView.
+ * Accessible via the overflow menu "LEAF Self-Test".
+ *
+ * Mirrors the structure of AliroSelfTestActivity — same ViewHolder/Adapter pattern,
+ * same progress-bar and Run/Share buttons.
  */
-public class AliroSelfTestActivity extends AppCompatActivity
+public class LeafSelfTestActivity extends AppCompatActivity
 {
     private RecyclerView recyclerTests;
     private Button btnRunTests;
@@ -48,14 +52,14 @@ public class AliroSelfTestActivity extends AppCompatActivity
     protected void onCreate(Bundle savedInstanceState)
     {
         super.onCreate(savedInstanceState);
-        setContentView(R.layout.activity_aliro_self_test);
+        setContentView(R.layout.activity_leaf_self_test);
 
         Toolbar toolbar = findViewById(R.id.toolbar);
         setSupportActionBar(toolbar);
         if (getSupportActionBar() != null)
         {
             getSupportActionBar().setDisplayHomeAsUpEnabled(true);
-            getSupportActionBar().setTitle("Aliro Self-Test");
+            getSupportActionBar().setTitle("LEAF Self-Test");
         }
         setupViews();
     }
@@ -63,7 +67,7 @@ public class AliroSelfTestActivity extends AppCompatActivity
     @Override
     public boolean onCreateOptionsMenu(android.view.Menu menu)
     {
-        // Clear any inherited menu items and show no overflow menu
+        // Clear inherited menu items — no overflow menu in this activity
         menu.clear();
         return false;
     }
@@ -75,12 +79,22 @@ public class AliroSelfTestActivity extends AppCompatActivity
         return super.onOptionsItemSelected(item);
     }
 
-    private void setupViews() {
+    @Override
+    public boolean onSupportNavigateUp()
+    {
+        finish();
+        return true;
+    }
 
-        recyclerTests = findViewById(R.id.recyclerTests);
-        btnRunTests = findViewById(R.id.btnRunTests);
+    // =========================================================================
+    // View setup
+    // =========================================================================
+    private void setupViews()
+    {
+        recyclerTests  = findViewById(R.id.recyclerTests);
+        btnRunTests    = findViewById(R.id.btnRunTests);
         btnShareReport = findViewById(R.id.btnShareReport);
-        progressBar = findViewById(R.id.progressBar);
+        progressBar    = findViewById(R.id.progressBar);
 
         adapter = new TestResultAdapter(results);
         recyclerTests.setLayoutManager(new LinearLayoutManager(this));
@@ -91,13 +105,9 @@ public class AliroSelfTestActivity extends AppCompatActivity
         btnShareReport.setEnabled(false);
     }
 
-    @Override
-    public boolean onSupportNavigateUp()
-    {
-        finish();
-        return true;
-    }
-
+    // =========================================================================
+    // Test execution
+    // =========================================================================
     private void runTests()
     {
         results.clear();
@@ -108,8 +118,8 @@ public class AliroSelfTestActivity extends AppCompatActivity
 
         new Thread(() ->
         {
-            AliroSelfTestEngine engine = new AliroSelfTestEngine();
-            engine.runAll(new AliroSelfTestEngine.Callback()
+            LeafSelfTestEngine engine = new LeafSelfTestEngine(LeafSelfTestActivity.this);
+            engine.runAll(new LeafSelfTestEngine.Callback()
             {
                 @Override
                 public void onTestComplete(TestResult result)
@@ -133,9 +143,12 @@ public class AliroSelfTestActivity extends AppCompatActivity
                     });
                 }
             });
-        }, "AliroSelfTest").start();
+        }, "LeafSelfTest").start();
     }
 
+    // =========================================================================
+    // Report sharing
+    // =========================================================================
     private void shareReport()
     {
         if (results.isEmpty()) return;
@@ -147,9 +160,9 @@ public class AliroSelfTestActivity extends AppCompatActivity
             String appVersion = getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
             String date = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(new Date());
 
-            String html = AliroSelfTestReportGenerator.generate(results, date, deviceInfo, appVersion);
+            String html = LeafSelfTestReportGenerator.generate(results, date, deviceInfo, appVersion);
 
-            String filename = "aliro_compliance_report_" + System.currentTimeMillis() + ".html";
+            String filename = "leaf_compliance_report_" + System.currentTimeMillis() + ".html";
             File cacheDir = getExternalCacheDir() != null ? getExternalCacheDir() : getCacheDir();
             File reportFile = new File(cacheDir, filename);
             FileWriter writer = new FileWriter(reportFile);
@@ -162,10 +175,10 @@ public class AliroSelfTestActivity extends AppCompatActivity
             Intent shareIntent = new Intent(Intent.ACTION_SEND);
             shareIntent.setType("application/octet-stream");
             shareIntent.putExtra(Intent.EXTRA_STREAM, uri);
-            shareIntent.putExtra(Intent.EXTRA_SUBJECT, "Aliro 1.0 Compliance Report — " + date);
-            shareIntent.putExtra(Intent.EXTRA_TEXT, "Aliro 1.0 self-test compliance report attached.");
+            shareIntent.putExtra(Intent.EXTRA_SUBJECT, "LEAF Verified Compliance Report — " + date);
+            shareIntent.putExtra(Intent.EXTRA_TEXT, "LEAF Verified self-test compliance report attached.");
             shareIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
-            startActivity(Intent.createChooser(shareIntent, "Share Compliance Report"));
+            startActivity(Intent.createChooser(shareIntent, "Share LEAF Compliance Report"));
         }
         catch (Exception e)
         {
@@ -251,11 +264,11 @@ public class AliroSelfTestActivity extends AppCompatActivity
             ViewHolder(View itemView)
             {
                 super(itemView);
-                textTestId = itemView.findViewById(R.id.textTestId);
-                textName = itemView.findViewById(R.id.textName);
-                textResult = itemView.findViewById(R.id.textResult);
+                textTestId  = itemView.findViewById(R.id.textTestId);
+                textName    = itemView.findViewById(R.id.textName);
+                textResult  = itemView.findViewById(R.id.textResult);
                 textDuration = itemView.findViewById(R.id.textDuration);
-                textDetail = itemView.findViewById(R.id.textDetail);
+                textDetail  = itemView.findViewById(R.id.textDetail);
             }
         }
     }
