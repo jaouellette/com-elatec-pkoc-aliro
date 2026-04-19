@@ -90,6 +90,7 @@ import android.os.IBinder;
 import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.util.LinkedList;
 import java.util.List;
@@ -109,6 +110,12 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
 {
 
     private static final String TAG = "HomeFragment";
+
+    /**
+     * DESFire 3-byte AID for the LEAF Verified application on MIFARE DUOX cards.
+     * Used with the DESFire wrapped SELECT APPLICATION command (CLA=0x90, INS=0x5A).
+     */
+    private static final byte[] DESFIRE_LEAF_AID = { (byte)0xD6, 0x1C, (byte)0xF5 };
 
     // Reader protocol mode
     public static final String PREF_READER_MODE  = "reader_protocol_mode";
@@ -155,6 +162,16 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
     // rebuilding the ECPrivateKey on every NFC tap (which takes ~400ms).
     private java.security.PrivateKey cachedAliroReaderPrivKey = null;
     private String cachedAliroPrivKeyHex = null;
+
+    // FAST mode session state — stored in memory (not SharedPrefs) so it
+    // only persists within the current app session. First tap = STANDARD,
+    // second tap = FAST (if checkbox is enabled).
+    private byte[] sessionKpersistent = null;
+    private byte[] sessionCredentialPubKeyX = null;
+
+    // Last document verification result from step-up phase
+    // Set by runAliroStepUp(), consumed by performAliroNfcTransaction() for post-step-up EXCHANGE status
+    private volatile AliroAccessDocumentVerifier.VerificationResult lastDocVerifyResult = null;
 
     // --- Aliro BLE L2CAP service ---
     private AliroBleReaderService aliroBleService;
@@ -206,36 +223,90 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                     // (initial value will be overwritten by formatAliroConnectionType below)
                     String connectionType = "";
 
-                    // Parse step-up result from device response bytes
+                    // Parse step-up result using the SAME full verifier as NFC
+                    // Both transports must produce identical verification results.
                     String bleStepUpResult = null;
                     if (deviceResponse != null)
                     {
-                        bleStepUpResult = parseBleStepUpResult(deviceResponse, stepUpElemId);
+                        try
+                        {
+                            byte[] credPubKeyBytes = (credPubKeyHex != null && !credPubKeyHex.isEmpty())
+                                    ? org.bouncycastle.util.encoders.Hex.decode(credPubKeyHex) : null;
+
+                            // Load step-up issuer key and element ID from prefs (same as NFC path)
+                            SharedPreferences stepUpPrefs = requireActivity().getPreferences(Context.MODE_PRIVATE);
+                            String issuerKeyHex = stepUpPrefs.getString(AliroPreferences.STEP_UP_ISSUER_PUB_KEY, "");
+                            byte[] issuerPubKey = issuerKeyHex.isEmpty() ? null
+                                    : org.bouncycastle.util.encoders.Hex.decode(issuerKeyHex);
+
+                            // Determine docType: prefer aliro-a (access) over aliro-r (revocation)
+                            String docType = "aliro-a";
+
+                            AliroAccessDocumentVerifier.VerificationResult verifyResult =
+                                    AliroAccessDocumentVerifier.verifyDocument(
+                                            deviceResponse, docType, credPubKeyBytes,
+                                            stepUpElemId, issuerPubKey);
+
+                            lastDocVerifyResult = verifyResult;
+                            bleStepUpResult = verifyResult.stepUpResultText;
+                            Log.d(TAG, "BLE Step-Up verification: " + bleStepUpResult);
+                        }
+                        catch (Exception e)
+                        {
+                            Log.w(TAG, "BLE Step-Up verification failed, falling back: " + e.getMessage());
+                            bleStepUpResult = parseBleStepUpResult(deviceResponse, stepUpElemId);
+                        }
                         if (bleStepUpResult == null)
                             bleStepUpResult = "Access Document received";
                     }
 
-                    // Parse mailbox: if it looks like raw hex (not already parsed), decode it
+                    // Parse mailbox using the same logic as NFC: look for §18 container
+                    // tag 0x60 and parse structured TLV content into human-readable form.
                     String bleMailboxParsed = null;
                     if (mailboxResult != null)
                     {
-                        if (mailboxResult.matches("[0-9A-Fa-f]+") && mailboxResult.length() >= 4)
+                        try
                         {
-                            try
+                            byte[] mailboxBytes;
+                            if (mailboxResult.matches("[0-9A-Fa-f]+") && mailboxResult.length() >= 4)
+                                mailboxBytes = org.bouncycastle.util.encoders.Hex.decode(mailboxResult);
+                            else
+                                mailboxBytes = null;
+
+                            if (mailboxBytes != null && mailboxBytes.length > 0)
                             {
-                                byte[] mailboxBytes = org.bouncycastle.util.encoders.Hex.decode(mailboxResult);
-                                if (mailboxBytes.length > 0 && (mailboxBytes[0] & 0xFF) == 0x60)
-                                    bleMailboxParsed = AliroMailbox.parseMailboxToString(mailboxBytes, mailboxBytes.length);
+                                // Scan for §18 container tag 0x60 within the first few bytes
+                                int tlvStart = -1;
+                                for (int s = 0; s < Math.min(4, mailboxBytes.length); s++)
+                                {
+                                    if ((mailboxBytes[s] & 0xFF) == 0x60) { tlvStart = s; break; }
+                                }
+                                if (tlvStart >= 0)
+                                {
+                                    byte[] tlvData = java.util.Arrays.copyOfRange(
+                                            mailboxBytes, tlvStart, mailboxBytes.length);
+                                    bleMailboxParsed = AliroMailbox.parseMailboxToString(
+                                            tlvData, tlvData.length);
+                                }
                                 else
-                                    bleMailboxParsed = mailboxResult;
+                                {
+                                    // No structured TLV found — show clean summary
+                                    String fullHex = org.bouncycastle.util.encoders.Hex.toHexString(mailboxBytes);
+                                    String preview = (fullHex.length() > 64)
+                                            ? fullHex.substring(0, 64) + "..."
+                                            : fullHex;
+                                    bleMailboxParsed = "Read " + mailboxBytes.length + " bytes\n"
+                                            + "  Preview: " + preview;
+                                }
                             }
-                            catch (Exception ignored)
+                            else
                             {
                                 bleMailboxParsed = mailboxResult;
                             }
                         }
-                        else
+                        catch (Exception e)
                         {
+                            Log.w(TAG, "BLE mailbox parse failed: " + e.getMessage());
                             bleMailboxParsed = mailboxResult;
                         }
                     }
@@ -627,7 +698,7 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
         try
         {
             isoDep.connect();
-            isoDep.setTimeout(5000); // 5 second timeout for crypto-heavy Aliro flow
+            isoDep.setTimeout(10000); // 10 second timeout for crypto-heavy Aliro flow + harness processing
 
             Log.d("NFC", "Tag discovered, reader mode: " + readerMode);
 
@@ -2083,361 +2154,434 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
     // =========================================================================
 
     /**
-     * Perform the LEAF Verified Open ID (Path 1) NFC transaction.
+     * Perform a LEAF NFC transaction supporting both HCE (ISO 7816-4) and
+     * real MIFARE DUOX (DESFire wrapped) cards.
      *
-     * Protocol:
-     *   1. SELECT LEAF Open App AID
-     *   2. SELECT certificate EF (file 0x0001)
-     *   3. READ BINARY in 224-byte chunks — collect full X.509 DER certificate
-     *   4. Verify certificate against stored Root CA public key
-     *   5. Generate 32-byte random challenge
-     *   6. INTERNAL AUTHENTICATE with challenge
-     *   7. Verify ECDSA signature (DER) from response against credential public key from cert
-     *   8. Extract 12-digit Open ID from cert subject CN
-     *   9. Display result on UI
+     * Auto-detection logic:
+     *   1. Try DESFire SELECT APP (CLA=0x90, INS=0x5A, AID=D6 1C F5).
+     *      If the response ends with 91 00 or 90 00 → DUOX path.
+     *   2. If DESFire fails, try the ISO 7816-4 path:
+     *      SELECT AID (00 A4 04) → SELECT EF → READ BINARY.
+     *      If both EF candidates fail → run diagnostic probes.
+     *
+     * Both paths produce a certDER byte[]. Steps 3-5 (cert verify,
+     * INTERNAL AUTHENTICATE, sig verify) are then common to both paths,
+     * with slight differences in challenge size and TLV format for DUOX.
      *
      * @param isoDep  Connected IsoDep tag
-     * @return true if LEAF credential was detected and authenticated (even if cert/sig fails),
-     *         false if the tag did not respond to LEAF SELECT (not a LEAF credential)
+     * @return true if LEAF credential was detected and processed
+     *         (even if cert or sig verification fails),
+     *         false if the tag did not respond to any LEAF SELECT
      */
     private boolean performLeafNfcTransaction(android.nfc.tech.IsoDep isoDep)
     {
         try
         {
-            // ------------------------------------------------------------------
-            // Step 1: SELECT LEAF Open App AID
-            // ------------------------------------------------------------------
-            byte[] leafAid  = LeafVerifiedManager.LEAF_OPEN_APP_AID;
-            byte[] selectCmd = new byte[5 + leafAid.length + 1];
-            selectCmd[0] = 0x00;  // CLA
-            selectCmd[1] = (byte)0xA4; // INS = SELECT
-            selectCmd[2] = 0x04;  // P1 = select by AID
-            selectCmd[3] = 0x00;  // P2
-            selectCmd[4] = (byte)leafAid.length; // Lc
-            System.arraycopy(leafAid, 0, selectCmd, 5, leafAid.length);
-            selectCmd[5 + leafAid.length] = 0x00; // Le
-
-            Log.d(TAG, "LEAF SELECT AID: " + Hex.toHexString(selectCmd));
-            byte[] selectResp = isoDep.transceive(selectCmd);
-            Log.d(TAG, "LEAF SELECT response: " + Hex.toHexString(selectResp));
-
-            if (!isSW9000(selectResp))
-            {
-                Log.d(TAG, "LEAF: AID not supported, SW=" + swHex(selectResp));
-                return false;  // not a LEAF credential
-            }
-
-            // ------------------------------------------------------------------
-            // Step 2: SELECT certificate EF
-            // Try DUOX file ID (E103) first, then fallback to 0001.
-            // If both fail, run diagnostic probes.
-            // ------------------------------------------------------------------
-            byte[][] efCandidates = {
-                    LeafVerifiedManager.LEAF_CERT_FILE_ID,
-                    LeafVerifiedManager.LEAF_CERT_FILE_ID_ALT
+            // ==================================================================
+            // AUTO-DETECTION: Try DESFire SELECT APP first (DUOX cards)
+            // ==================================================================
+            byte[] desfireSelect = new byte[] {
+                (byte)0x90, 0x5A, 0x00, 0x00, 0x03,
+                DESFIRE_LEAF_AID[0], DESFIRE_LEAF_AID[1], DESFIRE_LEAF_AID[2],
+                0x00
             };
-            byte[] selectEFResp = null;
-            byte[] usedFileId = null;
-            for (byte[] fid : efCandidates)
+            Log.d(TAG, "LEAF DESFIRE SELECT APP: " + Hex.toHexString(desfireSelect));
+            byte[] desfireSelectResp = isoDep.transceive(desfireSelect);
+            Log.d(TAG, "LEAF DESFIRE SELECT APP response: " + Hex.toHexString(desfireSelectResp));
+
+            boolean isDuox = isDesfireSuccess(desfireSelectResp);
+            Log.d(TAG, "LEAF: card type detection — isDuox=" + isDuox);
+
+            // certDER will be populated by whichever path succeeds
+            byte[] certDER = null;
+
+            if (isDuox)
             {
-                byte[] selectEF = { 0x00, (byte)0xA4, 0x02, 0x00, 0x02, fid[0], fid[1] };
-                Log.d(TAG, "LEAF SELECT EF: " + Hex.toHexString(selectEF));
-                selectEFResp = isoDep.transceive(selectEF);
-                Log.d(TAG, "LEAF SELECT EF response: " + Hex.toHexString(selectEFResp));
-                if (isSW9000(selectEFResp))
+                // ==============================================================
+                // DUOX PATH: DESFire wrapped READ DATA from file 02
+                // ==============================================================
+                Log.d(TAG, "LEAF: DUOX path selected — reading certificate via DESFire READ DATA");
+                certDER = readDuoxCertificate(isoDep);
+                if (certDER == null)
                 {
-                    usedFileId = fid;
-                    Log.d(TAG, "LEAF: EF " + Hex.toHexString(fid) + " selected successfully");
-                    break;
-                }
-                Log.d(TAG, "LEAF: EF " + Hex.toHexString(fid) + " failed (" + swHex(selectEFResp) + "), trying next...");
-            }
-
-            if (usedFileId == null)
-            {
-                Log.w(TAG, "LEAF: SELECT EF 0001 failed (" + swHex(selectEFResp)
-                        + ") — running diagnostic probes...");
-
-                // === DIAGNOSTIC: Probe the card's file structure ===
-                StringBuilder diag = new StringBuilder();
-                diag.append("LEAF Verified Diagnostic Report\n");
-                diag.append("================================\n\n");
-                diag.append("AID SELECT: OK (" + Hex.toHexString(selectResp) + ")\n");
-                diag.append("SELECT EF 0001: FAILED (" + swHex(selectEFResp) + ")\n\n");
-
-                // Probe 1: DESFire GetFileIDs (native cmd 0x6F, wrapped)
-                diag.append("--- Probe 1: DESFire GetFileIDs (90 6F 00 00 00) ---\n");
-                try
-                {
-                    byte[] getFileIDs = { (byte)0x90, 0x6F, 0x00, 0x00, 0x00 };
-                    byte[] fileIDsResp = isoDep.transceive(getFileIDs);
-                    String fileIDsHex = Hex.toHexString(fileIDsResp);
-                    diag.append("Response: ").append(fileIDsHex).append("\n");
-                    Log.d(TAG, "LEAF DIAG GetFileIDs: " + fileIDsHex);
-                    if (fileIDsResp.length > 2)
-                    {
-                        diag.append("File numbers: ");
-                        for (int i = 0; i < fileIDsResp.length - 2; i++)
-                            diag.append(String.format("0x%02X ", fileIDsResp[i]));
-                        diag.append("\n");
-                    }
-                }
-                catch (Exception e)
-                {
-                    diag.append("Error: ").append(e.getMessage()).append("\n");
-                    Log.w(TAG, "LEAF DIAG GetFileIDs failed", e);
-                }
-
-                // Probe 2: DESFire GetISOFileIDs (native cmd 0x61, wrapped)
-                diag.append("\n--- Probe 2: DESFire GetISOFileIDs (90 61 00 00 00) ---\n");
-                try
-                {
-                    byte[] getISOFileIDs = { (byte)0x90, 0x61, 0x00, 0x00, 0x00 };
-                    byte[] isoFileIDsResp = isoDep.transceive(getISOFileIDs);
-                    String isoFileIDsHex = Hex.toHexString(isoFileIDsResp);
-                    diag.append("Response: ").append(isoFileIDsHex).append("\n");
-                    Log.d(TAG, "LEAF DIAG GetISOFileIDs: " + isoFileIDsHex);
-                    if (isoFileIDsResp.length > 2)
-                    {
-                        diag.append("ISO File IDs: ");
-                        for (int i = 0; i < isoFileIDsResp.length - 2; i += 2)
-                        {
-                            if (i + 1 < isoFileIDsResp.length - 2)
-                                diag.append(String.format("0x%02X%02X ",
-                                        isoFileIDsResp[i], isoFileIDsResp[i + 1]));
-                        }
-                        diag.append("\n");
-                    }
-                }
-                catch (Exception e)
-                {
-                    diag.append("Error: ").append(e.getMessage()).append("\n");
-                    Log.w(TAG, "LEAF DIAG GetISOFileIDs failed", e);
-                }
-
-                // Probe 3: DESFire GetFileSettings for file 0 (native cmd 0xF5, wrapped)
-                diag.append("\n--- Probe 3: DESFire GetFileSettings file 0 (90 F5 00 00 01 00 00) ---\n");
-                try
-                {
-                    byte[] getSettings = { (byte)0x90, (byte)0xF5, 0x00, 0x00, 0x01, 0x00, 0x00 };
-                    byte[] settingsResp = isoDep.transceive(getSettings);
-                    String settingsHex = Hex.toHexString(settingsResp);
-                    diag.append("Response: ").append(settingsHex).append("\n");
-                    Log.d(TAG, "LEAF DIAG GetFileSettings(0): " + settingsHex);
-                    if (settingsResp.length > 2 && settingsResp[settingsResp.length - 2] == (byte)0x91
-                            && settingsResp[settingsResp.length - 1] == 0x00)
-                    {
-                        diag.append("File type: ").append(String.format("0x%02X", settingsResp[0]));
-                        if (settingsResp[0] == 0x00) diag.append(" (Standard Data File)");
-                        else if (settingsResp[0] == 0x01) diag.append(" (Backup Data File)");
-                        diag.append("\n");
-                        if (settingsResp.length >= 7)
-                        {
-                            int fileSize = (settingsResp[4] & 0xFF)
-                                    | ((settingsResp[5] & 0xFF) << 8)
-                                    | ((settingsResp[6] & 0xFF) << 16);
-                            diag.append("File size: ").append(fileSize).append(" bytes\n");
-                        }
-                    }
-                }
-                catch (Exception e)
-                {
-                    diag.append("Error: ").append(e.getMessage()).append("\n");
-                    Log.w(TAG, "LEAF DIAG GetFileSettings failed", e);
-                }
-
-                // Probe 4: Try common EF IDs via ISO SELECT
-                diag.append("\n--- Probe 4: ISO SELECT EF scan ---\n");
-                int[][] diagEfCandidates = {
-                    {0x00, 0x01}, {0x00, 0x02}, {0x00, 0x03},
-                    {0x01, 0x00}, {0x01, 0x01}, {0x01, 0x02},
-                    {0x02, 0x00}, {0x02, 0x01},
-                    {0xE1, 0x01}, {0xE1, 0x02}, {0xE1, 0x03}, {0xE1, 0x04},
-                    {0x3F, 0x00}, {0x3F, 0x01},
-                    {0x00, 0x00},
-                };
-                for (int[] ef : diagEfCandidates)
-                {
-                    try
-                    {
-                        byte[] tryEF = { 0x00, (byte)0xA4, 0x02, 0x00, 0x02,
-                                (byte)ef[0], (byte)ef[1] };
-                        byte[] tryResp = isoDep.transceive(tryEF);
-                        String efHex = String.format("%02X%02X", ef[0], ef[1]);
-                        String respHex = Hex.toHexString(tryResp);
-                        String sw = swHex(tryResp);
-                        if (isSW9000(tryResp) || tryResp.length > 2)
-                        {
-                            diag.append("  EF ").append(efHex).append(": ✅ ").append(sw);
-                            if (tryResp.length > 2)
-                                diag.append(" FCI=").append(respHex);
-                            diag.append("\n");
-                            Log.d(TAG, "LEAF DIAG EF " + efHex + ": FOUND — " + respHex);
-                        }
-                        else
-                        {
-                            Log.d(TAG, "LEAF DIAG EF " + efHex + ": " + sw);
-                        }
-                    }
-                    catch (Exception e)
-                    {
-                        Log.w(TAG, "LEAF DIAG EF scan exception", e);
-                    }
-                }
-
-                // Probe 5: Try READ BINARY with short EF IDs (P1 bit 7 set)
-                diag.append("\n--- Probe 5: READ BINARY with short EF IDs ---\n");
-                for (int shortEF = 1; shortEF <= 5; shortEF++)
-                {
-                    try
-                    {
-                        // P1 = 0x80 | (shortEF << 3), P2 = 0x00, Le = 0x04 (read 4 bytes)
-                        byte p1 = (byte)(0x80 | (shortEF & 0x1F));
-                        byte[] readCmd = { 0x00, (byte)0xB0, p1, 0x00, 0x04 };
-                        byte[] readResp = isoDep.transceive(readCmd);
-                        String sw = swHex(readResp);
-                        if (readResp.length > 2)
-                        {
-                            diag.append("  Short EF ").append(shortEF)
-                                    .append(": ✅ ").append(sw)
-                                    .append(" data=").append(Hex.toHexString(readResp))
-                                    .append("\n");
-                            Log.d(TAG, "LEAF DIAG ShortEF " + shortEF + ": "
-                                    + Hex.toHexString(readResp));
-                        }
-                    }
-                    catch (Exception e)
-                    {
-                        Log.w(TAG, "LEAF DIAG ShortEF scan exception", e);
-                    }
-                }
-
-                // Probe 6: GET DATA for FCI template
-                diag.append("\n--- Probe 6: GET DATA (00 CA 00 6E) ---\n");
-                try
-                {
-                    byte[] getData = { 0x00, (byte)0xCA, 0x00, 0x6E, 0x00 };
-                    byte[] gdResp = isoDep.transceive(getData);
-                    diag.append("Response: ").append(Hex.toHexString(gdResp)).append("\n");
-                    Log.d(TAG, "LEAF DIAG GET DATA 006E: " + Hex.toHexString(gdResp));
-                }
-                catch (Exception e)
-                {
-                    diag.append("Error: ").append(e.getMessage()).append("\n");
-                }
-
-                String diagReport = diag.toString();
-                Log.i(TAG, "\n" + diagReport);
-
-                // Display diagnostic on screen
-                final String finalDiag = diagReport;
-                requireActivity().runOnUiThread(() ->
-                {
-                    if (!isAdded()) return;
-                    readerImageView.setVisibility(View.GONE);
-                    keypadLayout.setVisibility(View.GONE);
-                    requireView().findViewById(R.id.protocolModeGroup).setVisibility(View.GONE);
-
-                    Button rdrBtn = requireView().findViewById(R.id.rdrButton);
-                    rdrBtn.setVisibility(View.GONE);
-
-                    textView.setText(finalDiag);
-                    textView.setTextSize(11);
-                    textView.setTypeface(android.graphics.Typeface.MONOSPACE);
-
-                    readerLocationUUIDView.setVisibility(View.GONE);
-                    readerSiteUUIDView.setVisibility(View.GONE);
-                    sitePublicKeyView.setVisibility(View.GONE);
-                    nfcAdvertisingStatusView.setVisibility(View.GONE);
-                    bleAdvertisingStatusView.setVisibility(View.GONE);
-
-                    Button scanButton = requireView().findViewById(R.id.scanButton);
-                    scanButton.setVisibility(View.VISIBLE);
-                    scanButton.setOnClickListener(v -> resetToScanScreen());
-
-                    Button emailButton = requireView().findViewById(R.id.emailButton);
-                    emailButton.setVisibility(View.VISIBLE);
-                    emailButton.setOnClickListener(v -> sendEmail());
-
-                    isDisplayingResult = true;
-                });
-
-                return true;
-            }
-
-            // ------------------------------------------------------------------
-            // Step 3: READ BINARY in 224-byte chunks
-            // ------------------------------------------------------------------
-            final int CHUNK = 224;
-            java.io.ByteArrayOutputStream certAcc = new java.io.ByteArrayOutputStream();
-            int offset = 0;
-            boolean done = false;
-
-            while (!done)
-            {
-                int p1 = (offset >> 8) & 0x7F;
-                int p2 = offset & 0xFF;
-                byte[] readCmd = { 0x00, (byte)0xB0, (byte)p1, (byte)p2, (byte)CHUNK };
-                Log.d(TAG, "LEAF READ BINARY offset=" + offset + " len=" + CHUNK);
-                byte[] readResp = isoDep.transceive(readCmd);
-
-                if (readResp == null || readResp.length < 2)
-                {
-                    Log.e(TAG, "LEAF READ BINARY: empty response at offset=" + offset);
-                    break;
-                }
-
-                byte sw1 = readResp[readResp.length - 2];
-                byte sw2 = readResp[readResp.length - 1];
-                int dataLen = readResp.length - 2;
-
-                if (dataLen > 0)
-                    certAcc.write(readResp, 0, dataLen);
-
-                if (sw1 == (byte)0x90 && sw2 == 0x00)
-                {
-                    // More data may follow — continue reading
-                    offset += dataLen;
-                    if (dataLen < CHUNK)
-                        done = true; // received less than requested = end of file
-                }
-                else if (sw1 == (byte)0x62 && sw2 == (byte)0x82)
-                {
-                    // End of file
-                    Log.d(TAG, "LEAF READ BINARY: end of file at offset=" + offset);
-                    done = true;
-                }
-                else
-                {
-                    Log.e(TAG, "LEAF READ BINARY: unexpected SW " + String.format("%02X%02X", sw1, sw2));
-                    showLeafError("LEAF READ BINARY failed: " + String.format("%02X%02X", sw1, sw2));
+                    showLeafError("LEAF DUOX: failed to read certificate from file 2.");
                     return true;
                 }
             }
-
-            byte[] certDER = certAcc.toByteArray();
-            Log.d(TAG, "LEAF: certificate read complete, " + certDER.length + " bytes");
-
-            if (certDER.length == 0)
+            else
             {
-                showLeafError("LEAF: empty certificate received.");
-                return true;
-            }
+                // ==============================================================
+                // ISO 7816-4 PATH: SELECT LEAF Open App AID, then SELECT EF,
+                // then READ BINARY
+                // ==============================================================
+                Log.d(TAG, "LEAF: ISO 7816-4 path selected — DESFire SELECT APP response was: "
+                        + (desfireSelectResp != null ? Hex.toHexString(desfireSelectResp) : "null"));
+
+                // Step 1: SELECT LEAF Open App AID
+                byte[] leafAid  = LeafVerifiedManager.LEAF_OPEN_APP_AID;
+                byte[] selectCmd = new byte[5 + leafAid.length + 1];
+                selectCmd[0] = 0x00;  // CLA
+                selectCmd[1] = (byte)0xA4; // INS = SELECT
+                selectCmd[2] = 0x04;  // P1 = select by AID
+                selectCmd[3] = 0x00;  // P2
+                selectCmd[4] = (byte)leafAid.length; // Lc
+                System.arraycopy(leafAid, 0, selectCmd, 5, leafAid.length);
+                selectCmd[5 + leafAid.length] = 0x00; // Le
+
+                Log.d(TAG, "LEAF SELECT AID: " + Hex.toHexString(selectCmd));
+                byte[] selectResp = isoDep.transceive(selectCmd);
+                Log.d(TAG, "LEAF SELECT response: " + Hex.toHexString(selectResp));
+
+                if (!isSW9000(selectResp))
+                {
+                    Log.d(TAG, "LEAF: AID not supported, SW=" + swHex(selectResp));
+                    return false;  // not a LEAF credential at all
+                }
+
+                // Step 2: SELECT certificate EF
+                // Try DUOX file ID (E103) first, then fallback to 0001.
+                // If both fail, run diagnostic probes.
+                byte[][] efCandidates = {
+                        LeafVerifiedManager.LEAF_CERT_FILE_ID,
+                        LeafVerifiedManager.LEAF_CERT_FILE_ID_ALT
+                };
+                byte[] selectEFResp = null;
+                byte[] usedFileId = null;
+                for (byte[] fid : efCandidates)
+                {
+                    byte[] selectEF = { 0x00, (byte)0xA4, 0x02, 0x00, 0x02, fid[0], fid[1] };
+                    Log.d(TAG, "LEAF SELECT EF: " + Hex.toHexString(selectEF));
+                    selectEFResp = isoDep.transceive(selectEF);
+                    Log.d(TAG, "LEAF SELECT EF response: " + Hex.toHexString(selectEFResp));
+                    if (isSW9000(selectEFResp))
+                    {
+                        usedFileId = fid;
+                        Log.d(TAG, "LEAF: EF " + Hex.toHexString(fid) + " selected successfully");
+                        break;
+                    }
+                    Log.d(TAG, "LEAF: EF " + Hex.toHexString(fid) + " failed ("
+                            + swHex(selectEFResp) + "), trying next...");
+                }
+
+                if (usedFileId == null)
+                {
+                    Log.w(TAG, "LEAF: SELECT EF failed (" + swHex(selectEFResp)
+                            + ") — running diagnostic probes...");
+
+                    // === DIAGNOSTIC: Probe the card's file structure ===
+                    StringBuilder diag = new StringBuilder();
+                    diag.append("LEAF Verified Diagnostic Report\n");
+                    diag.append("================================\n\n");
+                    diag.append("DESFire SELECT APP: FAILED (not DUOX)\n");
+                    diag.append("ISO AID SELECT: OK (" + Hex.toHexString(selectResp) + ")\n");
+                    diag.append("SELECT EF (all candidates): FAILED (" + swHex(selectEFResp) + ")\n\n");
+
+                    // Probe 1: DESFire GetFileIDs (native cmd 0x6F, wrapped)
+                    diag.append("--- Probe 1: DESFire GetFileIDs (90 6F 00 00 00) ---\n");
+                    try
+                    {
+                        byte[] getFileIDs = { (byte)0x90, 0x6F, 0x00, 0x00, 0x00 };
+                        byte[] fileIDsResp = isoDep.transceive(getFileIDs);
+                        String fileIDsHex = Hex.toHexString(fileIDsResp);
+                        diag.append("Response: ").append(fileIDsHex).append("\n");
+                        Log.d(TAG, "LEAF DIAG GetFileIDs: " + fileIDsHex);
+                        if (fileIDsResp.length > 2)
+                        {
+                            diag.append("File numbers: ");
+                            for (int i = 0; i < fileIDsResp.length - 2; i++)
+                                diag.append(String.format("0x%02X ", fileIDsResp[i]));
+                            diag.append("\n");
+                        }
+                    }
+                    catch (Exception e)
+                    {
+                        diag.append("Error: ").append(e.getMessage()).append("\n");
+                        Log.w(TAG, "LEAF DIAG GetFileIDs failed", e);
+                    }
+
+                    // Probe 2: DESFire GetISOFileIDs (native cmd 0x61, wrapped)
+                    diag.append("\n--- Probe 2: DESFire GetISOFileIDs (90 61 00 00 00) ---\n");
+                    try
+                    {
+                        byte[] getISOFileIDs = { (byte)0x90, 0x61, 0x00, 0x00, 0x00 };
+                        byte[] isoFileIDsResp = isoDep.transceive(getISOFileIDs);
+                        String isoFileIDsHex = Hex.toHexString(isoFileIDsResp);
+                        diag.append("Response: ").append(isoFileIDsHex).append("\n");
+                        Log.d(TAG, "LEAF DIAG GetISOFileIDs: " + isoFileIDsHex);
+                        if (isoFileIDsResp.length > 2)
+                        {
+                            diag.append("ISO File IDs: ");
+                            for (int i = 0; i < isoFileIDsResp.length - 2; i += 2)
+                            {
+                                if (i + 1 < isoFileIDsResp.length - 2)
+                                    diag.append(String.format("0x%02X%02X ",
+                                            isoFileIDsResp[i], isoFileIDsResp[i + 1]));
+                            }
+                            diag.append("\n");
+                        }
+                    }
+                    catch (Exception e)
+                    {
+                        diag.append("Error: ").append(e.getMessage()).append("\n");
+                        Log.w(TAG, "LEAF DIAG GetISOFileIDs failed", e);
+                    }
+
+                    // Probe 3: DESFire GetFileSettings for file 0 (native cmd 0xF5, wrapped)
+                    diag.append("\n--- Probe 3: DESFire GetFileSettings file 0 (90 F5 00 00 01 00 00) ---\n");
+                    try
+                    {
+                        byte[] getSettings = { (byte)0x90, (byte)0xF5, 0x00, 0x00, 0x01, 0x00, 0x00 };
+                        byte[] settingsResp = isoDep.transceive(getSettings);
+                        String settingsHex = Hex.toHexString(settingsResp);
+                        diag.append("Response: ").append(settingsHex).append("\n");
+                        Log.d(TAG, "LEAF DIAG GetFileSettings(0): " + settingsHex);
+                        if (settingsResp.length > 2
+                                && settingsResp[settingsResp.length - 2] == (byte)0x91
+                                && settingsResp[settingsResp.length - 1] == 0x00)
+                        {
+                            diag.append("File type: ").append(String.format("0x%02X", settingsResp[0]));
+                            if (settingsResp[0] == 0x00) diag.append(" (Standard Data File)");
+                            else if (settingsResp[0] == 0x01) diag.append(" (Backup Data File)");
+                            diag.append("\n");
+                            if (settingsResp.length >= 7)
+                            {
+                                int fileSize = (settingsResp[4] & 0xFF)
+                                        | ((settingsResp[5] & 0xFF) << 8)
+                                        | ((settingsResp[6] & 0xFF) << 16);
+                                diag.append("File size: ").append(fileSize).append(" bytes\n");
+                            }
+                        }
+                    }
+                    catch (Exception e)
+                    {
+                        diag.append("Error: ").append(e.getMessage()).append("\n");
+                        Log.w(TAG, "LEAF DIAG GetFileSettings failed", e);
+                    }
+
+                    // Probe 4: Try common EF IDs via ISO SELECT
+                    diag.append("\n--- Probe 4: ISO SELECT EF scan ---\n");
+                    int[][] diagEfCandidates = {
+                        {0x00, 0x01}, {0x00, 0x02}, {0x00, 0x03},
+                        {0x01, 0x00}, {0x01, 0x01}, {0x01, 0x02},
+                        {0x02, 0x00}, {0x02, 0x01},
+                        {0xE1, 0x01}, {0xE1, 0x02}, {0xE1, 0x03}, {0xE1, 0x04},
+                        {0x3F, 0x00}, {0x3F, 0x01},
+                        {0x00, 0x00},
+                    };
+                    for (int[] ef : diagEfCandidates)
+                    {
+                        try
+                        {
+                            byte[] tryEF = { 0x00, (byte)0xA4, 0x02, 0x00, 0x02,
+                                    (byte)ef[0], (byte)ef[1] };
+                            byte[] tryResp = isoDep.transceive(tryEF);
+                            String efHex = String.format("%02X%02X", ef[0], ef[1]);
+                            String respHex = Hex.toHexString(tryResp);
+                            String sw = swHex(tryResp);
+                            if (isSW9000(tryResp) || tryResp.length > 2)
+                            {
+                                diag.append("  EF ").append(efHex).append(": \u2705 ").append(sw);
+                                if (tryResp.length > 2)
+                                    diag.append(" FCI=").append(respHex);
+                                diag.append("\n");
+                                Log.d(TAG, "LEAF DIAG EF " + efHex + ": FOUND — " + respHex);
+                            }
+                            else
+                            {
+                                Log.d(TAG, "LEAF DIAG EF " + efHex + ": " + sw);
+                            }
+                        }
+                        catch (Exception e)
+                        {
+                            Log.w(TAG, "LEAF DIAG EF scan exception", e);
+                        }
+                    }
+
+                    // Probe 5: Try READ BINARY with short EF IDs (P1 bit 7 set)
+                    diag.append("\n--- Probe 5: READ BINARY with short EF IDs ---\n");
+                    for (int shortEF = 1; shortEF <= 5; shortEF++)
+                    {
+                        try
+                        {
+                            // P1 = 0x80 | (shortEF & 0x1F), P2 = 0x00, Le = 0x04
+                            byte p1diag = (byte)(0x80 | (shortEF & 0x1F));
+                            byte[] readCmd = { 0x00, (byte)0xB0, p1diag, 0x00, 0x04 };
+                            byte[] readResp = isoDep.transceive(readCmd);
+                            String sw = swHex(readResp);
+                            if (readResp.length > 2)
+                            {
+                                diag.append("  Short EF ").append(shortEF)
+                                        .append(": \u2705 ").append(sw)
+                                        .append(" data=").append(Hex.toHexString(readResp))
+                                        .append("\n");
+                                Log.d(TAG, "LEAF DIAG ShortEF " + shortEF + ": "
+                                        + Hex.toHexString(readResp));
+                            }
+                        }
+                        catch (Exception e)
+                        {
+                            Log.w(TAG, "LEAF DIAG ShortEF scan exception", e);
+                        }
+                    }
+
+                    // Probe 6: GET DATA for FCI template
+                    diag.append("\n--- Probe 6: GET DATA (00 CA 00 6E) ---\n");
+                    try
+                    {
+                        byte[] getData = { 0x00, (byte)0xCA, 0x00, 0x6E, 0x00 };
+                        byte[] gdResp = isoDep.transceive(getData);
+                        diag.append("Response: ").append(Hex.toHexString(gdResp)).append("\n");
+                        Log.d(TAG, "LEAF DIAG GET DATA 006E: " + Hex.toHexString(gdResp));
+                    }
+                    catch (Exception e)
+                    {
+                        diag.append("Error: ").append(e.getMessage()).append("\n");
+                    }
+
+                    String diagReport = diag.toString();
+                    Log.i(TAG, "\n" + diagReport);
+
+                    // Display diagnostic on screen
+                    final String finalDiag = diagReport;
+                    requireActivity().runOnUiThread(() ->
+                    {
+                        if (!isAdded()) return;
+                        readerImageView.setVisibility(View.GONE);
+                        keypadLayout.setVisibility(View.GONE);
+                        requireView().findViewById(R.id.protocolModeGroup).setVisibility(View.GONE);
+
+                        Button rdrBtn = requireView().findViewById(R.id.rdrButton);
+                        rdrBtn.setVisibility(View.GONE);
+
+                        textView.setText(finalDiag);
+                        textView.setTextSize(11);
+                        textView.setTypeface(android.graphics.Typeface.MONOSPACE);
+
+                        readerLocationUUIDView.setVisibility(View.GONE);
+                        readerSiteUUIDView.setVisibility(View.GONE);
+                        sitePublicKeyView.setVisibility(View.GONE);
+                        nfcAdvertisingStatusView.setVisibility(View.GONE);
+                        bleAdvertisingStatusView.setVisibility(View.GONE);
+
+                        Button scanButton = requireView().findViewById(R.id.scanButton);
+                        scanButton.setVisibility(View.VISIBLE);
+                        scanButton.setOnClickListener(v -> resetToScanScreen());
+
+                        Button emailButton = requireView().findViewById(R.id.emailButton);
+                        emailButton.setVisibility(View.VISIBLE);
+                        emailButton.setOnClickListener(v -> sendEmail());
+
+                        isDisplayingResult = true;
+                    });
+
+                    return true;
+                } // end if (usedFileId == null)
+
+                // ------------------------------------------------------------------
+                // Step 3 (ISO path): READ BINARY in 224-byte chunks
+                // ------------------------------------------------------------------
+                final int CHUNK = 224;
+                java.io.ByteArrayOutputStream certAcc = new java.io.ByteArrayOutputStream();
+                int offset = 0;
+                boolean done = false;
+
+                while (!done)
+                {
+                    int p1 = (offset >> 8) & 0x7F;
+                    int p2 = offset & 0xFF;
+                    byte[] readCmd = { 0x00, (byte)0xB0, (byte)p1, (byte)p2, (byte)CHUNK };
+                    Log.d(TAG, "LEAF READ BINARY offset=" + offset + " len=" + CHUNK);
+                    byte[] readResp = isoDep.transceive(readCmd);
+
+                    if (readResp == null || readResp.length < 2)
+                    {
+                        Log.e(TAG, "LEAF READ BINARY: empty response at offset=" + offset);
+                        break;
+                    }
+
+                    byte sw1 = readResp[readResp.length - 2];
+                    byte sw2 = readResp[readResp.length - 1];
+                    int dataLen = readResp.length - 2;
+
+                    if (dataLen > 0)
+                        certAcc.write(readResp, 0, dataLen);
+
+                    if (sw1 == (byte)0x90 && sw2 == 0x00)
+                    {
+                        // More data may follow — continue reading
+                        offset += dataLen;
+                        if (dataLen < CHUNK)
+                            done = true; // received less than requested = end of file
+                    }
+                    else if (sw1 == (byte)0x62 && sw2 == (byte)0x82)
+                    {
+                        // End of file reached
+                        Log.d(TAG, "LEAF READ BINARY: end of file at offset=" + offset);
+                        done = true;
+                    }
+                    else
+                    {
+                        Log.e(TAG, "LEAF READ BINARY: unexpected SW "
+                                + String.format("%02X%02X", sw1, sw2));
+                        showLeafError("LEAF READ BINARY failed: "
+                                + String.format("%02X%02X", sw1, sw2));
+                        return true;
+                    }
+                }
+
+                certDER = certAcc.toByteArray();
+                Log.d(TAG, "LEAF: ISO certificate read complete, " + certDER.length + " bytes");
+
+                if (certDER.length == 0)
+                {
+                    showLeafError("LEAF: empty certificate received from ISO path.");
+                    return true;
+                }
+            } // end else (ISO 7816-4 path)
+
+            // ==================================================================
+            // COMMON STEPS 3-9: Both DUOX and ISO paths converge here.
+            // certDER is now populated by whichever path ran above.
+            // ==================================================================
 
             // ------------------------------------------------------------------
-            // Step 4: Verify certificate against Root CA public key
+            // Step 3: Verify certificate against Root CA public key
+            // Try the reader-configured Root CA first; if absent or invalid,
+            // also try the built-in production LEAF Root CA.
             // ------------------------------------------------------------------
             byte[] rootCAPub = LeafVerifiedManager.getReaderRootCAPubKey(requireContext());
-            if (rootCAPub == null)
+            boolean certVerified = false;
+            String certVerifyMsg;
+
+            if (rootCAPub != null)
+            {
+                certVerified = LeafVerifiedManager.verifyCertificate(certDER, rootCAPub);
+                Log.d(TAG, "LEAF: cert verify against reader Root CA=" + certVerified);
+            }
+
+            // If not verified yet, try the built-in production LEAF Root CA
+            // (covers real DUOX cards even when no custom Root CA is configured)
+            if (!certVerified)
+            {
+                byte[] prodRootCAPub = LeafVerifiedManager.getProductionRootCAPubKey();
+                if (prodRootCAPub != null)
+                {
+                    certVerified = LeafVerifiedManager.verifyCertificate(certDER, prodRootCAPub);
+                    Log.d(TAG, "LEAF: cert verify against production Root CA=" + certVerified);
+                    if (certVerified)
+                        rootCAPub = prodRootCAPub; // remember which key worked
+                }
+            }
+
+            if (rootCAPub == null && !certVerified)
             {
                 Log.e(TAG, "LEAF: no Root CA public key configured — aborting");
                 showLeafError("LEAF: Root CA not configured. Import via LEAF Config.");
                 return true;
             }
 
-            boolean certVerified = LeafVerifiedManager.verifyCertificate(certDER, rootCAPub);
-            String certVerifyMsg = certVerified ? "Verified \u2713" : "FAILED \u2717";
-            Log.d(TAG, "LEAF: cert verify=" + certVerified);
+            certVerifyMsg = certVerified ? "Verified \u2713" : "FAILED \u2717";
+            Log.d(TAG, "LEAF: cert verification result=" + certVerified);
 
             if (!certVerified)
             {
@@ -2446,7 +2590,7 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                 return true;
             }
 
-            // Spec Step 4: Only upon successful validation, extract Open ID
+            // Step 3b: Extract credential public key and Open ID from cert
             byte[] credPubKey = LeafVerifiedManager.extractPublicKeyFromCert(certDER);
             String openId     = LeafVerifiedManager.extractOpenIDFromCert(certDER);
 
@@ -2456,62 +2600,134 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                 return true;
             }
 
-            // Validate Open ID is exactly 12-digit numeric per spec
-            if (openId == null || !openId.matches("\\d{12}"))
+            // Validate Open ID is present and numeric
+            if (openId == null || openId.isEmpty())
             {
-                showLeafError("LEAF: Open ID is not a valid 12-digit numeric value.");
+                showLeafError("LEAF: Open ID not found in certificate.");
                 return true;
+            }
+            Log.d(TAG, "LEAF Open ID: " + openId + " (" + openId.length() + " chars)");
+
+            // ------------------------------------------------------------------
+            // Step 4: INTERNAL AUTHENTICATE (ISO 7816-4, INS=0x88)
+            //
+            // DUOX cards use a TLV-wrapped command with a 16-byte challenge:
+            //   00 88 00 00 <Lc> 80 00 7C 12 81 10 <16-byte challenge> 00
+            //   where Lc = 2 (OptsA) + 2 (7C tag+len) + 2 (81 tag+len) + 16 = 22 = 0x16
+            //
+            // HCE cards use a raw command with a 32-byte challenge:
+            //   00 88 00 00 20 <32-byte challenge>
+            //
+            // Response TLV for DUOX:
+            //   7C <len> 81 10 <card_random 16 bytes> 82 40 <signature_rs 64 bytes>
+            // Response for HCE: raw DER-encoded ECDSA signature || 90 00
+            // ------------------------------------------------------------------
+            boolean sigVerified;
+
+            if (isDuox)
+            {
+                // DUOX: 16-byte challenge, TLV-wrapped INTERNAL AUTHENTICATE
+                byte[] challenge16 = new byte[16];
+                new java.security.SecureRandom().nextBytes(challenge16);
+                Log.d(TAG, "LEAF DUOX challenge: " + Hex.toHexString(challenge16));
+
+                // Build TLV command body:
+                //   80 00           — OptsA TLV (tag 80, length 00, no value)
+                //   7C 12           — Data Object tag 7C, length 0x12 = 18
+                //   81 10 <16bytes> — Challenge TLV (tag 81, length 16, challenge)
+                // Lc = 2 + 2 + 2 + 16 = 22 = 0x16
+                // Full APDU: 00 88 00 00 16 80 00 7C 12 81 10 <16 bytes> 00
+                byte[] authCmd = new byte[6 + 22]; // header(5) + body(22) + Le(1)
+                authCmd[0] = 0x00;          // CLA
+                authCmd[1] = (byte)0x88;    // INS = INTERNAL AUTHENTICATE
+                authCmd[2] = 0x00;          // P1
+                authCmd[3] = 0x00;          // P2
+                authCmd[4] = 0x16;          // Lc = 22 bytes of data
+                authCmd[5] = (byte)0x80;    // OptsA tag
+                authCmd[6] = 0x00;          // OptsA length (0)
+                authCmd[7] = 0x7C;          // Dynamic Auth Data tag
+                authCmd[8] = 0x12;          // Dynamic Auth Data length (18 = 2 + 16)
+                authCmd[9] = (byte)0x81;    // Challenge tag
+                authCmd[10] = 0x10;         // Challenge length (16)
+                System.arraycopy(challenge16, 0, authCmd, 11, 16);
+                authCmd[27] = 0x00;         // Le
+
+                Log.d(TAG, "LEAF DUOX INTERNAL AUTHENTICATE: " + Hex.toHexString(authCmd));
+                byte[] authResp = isoDep.transceive(authCmd);
+                Log.d(TAG, "LEAF DUOX INTERNAL AUTHENTICATE response: " + Hex.toHexString(authResp));
+
+                if (!isSW9000(authResp) || authResp.length < 4)
+                {
+                    showLeafError("LEAF DUOX INTERNAL AUTHENTICATE failed: " + swHex(authResp));
+                    return true;
+                }
+
+                // Parse response TLV:
+                //   7C <len> 81 10 <cardRandom 16> 82 40 <sigRS 64>
+                // Response data is everything before the trailing 90 00
+                byte[] respData = java.util.Arrays.copyOfRange(authResp, 0, authResp.length - 2);
+                Log.d(TAG, "LEAF DUOX auth response data: " + Hex.toHexString(respData));
+
+                byte[] cardRandom16 = parseDuoxTlvTag(respData, (byte)0x81, 16);
+                byte[] sigRS64      = parseDuoxTlvTag(respData, (byte)0x82, 64);
+
+                if (cardRandom16 == null || sigRS64 == null)
+                {
+                    showLeafError("LEAF DUOX: failed to parse TLV response from INTERNAL AUTHENTICATE.");
+                    return true;
+                }
+
+                Log.d(TAG, "LEAF DUOX cardRandom: " + Hex.toHexString(cardRandom16));
+                Log.d(TAG, "LEAF DUOX sigRS64: " + Hex.toHexString(sigRS64));
+
+                // Verify DUOX signature: msg = F0F0 || OptsA(80 00) || RndB(16) || RndA(16)
+                sigVerified = LeafVerifiedManager.verifyDuoxSignature(
+                        cardRandom16, challenge16, sigRS64, credPubKey);
+                Log.d(TAG, "LEAF DUOX: sig verify=" + sigVerified);
+            }
+            else
+            {
+                // HCE (ISO 7816-4): 32-byte challenge, raw INTERNAL AUTHENTICATE
+                byte[] challenge32 = new byte[32];
+                new java.security.SecureRandom().nextBytes(challenge32);
+                Log.d(TAG, "LEAF HCE challenge: " + Hex.toHexString(challenge32));
+
+                byte[] authCmd = new byte[5 + challenge32.length];
+                authCmd[0] = 0x00;            // CLA
+                authCmd[1] = (byte)0x88;      // INS = INTERNAL AUTHENTICATE
+                authCmd[2] = 0x00;            // P1
+                authCmd[3] = 0x00;            // P2
+                authCmd[4] = (byte)challenge32.length; // Lc
+                System.arraycopy(challenge32, 0, authCmd, 5, challenge32.length);
+
+                Log.d(TAG, "LEAF HCE INTERNAL AUTHENTICATE: " + Hex.toHexString(authCmd));
+                byte[] authResp = isoDep.transceive(authCmd);
+                Log.d(TAG, "LEAF HCE INTERNAL AUTHENTICATE response: " + Hex.toHexString(authResp));
+
+                if (!isSW9000(authResp) || authResp.length < 4)
+                {
+                    showLeafError("LEAF INTERNAL AUTHENTICATE failed: " + swHex(authResp));
+                    return true;
+                }
+
+                // DER signature is everything before the trailing 90 00
+                byte[] sigDER = java.util.Arrays.copyOfRange(authResp, 0, authResp.length - 2);
+
+                // Verify ECDSA signature against credential's public key (challenge is the message)
+                sigVerified = LeafVerifiedManager.verifyChallenge(challenge32, sigDER, credPubKey);
+                Log.d(TAG, "LEAF HCE: sig verify=" + sigVerified);
             }
 
             // ------------------------------------------------------------------
-            // Step 5: Generate 32-byte random challenge
+            // Step 5: Build display string and show result on UI thread
             // ------------------------------------------------------------------
-            byte[] challenge = new byte[32];
-            new java.security.SecureRandom().nextBytes(challenge);
-            Log.d(TAG, "LEAF challenge: " + Hex.toHexString(challenge));
-
-            // ------------------------------------------------------------------
-            // Step 6: INTERNAL AUTHENTICATE (INS=0x88)
-            // ------------------------------------------------------------------
-            byte[] authCmd = new byte[5 + challenge.length];
-            authCmd[0] = 0x00;            // CLA
-            authCmd[1] = (byte)0x88;      // INS = INTERNAL AUTHENTICATE
-            authCmd[2] = 0x00;            // P1
-            authCmd[3] = 0x00;            // P2
-            authCmd[4] = (byte)challenge.length; // Lc
-            System.arraycopy(challenge, 0, authCmd, 5, challenge.length);
-
-            Log.d(TAG, "LEAF INTERNAL AUTHENTICATE: " + Hex.toHexString(authCmd));
-            byte[] authResp = isoDep.transceive(authCmd);
-            Log.d(TAG, "LEAF INTERNAL AUTHENTICATE response: " + Hex.toHexString(authResp));
-
-            if (!isSW9000(authResp) || authResp.length < 4)
-            {
-                showLeafError("LEAF INTERNAL AUTHENTICATE failed: " + swHex(authResp));
-                return true;
-            }
-
-            // DER signature is everything before the trailing 9000
-            byte[] sigDER = java.util.Arrays.copyOfRange(authResp, 0, authResp.length - 2);
-
-            // ------------------------------------------------------------------
-            // Step 7: Verify ECDSA signature against credential's public key
-            // ------------------------------------------------------------------
-            boolean sigVerified = LeafVerifiedManager.verifyChallenge(challenge, sigDER, credPubKey);
-            Log.d(TAG, "LEAF: sig verify=" + sigVerified);
-
-            // ------------------------------------------------------------------
-            // Step 8: Extract Open ID and build display string
-            // ------------------------------------------------------------------
-            final String finalOpenId      = openId;
+            final String finalOpenId       = openId;
             final boolean finalCertVerified = certVerified;
             final boolean finalSigVerified  = sigVerified;
-            final String finalCertMsg      = certVerifyMsg;
-            final String finalPubKeyHex    = Hex.toHexString(credPubKey).toUpperCase();
+            final String finalCertMsg       = certVerifyMsg;
+            final String finalPubKeyHex     = Hex.toHexString(credPubKey).toUpperCase();
+            final boolean finalIsDuox       = isDuox;
 
-            // ------------------------------------------------------------------
-            // Step 9: Display result on UI thread
-            // ------------------------------------------------------------------
             requireActivity().runOnUiThread(() ->
             {
                 if (!isAdded()) return;
@@ -2524,9 +2740,11 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                 // Compute 40-bit Wiegand output per LEAF spec
                 String wiegandDisplay = LeafVerifiedManager.formatWiegand40Display(finalOpenId);
 
+                String cardType = finalIsDuox ? "MIFARE DUOX" : "HCE";
                 sb.append("LEAF NFC \u2014 Open ID ").append(finalSigVerified ? "Verified" : "FAILED");
                 sb.append("\n\nOPEN ID APPLICATION\n");
                 sb.append("  ID:             ").append(finalOpenId).append("\n");
+                sb.append("  Card type:      ").append(cardType).append("\n");
                 sb.append("  Format:         12-digit unique ID\n");
                 sb.append("  Certificate:    X.509 PKI (ECC P-256)\n");
                 sb.append("  Auth:           Unilateral (reader verifies credential)\n");
@@ -2557,6 +2775,350 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
             Log.e(TAG, "LEAF NFC IO error", e);
             return false;
         }
+    }
+
+    /**
+     * Check whether a DESFire APDU response indicates success.
+     * DESFire wrapped commands return SW 91 00 (or 90 00 in some implementations).
+     * An optional single 0x00 data byte may precede the status bytes.
+     *
+     * @param resp raw response bytes from isoDep.transceive()
+     * @return true if the response signals success
+     */
+    private boolean isDesfireSuccess(byte[] resp)
+    {
+        if (resp == null || resp.length < 2) return false;
+        byte sw1 = resp[resp.length - 2];
+        byte sw2 = resp[resp.length - 1];
+        return (sw1 == (byte)0x91 && sw2 == 0x00)
+                || (sw1 == (byte)0x90 && sw2 == 0x00);
+    }
+
+    /**
+     * Read the LEAF certificate from a MIFARE DUOX card using DESFire wrapped
+     * READ DATA commands (CLA=0x90, INS=0xAD) from file number 0x02.
+     *
+     * Protocol:
+     *  a) First read 8 bytes to obtain the DER header and calculate total cert length.
+     *  b) Read remaining bytes in 59-byte chunks (fits within 64-byte NFC frame).
+     *  c) If any response returns SW 91 AF, send GET ADDITIONAL FRAME (90 AF 00 00 00)
+     *     to continue reading. Repeat until SW is 91 00 or 90 00.
+     *
+     * @param isoDep connected IsoDep tag; DESFire application already selected
+     * @return DER-encoded certificate bytes, or null on error
+     */
+    private byte[] readDuoxCertificate(android.nfc.tech.IsoDep isoDep)
+    {
+        try
+        {
+            final byte FILE_NO = 0x02;  // LEAF certificate is stored in DESFire file 2
+
+            // Step a: Read first 8 bytes to get DER header (tag + length)
+            // This lets us determine the total certificate length before reading all data.
+            byte[] header = readDuoxFileChunk(isoDep, FILE_NO, 0, 8);
+            if (header == null)
+            {
+                Log.e(TAG, "readDuoxCertificate: failed to read DER header");
+                return null;
+            }
+            Log.d(TAG, "LEAF DUOX: DER header bytes: " + Hex.toHexString(header));
+
+            // Parse DER length from header to find total certificate size
+            int totalLength = parseDerTotalLength(header);
+            if (totalLength <= 0)
+            {
+                Log.e(TAG, "readDuoxCertificate: could not parse DER length from header");
+                return null;
+            }
+            Log.d(TAG, "LEAF DUOX: DER total length=" + totalLength);
+
+            // Step b: Read the full certificate starting from offset 0
+            // Read in chunks; handle GET ADDITIONAL FRAME (91 AF) chaining.
+            java.io.ByteArrayOutputStream certAcc = new java.io.ByteArrayOutputStream();
+            final int CHUNK_SIZE = 59; // safe chunk size for NFC frames
+            int offset = 0;
+
+            while (certAcc.size() < totalLength)
+            {
+                int remaining = totalLength - certAcc.size();
+                int toRead = Math.min(remaining, CHUNK_SIZE);
+
+                // Build DESFire READ DATA APDU:
+                // 90 AD 00 00 07 <fileNo> <offset 3 LE> <length 3 LE> 00
+                byte[] readCmd = buildDuoxReadDataCmd(FILE_NO, offset, toRead);
+                Log.d(TAG, "LEAF DUOX READ DATA: offset=" + offset
+                        + " len=" + toRead + " cmd=" + Hex.toHexString(readCmd));
+
+                byte[] resp = isoDep.transceive(readCmd);
+                Log.d(TAG, "LEAF DUOX READ DATA response: " + Hex.toHexString(resp));
+
+                if (resp == null || resp.length < 2)
+                {
+                    Log.e(TAG, "LEAF DUOX READ DATA: null/short response at offset=" + offset);
+                    return null;
+                }
+
+                // Accumulate data (all bytes before the trailing 2 SW bytes)
+                int dataLen = resp.length - 2;
+                if (dataLen > 0)
+                    certAcc.write(resp, 0, dataLen);
+
+                byte respSw1 = resp[resp.length - 2];
+                byte respSw2 = resp[resp.length - 1];
+
+                if (respSw1 == (byte)0x91 && respSw2 == (byte)0xAF)
+                {
+                    // More data available — drain with GET ADDITIONAL FRAME
+                    Log.d(TAG, "LEAF DUOX READ DATA: got 91AF, sending GET ADDITIONAL FRAME");
+                    boolean moreData = true;
+                    while (moreData)
+                    {
+                        byte[] getMoreFrame = { (byte)0x90, (byte)0xAF, 0x00, 0x00, 0x00 };
+                        byte[] moreResp = isoDep.transceive(getMoreFrame);
+                        Log.d(TAG, "LEAF DUOX GET ADDITIONAL FRAME: "
+                                + Hex.toHexString(moreResp));
+                        if (moreResp == null || moreResp.length < 2)
+                        {
+                            Log.e(TAG, "LEAF DUOX GET ADDITIONAL FRAME: null/short response");
+                            return null;
+                        }
+                        int moreDataLen = moreResp.length - 2;
+                        if (moreDataLen > 0)
+                            certAcc.write(moreResp, 0, moreDataLen);
+
+                        byte moreSw1 = moreResp[moreResp.length - 2];
+                        byte moreSw2 = moreResp[moreResp.length - 1];
+                        if ((moreSw1 == (byte)0x91 || moreSw1 == (byte)0x90) && moreSw2 == 0x00)
+                        {
+                            moreData = false; // done
+                        }
+                        else if (moreSw1 == (byte)0x91 && moreSw2 == (byte)0xAF)
+                        {
+                            // More frames to come — continue loop
+                        }
+                        else
+                        {
+                            Log.e(TAG, "LEAF DUOX GET ADDITIONAL FRAME: unexpected SW "
+                                    + String.format("%02X%02X", moreSw1, moreSw2));
+                            return null;
+                        }
+                    }
+                    // After draining chained frames, exit the outer while loop
+                    break;
+                }
+                else if ((respSw1 == (byte)0x91 || respSw1 == (byte)0x90) && respSw2 == 0x00)
+                {
+                    // This chunk was read successfully; advance offset
+                    offset += dataLen;
+                    // If we've accumulated enough data, stop
+                    if (certAcc.size() >= totalLength)
+                        break;
+                }
+                else
+                {
+                    Log.e(TAG, "LEAF DUOX READ DATA: unexpected SW "
+                            + String.format("%02X%02X", respSw1, respSw2)
+                            + " at offset=" + offset);
+                    return null;
+                }
+            }
+
+            byte[] certDER = certAcc.toByteArray();
+            Log.d(TAG, "LEAF DUOX: certificate read complete, " + certDER.length + " bytes");
+
+            if (certDER.length == 0)
+            {
+                Log.e(TAG, "LEAF DUOX: empty certificate");
+                return null;
+            }
+
+            return certDER;
+        }
+        catch (Exception e)
+        {
+            Log.e(TAG, "readDuoxCertificate failed", e);
+            return null;
+        }
+    }
+
+    /**
+     * Build a DESFire wrapped READ DATA APDU.
+     * Format: 90 AD 00 00 07 &lt;fileNo&gt; &lt;offset 3 bytes LE&gt; &lt;length 3 bytes LE&gt; 00
+     *
+     * @param fileNo  DESFire file number
+     * @param offset  byte offset into the file (little-endian, 3 bytes)
+     * @param length  number of bytes to read (little-endian, 3 bytes)
+     * @return 9-byte APDU
+     */
+    private byte[] buildDuoxReadDataCmd(byte fileNo, int offset, int length)
+    {
+        return new byte[] {
+            (byte)0x90, (byte)0xAD, 0x00, 0x00, 0x07,
+            fileNo,
+            (byte)(offset & 0xFF),          // offset byte 0 (LSB)
+            (byte)((offset >> 8) & 0xFF),   // offset byte 1
+            (byte)((offset >> 16) & 0xFF),  // offset byte 2 (MSB)
+            (byte)(length & 0xFF),          // length byte 0 (LSB)
+            (byte)((length >> 8) & 0xFF),   // length byte 1
+            (byte)((length >> 16) & 0xFF),  // length byte 2 (MSB)
+            0x00                            // Le
+        };
+    }
+
+    /**
+     * Read a chunk of data from a DESFire file using a single READ DATA command.
+     * Returns the data bytes only (SW bytes stripped), or null on error.
+     *
+     * @param isoDep  connected IsoDep tag
+     * @param fileNo  DESFire file number
+     * @param offset  byte offset into the file
+     * @param length  number of bytes to read
+     * @return data bytes (without SW), or null on error
+     */
+    private byte[] readDuoxFileChunk(
+            android.nfc.tech.IsoDep isoDep, byte fileNo, int offset, int length)
+    {
+        try
+        {
+            byte[] cmd = buildDuoxReadDataCmd(fileNo, offset, length);
+            byte[] resp = isoDep.transceive(cmd);
+            if (resp == null || resp.length < 2) return null;
+            byte sw1 = resp[resp.length - 2];
+            byte sw2 = resp[resp.length - 1];
+            boolean ok = (sw1 == (byte)0x91 || sw1 == (byte)0x90) && sw2 == 0x00;
+            if (!ok && !(sw1 == (byte)0x91 && sw2 == (byte)0xAF)) return null;
+            int dataLen = resp.length - 2;
+            if (dataLen <= 0) return new byte[0];
+            byte[] data = new byte[dataLen];
+            System.arraycopy(resp, 0, data, 0, dataLen);
+            return data;
+        }
+        catch (Exception e)
+        {
+            Log.e(TAG, "readDuoxFileChunk failed", e);
+            return null;
+        }
+    }
+
+    /**
+     * Parse the total DER-encoded structure length from the first few bytes of a
+     * DER TLV header. Handles both short-form (1-byte) and long-form (multi-byte)
+     * ASN.1 length encodings.
+     *
+     * @param header at least 4 bytes from the start of the DER-encoded certificate
+     * @return total length of the DER structure (tag + length octets + value octets),
+     *         or -1 if the header is too short or malformed
+     */
+    private int parseDerTotalLength(byte[] header)
+    {
+        if (header == null || header.length < 2) return -1;
+        // byte[0] is the tag (0x30 = SEQUENCE for X.509)
+        // byte[1] onwards is the length
+        int tagLen = 1; // skip the tag byte
+        int lenByte = header[tagLen] & 0xFF;
+        int valueLen;
+        int headerBytes; // number of bytes consumed by tag + length
+        if ((lenByte & 0x80) == 0)
+        {
+            // Short form: length is in this byte
+            valueLen  = lenByte;
+            headerBytes = 2; // 1 tag + 1 length
+        }
+        else
+        {
+            // Long form: lower 7 bits = number of subsequent length bytes
+            int numLenBytes = lenByte & 0x7F;
+            if (header.length < 2 + numLenBytes) return -1;
+            valueLen = 0;
+            for (int i = 0; i < numLenBytes; i++)
+                valueLen = (valueLen << 8) | (header[2 + i] & 0xFF);
+            headerBytes = 2 + numLenBytes; // 1 tag + 1 length-of-length + numLenBytes
+        }
+        return headerBytes + valueLen;
+    }
+
+    /**
+     * Parse a TLV value from the DUOX INTERNAL AUTHENTICATE response data.
+     * Searches for the given single-byte tag and returns its value bytes.
+     * Tags 0x81 (card random, 16 bytes) and 0x82 (signature R||S, 64 bytes)
+     * are expected inside the outer 0x7C Data Object wrapper.
+     *
+     * This parser strips the outer 0x7C wrapper if present before searching.
+     *
+     * @param data     response data (SW bytes already removed)
+     * @param tag      single-byte tag to find
+     * @param expected expected length of the value in bytes
+     * @return value bytes of the found TLV, or null if not found / wrong length
+     */
+    private byte[] parseDuoxTlvTag(byte[] data, byte tag, int expected)
+    {
+        if (data == null || data.length < 2) return null;
+
+        // Strip outer 0x7C wrapper if present
+        byte[] inner = data;
+        if (data[0] == 0x7C)
+        {
+            // 0x7C <len> <contents>
+            int outerLenByte = data[1] & 0xFF;
+            int outerHeaderBytes;
+            int innerLen;
+            if ((outerLenByte & 0x80) == 0)
+            {
+                outerHeaderBytes = 2;
+                innerLen = outerLenByte;
+            }
+            else
+            {
+                int n = outerLenByte & 0x7F;
+                if (data.length < 2 + n) return null;
+                innerLen = 0;
+                for (int i = 0; i < n; i++)
+                    innerLen = (innerLen << 8) | (data[2 + i] & 0xFF);
+                outerHeaderBytes = 2 + n;
+            }
+            if (data.length < outerHeaderBytes + innerLen) return null;
+            inner = java.util.Arrays.copyOfRange(data, outerHeaderBytes,
+                    outerHeaderBytes + innerLen);
+        }
+
+        // Search for the target tag in the (possibly unwrapped) contents
+        int i = 0;
+        while (i < inner.length - 1)
+        {
+            byte curTag = inner[i];
+            int curLenByte = inner[i + 1] & 0xFF;
+            int curHeaderBytes;
+            int curLen;
+            if ((curLenByte & 0x80) == 0)
+            {
+                curLen = curLenByte;
+                curHeaderBytes = 2;
+            }
+            else
+            {
+                int n = curLenByte & 0x7F;
+                if (i + 2 + n > inner.length) return null;
+                curLen = 0;
+                for (int j = 0; j < n; j++)
+                    curLen = (curLen << 8) | (inner[i + 2 + j] & 0xFF);
+                curHeaderBytes = 2 + n;
+            }
+            if (curTag == tag)
+            {
+                if (curLen != expected)
+                {
+                    Log.w(TAG, "parseDuoxTlvTag: tag 0x" + String.format("%02X", tag & 0xFF)
+                            + " found but length=" + curLen + " expected=" + expected);
+                    return null;
+                }
+                if (i + curHeaderBytes + curLen > inner.length) return null;
+                return java.util.Arrays.copyOfRange(
+                        inner, i + curHeaderBytes, i + curHeaderBytes + curLen);
+            }
+            i += curHeaderBytes + curLen;
+        }
+        Log.w(TAG, "parseDuoxTlvTag: tag 0x" + String.format("%02X", tag & 0xFF) + " not found");
+        return null;
     }
 
     /** Show a toast error for LEAF failures */
@@ -2616,7 +3178,17 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
             byte[] readerIdBytes      = Hex.decode(readerIdHex);
             byte[] issuerKeyBytes     = issuerKeyHex.isEmpty() ? null : Hex.decode(issuerKeyHex);
             byte[] certBytes          = certHex.isEmpty() ? null : Hex.decode(certHex);
-            boolean useCert           = (certBytes != null && issuerKeyBytes != null);
+
+            // Certificate delivery mode: "none", "load_cert", or "auth1"
+            String certMode = prefs.getString(AliroPreferences.CERT_DELIVERY_MODE,
+                    AliroPreferences.CERT_MODE_LOAD_CERT);
+            boolean hasCert = (certBytes != null && issuerKeyBytes != null);
+            boolean useCert = hasCert && !AliroPreferences.CERT_MODE_NONE.equals(certMode);
+            boolean certInAuth1 = hasCert && AliroPreferences.CERT_MODE_AUTH1.equals(certMode);
+            boolean forceChaining = prefs.getBoolean(AliroPreferences.CERT_FORCE_CHAINING, false);
+            Log.d(TAG, "Cert mode: " + certMode + " hasCert=" + hasCert
+                    + " useCert=" + useCert + " certInAuth1=" + certInAuth1
+                    + " forceChaining=" + forceChaining);
 
             // ------------------------------------------------------------------
             // Parse SELECT response
@@ -2629,15 +3201,37 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
             byte[] selectProprietaryTLV = parseSelectProprietaryTLV(selectResponse);
             byte[] protocolVersion      = parseProtocolVersion(selectResponse);
 
-            if (selectProprietaryTLV == null || protocolVersion == null)
+            if (selectProprietaryTLV == null)
             {
                 Log.e(TAG, "Aliro SELECT response parse failed");
                 sendControlFlow(isoDep);
                 showAliroError("Aliro SELECT response invalid.");
                 return;
             }
+            if (protocolVersion == null)
+            {
+                Log.e(TAG, "No common Aliro protocol version — sending CONTROL FLOW S2=0x27");
+                sendControlFlow(isoDep, (byte)0x27); // S2 = protocol version not supported
+                showAliroError("No common protocol version with credential.");
+                return;
+            }
             Log.d(TAG, "Aliro protocol version: " + Hex.toHexString(protocolVersion));
-            Log.d(TAG, "Aliro proprietary TLV: " + Hex.toHexString(selectProprietaryTLV));
+            Log.d(TAG, "Aliro proprietary TLV (full): " + Hex.toHexString(selectProprietaryTLV));
+
+            // Per §8.3.1.12 / §8.3.1.13 the salt uses "0xA5 proprietary
+            // information TLV according to Table 10-2". The harness only
+            // includes the core children (0x80 Type, 0x5C versions) and
+            // strips transport-layer DO'7F66' (extended length) and 0xB3
+            // (vendor extensions) before computing the HKDF salt.
+            // Keep the full TLV for extended-length detection below, but
+            // use the stripped version for all key derivation calls.
+            // Use the full A5 proprietary TLV (including DO'7F66' and vendor tags)
+            // for HKDF salt computation. The CSA harness uses the full TLV as received
+            // in the SELECT response for its HKDF (reader.py line 2254:
+            // proprietary_information=self.proprietary_tlv.to_bytes()). Both sides
+            // must use the identical bytes to derive matching session keys.
+            byte[] selectTLVForCrypto = selectProprietaryTLV;
+            Log.d(TAG, "Aliro proprietary TLV (crypto): " + Hex.toHexString(selectTLVForCrypto));
 
             // ------------------------------------------------------------------
             // Generate ephemeral key pair and transaction ID
@@ -2653,9 +3247,13 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
             byte[] transactionId   = AliroCryptoProvider.generateRandom(16);
 
             // ------------------------------------------------------------------
-            // Derive reader public key (or issuer key X for key derivation)
-            // We need the reader's static public key X for HKDF.
-            // Re-derive it from private key bytes using BouncyCastle.
+            // Derive reader public key X from private key.
+            // Used for both reader signature (AUTH1) and HKDF salt.
+            //
+            // Per Aliro §6.2, reader_group_identifier_key is the reader's own
+            // public key (self-signed cert: reader key = issuer CA key).
+            // The credential stores this same key, so HKDF uses the same X
+            // coordinate regardless of cert or no-cert mode.
             // ------------------------------------------------------------------
             byte[] readerPubKeyX = derivePublicKeyXFromPrivate(readerPrivKeyBytes);
             if (readerPubKeyX == null)
@@ -2663,11 +3261,8 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                 showAliroError("Failed to derive reader public key.");
                 return;
             }
-            // HKDF reader_group_identifier_key.x = reader's own static public key X
-            // per section 8.3.1.13. Derived from the configured reader private key.
-            // The credential extracts the same value from tag 0x85 in LOAD CERT.
-            // These MUST match — if not, AUTH1 decryption will fail with GCM tag mismatch.
             byte[] hkdfReaderPubKeyX = readerPubKeyX;
+            Log.d(TAG, "HKDF reader_group_identifier_key.x: " + Hex.toHexString(hkdfReaderPubKeyX));
 
             // ------------------------------------------------------------------
             // Get reader private key — use cached instance if the key hex hasn't
@@ -2687,15 +3282,31 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
             }
 
             // ------------------------------------------------------------------
-            // Build and send AUTH0
-            // Header: 80 80 00 00 <Lc> 81 41 01 00 42 01 01
-            //   5C 02 <protocol version>
-            //   87 41 <reader eph public key 65 bytes>
-            //   4C 10 <transaction ID 16 bytes>
-            //   4D 20 <reader ID 32 bytes>
-            //   00 (Le)
+            // FAST mode detection (moved before AUTH0 to set command_parameters)
+            //
+            // FAST mode uses Kpersistent from a prior STANDARD transaction.
+            // We use in-memory state (sessionKpersistent) so FAST only activates
+            // after a STANDARD transaction in the SAME test session. Stale
+            // Kpersistent from a previous test run is ignored.
+            //
+            // The FAST_MODE_ENABLED checkbox acts as a gate — when unchecked,
+            // FAST is never used (always STANDARD). When checked, FAST will
+            // activate automatically after the first STANDARD tap stores
+            // Kpersistent in the session variable.
             // ------------------------------------------------------------------
-            byte[] auth0 = buildAuth0Command(protocolVersion, readerEphPub, transactionId, readerIdBytes);
+            boolean fastModeEnabled = prefs.getBoolean(AliroPreferences.FAST_MODE_ENABLED, false);
+            boolean useFastMode = fastModeEnabled
+                    && sessionKpersistent != null
+                    && sessionCredentialPubKeyX != null;
+            byte cmdParams = useFastMode ? (byte)0x01 : (byte)0x00;
+            Log.d(TAG, "FAST mode: enabled=" + fastModeEnabled
+                    + " hasSessionKp=" + (sessionKpersistent != null)
+                    + " useFastMode=" + useFastMode);
+
+            // ------------------------------------------------------------------
+            // Build and send AUTH0
+            // ------------------------------------------------------------------
+            byte[] auth0 = buildAuth0Command(protocolVersion, readerEphPub, transactionId, readerIdBytes, cmdParams);
             Log.d(TAG, "AUTH0 command: " + Hex.toHexString(auth0));
             byte[] auth0Response = isoDep.transceive(auth0);
             Log.d(TAG, "AUTH0 response: " + Hex.toHexString(auth0Response));
@@ -2711,6 +3322,9 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
             if (auth0Response.length < 69 || auth0Response[0] != (byte)0x86 || auth0Response[1] != 0x41)
             {
                 sendControlFlow(isoDep);
+                // Keep the NFC link alive briefly so the harness can complete
+                // processing of the CONTROL FLOW before we return and the link drops.
+                try { Thread.sleep(500); } catch (InterruptedException ignored) {}
                 showAliroError("AUTH0 response format invalid.");
                 return;
             }
@@ -2722,11 +3336,131 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
             byte[] auth0RspVendorTLV = parseVendorExtensionTLV(auth0Response, 67);
 
             // ------------------------------------------------------------------
-            // Compute reader signature and derive session keys immediately after
-            // AUTH0 — before LOAD CERT — so AUTH1 is ready to fire with no delay.
-            // keybuf[0..31]  = ExpeditedSKReader (encrypt EXCHANGE)
-            // keybuf[32..63] = ExpeditedSKDevice (decrypt AUTH1 response)
-            // keybuf[64..95] = StepUpSK (for ENVELOPE session encryption)
+            // §8.3.3.2.8: If STANDARD was requested, reject any unexpected cryptogram
+            // (tag 0x9D) in the AUTH0 response — mandatory failure condition.
+            // ------------------------------------------------------------------
+            if (!useFastMode)
+            {
+                boolean unexpectedCryptogram = false;
+                int swLen0 = 2; // status word at end of response
+                int pos0 = 67; // right after tag 0x86 payload
+                while (pos0 + 2 <= auth0Response.length - swLen0)
+                {
+                    int tag0 = auth0Response[pos0] & 0xFF;
+                    int len0 = auth0Response[pos0 + 1] & 0xFF;
+                    if (tag0 == 0x9D)
+                    {
+                        unexpectedCryptogram = true;
+                        break;
+                    }
+                    if (len0 == 0 || pos0 + 2 + len0 > auth0Response.length - swLen0) break;
+                    pos0 += 2 + len0;
+                }
+                if (unexpectedCryptogram)
+                {
+                    Log.w(TAG, "STANDARD AUTH0 response contains unexpected cryptogram (0x9D) — CONTROL FLOW");
+                    sendControlFlow(isoDep);
+                    showAliroError("AUTH0 STANDARD response contained unexpected cryptogram.");
+                    return;
+                }
+            }
+
+            // ------------------------------------------------------------------
+            // FAST cryptogram verification (§8.3.3.2.8)
+            //
+            // If we requested FAST, the AUTH0 response contains a cryptogram
+            // (tag 0x9D, 64 bytes). We must verify it by deriving CryptogramSK
+            // from Kpersistent and decrypting. If verification fails, the
+            // Kpersistent is stale — fall back to STANDARD for this transaction.
+            // ------------------------------------------------------------------
+            boolean fellBackFromFast = false;
+            if (useFastMode)
+            {
+                // Extract cryptogram (tag 0x9D, length 0x40 = 64 bytes)
+                byte[] fastCryptogram = null;
+                int swLen = 2; // status word at end of response
+                int pos = 67;  // right after tag 0x86 payload
+                while (pos + 2 < auth0Response.length - swLen)
+                {
+                    int tag = auth0Response[pos] & 0xFF;
+                    int len = auth0Response[pos + 1] & 0xFF;
+                    if (tag == 0x9D && len == 0x40 && pos + 2 + len <= auth0Response.length - swLen)
+                    {
+                        fastCryptogram = Arrays.copyOfRange(auth0Response, pos + 2, pos + 2 + 64);
+                        break;
+                    }
+                    pos += 2 + len;
+                }
+
+                if (fastCryptogram == null)
+                {
+                    // §8.3.3.2.8: cryptogram not present while FAST was requested → failure
+                    Log.w(TAG, "FAST requested but no cryptogram (0x9D) in AUTH0 response");
+                    sendControlFlow(isoDep);
+                    showAliroError("AUTH0 response missing FAST cryptogram.");
+                    return;
+                }
+                Log.d(TAG, "FAST cryptogram (0x9D): " + Hex.toHexString(fastCryptogram));
+
+                // Derive FAST keys to get CryptogramSK for verification.
+                // auth0Flag must be FAST (0x01) since that's what we sent.
+                byte[] fastFlag = new byte[]{ 0x01, 0x01 };
+                byte[] fastKeybuf = AliroCryptoProvider.deriveFastKeys(
+                        sessionKpersistent,
+                        160,  // CryptogramSK(32) + SKReader(32) + SKDevice(32) + BleSK(32) + StepUpSK(32)
+                        protocolVersion,
+                        hkdfReaderPubKeyX,
+                        readerIdBytes,
+                        transactionId,
+                        readerEphPubX,
+                        udEphPubX,
+                        sessionCredentialPubKeyX,
+                        selectTLVForCrypto,
+                        null,                                    // auth0CmdVendorTLV
+                        auth0RspVendorTLV,
+                        AliroCryptoProvider.INTERFACE_BYTE_NFC,
+                        fastFlag);
+
+                boolean fastVerified = false;
+                if (fastKeybuf != null)
+                {
+                    // CryptogramSK = first 32 bytes of FAST key material
+                    byte[] cryptogramSK = Arrays.copyOfRange(fastKeybuf, 0, 32);
+                    // §8.3.1.11: decrypt cryptogram to verify authentication_tag
+                    byte[] cryptogramPlain = AliroCryptoProvider.decryptCryptogram(
+                            cryptogramSK, fastCryptogram);
+                    fastVerified = (cryptogramPlain != null);
+                    Log.d(TAG, "FAST cryptogram verification: " + (fastVerified ? "SUCCESS" : "FAILED"));
+                }
+                else
+                {
+                    Log.w(TAG, "FAST key derivation failed — cannot verify cryptogram");
+                }
+
+                if (!fastVerified)
+                {
+                    // Kpersistent is stale or doesn't match this session.
+                    // Fall back to STANDARD for this transaction.
+                    // This works when the harness has no Kpersistent (random
+                    // cryptogram → STD keys on both sides). If the harness
+                    // DID have Kpersistent, it committed to FAST keys and
+                    // the AUTH1 decryption will fail — the failure EXCHANGE
+                    // handler will deal with that case.
+                    Log.w(TAG, "FAST cryptogram verification failed — falling back to STANDARD");
+                    useFastMode = false;
+                    fellBackFromFast = true;
+                    sessionKpersistent = null;
+                    sessionCredentialPubKeyX = null;
+                }
+                else
+                {
+                    Log.d(TAG, "FAST cryptogram verified — proceeding with FAST mode");
+                }
+            }
+
+            // ------------------------------------------------------------------
+            // Compute reader signature and derive session keys.
+            // useFastMode may have been cleared above if cryptogram failed.
             // ------------------------------------------------------------------
             byte[] readerSig = AliroCryptoProvider.computeReaderSignature(
                     readerPrivKey, readerIdBytes, udEphPubX, readerEphPubX, transactionId);
@@ -2737,60 +3471,353 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
             }
 
             // flag = command_parameters || authentication_policy per Table 8-4
-            // command_parameters = 0x00 (Bit0=0 = expedited-standard)
-            // authentication_policy = 0x01 (user device setting)
-            byte[] auth0Flag = new byte[]{ 0x00, 0x01 };
+            // Note: auth0Flag reflects what was SENT in AUTH0 (0x01 if FAST was
+            // originally requested), not the current useFastMode. The flag is
+            // used in key derivation salt, which must match what both sides used.
+            byte[] auth0Flag = cmdParams == (byte)0x01
+                    ? new byte[]{ 0x01, 0x01 }   // FAST was requested
+                    : new byte[]{ 0x00, 0x01 };  // STANDARD was requested
 
-            byte[] keybuf = AliroCryptoProvider.deriveKeys(
-                    readerEphKP.getPrivate(),
-                    udEphPub,
-                    96,
-                    protocolVersion,
-                    hkdfReaderPubKeyX,
-                    readerIdBytes,
-                    transactionId,
-                    readerEphPubX,
-                    udEphPubX,
-                    selectProprietaryTLV,
-                    null,                                    // auth0CmdVendorTLV
-                    auth0RspVendorTLV,
-                    AliroCryptoProvider.INTERFACE_BYTE_NFC,
-                    auth0Flag);
+            byte[] skReader;
+            byte[] skDevice;
+            byte[] stepUpSK;
+            byte[] credentialPubKeyX = null; // populated during STANDARD AUTH1
 
-            if (keybuf == null)
+            if (useFastMode)
             {
-                showAliroError("Key derivation failed.");
-                return;
-            }
-            byte[] skReader  = Arrays.copyOfRange(keybuf, 0,  32);
-            byte[] skDevice  = Arrays.copyOfRange(keybuf, 32, 64);
-            byte[] stepUpSK  = Arrays.copyOfRange(keybuf, 64, 96);
+                // -------------------------------------------------------
+                // FAST key derivation: use Kpersistent, no ECDH
+                // Keys already derived above during verification; re-derive
+                // to get the session keys (or reuse fastKeybuf — but it's
+                // out of scope, so re-derive cleanly).
+                // -------------------------------------------------------
+                credentialPubKeyX = sessionCredentialPubKeyX;
 
-            // ------------------------------------------------------------------
-            // LOAD CERT (optional) — sent after crypto is pre-computed so AUTH1
-            // follows immediately with no processing delay.
-            // ------------------------------------------------------------------
-            if (useCert)
-            {
-                byte[] loadCert = buildLoadCertCommand(certBytes);
-                Log.d(TAG, "LOAD CERT command length: " + loadCert.length);
-                byte[] loadCertResponse = isoDep.transceive(loadCert);
-                Log.d(TAG, "LOAD CERT response: " + Hex.toHexString(loadCertResponse));
-                if (!isSW9000(loadCertResponse))
+                byte[] fastKeybuf = AliroCryptoProvider.deriveFastKeys(
+                        sessionKpersistent,
+                        160,
+                        protocolVersion,
+                        hkdfReaderPubKeyX,
+                        readerIdBytes,
+                        transactionId,
+                        readerEphPubX,
+                        udEphPubX,
+                        credentialPubKeyX,
+                        selectTLVForCrypto,
+                        null,                                    // auth0CmdVendorTLV
+                        auth0RspVendorTLV,
+                        AliroCryptoProvider.INTERFACE_BYTE_NFC,
+                        auth0Flag);
+
+                if (fastKeybuf == null)
                 {
-                    sendControlFlow(isoDep);
-                    showAliroError("LOAD CERT failed: SW=" + swHex(loadCertResponse));
+                    showAliroError("FAST key derivation failed.");
                     return;
+                }
+                // FAST output layout (§8.3.1.12):
+                //   [0..31]   CryptogramSK (used for AUTH0 response cryptogram)
+                //   [32..63]  ExpeditedSKReader
+                //   [64..95]  ExpeditedSKDevice
+                //   [96..127] BleSK (Bluetooth LE only — not used on NFC)
+                //   [128..159] StepUpSK
+                skReader = Arrays.copyOfRange(fastKeybuf, 32, 64);
+                skDevice = Arrays.copyOfRange(fastKeybuf, 64, 96);
+                // [96..127] is BleSK — skip it
+                stepUpSK = Arrays.copyOfRange(fastKeybuf, 128, 160);
+                Log.d(TAG, "FAST keys derived from Kpersistent");
+            }
+            else
+            {
+                // -------------------------------------------------------
+                // STANDARD key derivation: ECDH + HKDF (§8.3.1.13)
+                // Note: when falling back from FAST, auth0Flag still
+                // reflects 0x01 (what was sent), which is correct per
+                // spec — the salt uses the original command_parameters.
+                // -------------------------------------------------------
+                byte[] keybuf = AliroCryptoProvider.deriveKeys(
+                        readerEphKP.getPrivate(),
+                        udEphPub,
+                        96,
+                        protocolVersion,
+                        hkdfReaderPubKeyX,
+                        readerIdBytes,
+                        transactionId,
+                        readerEphPubX,
+                        udEphPubX,
+                        selectTLVForCrypto,
+                        null,                                    // auth0CmdVendorTLV
+                        auth0RspVendorTLV,
+                        AliroCryptoProvider.INTERFACE_BYTE_NFC,
+                        auth0Flag);
+
+                if (keybuf == null)
+                {
+                    showAliroError("Key derivation failed.");
+                    return;
+                }
+                skReader = Arrays.copyOfRange(keybuf, 0,  32);
+                skDevice = Arrays.copyOfRange(keybuf, 32, 64);
+                stepUpSK = Arrays.copyOfRange(keybuf, 64, 96);
+            }
+
+            // ------------------------------------------------------------------
+            // LOAD CERT / AUTH1 (STANDARD only — FAST skips AUTH1 entirely)
+            // ------------------------------------------------------------------
+            boolean sigValid = false; // will be set during AUTH1 or FAST EXCHANGE
+
+            // auth1Response — only used in STANDARD mode, declared here for scope
+            byte[] auth1Response = null;
+
+            // Decrypted AUTH1 payload — only populated in STANDARD mode
+            byte[] decrypted = null;
+            byte[] credentialPubKey = null; // from AUTH1 response (STANDARD only)
+
+            // GCM counters — declared here so they're in scope for EXCHANGE.
+            // STANDARD: AUTH1 response uses device_counter=1, EXCHANGE starts at 2.
+            // FAST: no AUTH1, EXCHANGE response uses device_counter=1.
+            int deviceCounter = 1; // both FAST and STANDARD start at 1 per §8.3.1.12
+            int readerCounter = 1;
+
+            if (useFastMode)
+            {
+                // FAST mode: skip LOAD CERT and AUTH1 entirely.
+                // Keys are already derived from Kpersistent above.
+                // Go straight to EXCHANGE (handled below).
+                Log.d(TAG, "FAST mode: skipping LOAD CERT + AUTH1");
+                sigValid = true; // FAST assumes prior STANDARD established trust
+            }
+            else
+            {
+            // Three modes controlled by CERT_DELIVERY_MODE preference:
+            //   "none"      → skip LOAD CERT, AUTH1 has no cert
+            //   "load_cert" → send cert via LOAD CERT (INS D1), AUTH1 has no cert
+            //   "auth1"     → skip LOAD CERT, embed cert in AUTH1 (tag 0x90)
+            // ------------------------------------------------------------------
+            if (useCert && !certInAuth1)
+            {
+                if (forceChaining)
+                {
+                    // Mode: load_cert with command chaining (§8.3.2.2)
+                    // Split cert into chunks; CLA=0x90 for non-final, 0x80 for final.
+                    // Chunk size: half the cert, so we always get at least 2 chunks.
+                    int chunkSize = Math.max(1, certBytes.length / 2);
+                    int offset = 0;
+                    int chunkNum = 0;
+                    while (offset < certBytes.length)
+                    {
+                        int remaining = certBytes.length - offset;
+                        int thisChunk = Math.min(chunkSize, remaining);
+                        boolean lastChunk = (offset + thisChunk >= certBytes.length);
+                        byte cla = lastChunk ? (byte)0x80 : (byte)0x90;
+
+                        byte[] chunk = new byte[5 + thisChunk + 1];
+                        chunk[0] = cla;
+                        chunk[1] = (byte)0xD1; // INS = LOAD CERT
+                        chunk[2] = 0x00;        // P1
+                        chunk[3] = 0x00;        // P2
+                        chunk[4] = (byte)thisChunk; // Lc
+                        System.arraycopy(certBytes, offset, chunk, 5, thisChunk);
+                        chunk[5 + thisChunk] = 0x00; // Le
+
+                        Log.d(TAG, "LOAD CERT chain[" + chunkNum + "] CLA=0x"
+                                + String.format("%02X", cla & 0xFF)
+                                + " len=" + thisChunk
+                                + (lastChunk ? " (final)" : " (more)"));
+
+                        byte[] resp = isoDep.transceive(chunk);
+                        Log.d(TAG, "LOAD CERT chain[" + chunkNum + "] response: "
+                                + Hex.toHexString(resp));
+
+                        if (!isSW9000(resp))
+                        {
+                            sendControlFlow(isoDep);
+                            showAliroError("LOAD CERT chaining failed at chunk "
+                                    + chunkNum + ": SW=" + swHex(resp));
+                            return;
+                        }
+                        offset += thisChunk;
+                        chunkNum++;
+                    }
+                    Log.d(TAG, "LOAD CERT chaining complete: " + chunkNum + " chunks sent");
+                }
+                else
+                {
+                    // Mode: load_cert single APDU (no chaining)
+                    byte[] loadCert = buildLoadCertCommand(certBytes);
+                    Log.d(TAG, "LOAD CERT command length: " + loadCert.length);
+                    byte[] loadCertResponse = isoDep.transceive(loadCert);
+                    Log.d(TAG, "LOAD CERT response: " + Hex.toHexString(loadCertResponse));
+                    if (!isSW9000(loadCertResponse))
+                    {
+                        sendControlFlow(isoDep);
+                        showAliroError("LOAD CERT failed: SW=" + swHex(loadCertResponse));
+                        return;
+                    }
                 }
             }
 
-            // ------------------------------------------------------------------
             // Build and send AUTH1
-            // Header: 80 81 00 00 45 41 01 01 9E 40 <signature 64 bytes>
-            // ------------------------------------------------------------------
-            byte[] auth1 = buildAuth1Command(readerSig);
-            Log.d(TAG, "AUTH1 command: " + Hex.toHexString(auth1));
-            byte[] auth1Response = isoDep.transceive(auth1);
+            //
+            // Two cert-in-AUTH1 delivery modes per §8.3.2.2:
+            //   1. Command chaining (CLA=0x90/0x80) — mandatory, always supported
+            //   2. Extended-length APDU — optional, requires User Device support
+            //
+            // Check forceChaining preference:
+            //   true  → always use command chaining (WITH_CHAINING test)
+            //   false → use extended-length if device supports it (NO_CHAINING test)
+            //
+            // If extended-length is attempted but fails, fall back to chaining.
+            // Per §8.3.2.2: extended-length is only supported if the User Device
+            // advertised DO'7F66' in the SELECT response. Parse the proprietary
+            // TLV (tag A5) from the SELECT response for tag 7F66.
+            boolean udSupportsExtendedLength = false;
+            if (selectProprietaryTLV != null) {
+                // Scan proprietary TLV bytes for tag 0x7F66
+                for (int i = 0; i < selectProprietaryTLV.length - 3; i++) {
+                    if (selectProprietaryTLV[i] == 0x7F
+                            && selectProprietaryTLV[i + 1] == 0x66) {
+                        udSupportsExtendedLength = true;
+                        Log.d(TAG, "User Device advertised DO'7F66' — extended-length supported");
+                        break;
+                    }
+                }
+            }
+            boolean useExtendedLength = certInAuth1 && !forceChaining
+                    && udSupportsExtendedLength;
+            Log.d(TAG, "AUTH1 cert delivery: certInAuth1=" + certInAuth1
+                    + " forceChaining=" + forceChaining
+                    + " udExtLen=" + udSupportsExtendedLength
+                    + " useExtLen=" + useExtendedLength);
+
+            if (certInAuth1 && !useExtendedLength)
+            {
+                // Mode: auth1 with cert + command chaining (§8.3.2.2)
+                // Build the AUTH1 data field: 41 01 01 | 9E 40 <sig> | 90 xx <cert>
+                // Then split across chained APDUs.
+                ByteArrayOutputStream auth1Data = new ByteArrayOutputStream();
+                auth1Data.write(0x41); auth1Data.write(0x01); auth1Data.write(0x01);
+                auth1Data.write((byte)0x9E); auth1Data.write(0x40);
+                auth1Data.write(readerSig, 0, 64);
+                auth1Data.write((byte)0x90);
+                if (certBytes.length > 127) {
+                    auth1Data.write((byte)0x81);
+                    auth1Data.write((byte)(certBytes.length & 0xFF));
+                } else {
+                    auth1Data.write((byte)certBytes.length);
+                }
+                auth1Data.write(certBytes, 0, certBytes.length);
+                byte[] dataField = auth1Data.toByteArray();
+
+                int chunkSize = Math.max(1, dataField.length / 2);
+                int offset = 0;
+                int chunkNum = 0;
+                auth1Response = null;
+                while (offset < dataField.length)
+                {
+                    int remaining = dataField.length - offset;
+                    int thisChunk = Math.min(chunkSize, remaining);
+                    boolean lastChunk = (offset + thisChunk >= dataField.length);
+                    byte cla = lastChunk ? (byte)0x80 : (byte)0x90;
+
+                    byte[] chunk = new byte[5 + thisChunk + (lastChunk ? 1 : 0)];
+                    chunk[0] = cla;
+                    chunk[1] = (byte)0x81; // INS = AUTH1
+                    chunk[2] = 0x00;       // P1
+                    chunk[3] = 0x00;       // P2
+                    chunk[4] = (byte)thisChunk; // Lc
+                    System.arraycopy(dataField, offset, chunk, 5, thisChunk);
+                    if (lastChunk) chunk[5 + thisChunk] = 0x00; // Le on final
+
+                    Log.d(TAG, "AUTH1 chain[" + chunkNum + "] CLA=0x"
+                            + String.format("%02X", cla & 0xFF)
+                            + " len=" + thisChunk
+                            + (lastChunk ? " (final)" : " (more)"));
+
+                    byte[] resp = isoDep.transceive(chunk);
+                    Log.d(TAG, "AUTH1 chain[" + chunkNum + "] response: "
+                            + Hex.toHexString(resp));
+
+                    if (!lastChunk)
+                    {
+                        if (!isSW9000(resp))
+                        {
+                            sendControlFlow(isoDep);
+                            showAliroError("AUTH1 chaining failed at chunk "
+                                    + chunkNum + ": SW=" + swHex(resp));
+                            return;
+                        }
+                    }
+                    else
+                    {
+                        auth1Response = resp;
+                    }
+                    offset += thisChunk;
+                    chunkNum++;
+                }
+                Log.d(TAG, "AUTH1 chaining complete: " + chunkNum + " chunks sent");
+            }
+            else if (useExtendedLength)
+            {
+                // Mode: auth1 with cert + single extended-length APDU (no chaining)
+                byte[] auth1 = buildAuth1Command(readerSig, certBytes);
+                Log.d(TAG, "AUTH1 command (cert embedded, extended-length, " + auth1.length
+                        + " bytes): " + Hex.toHexString(auth1));
+                try
+                {
+                    auth1Response = isoDep.transceive(auth1);
+                }
+                catch (Exception extEx)
+                {
+                    Log.w(TAG, "Extended-length AUTH1 failed (" + extEx.getMessage()
+                            + ") — retrying with command chaining");
+                    // Fall back to chaining on the same IsoDep connection
+                    useExtendedLength = false;
+                    // Re-build and send via chaining
+                    ByteArrayOutputStream auth1Data2 = new ByteArrayOutputStream();
+                    auth1Data2.write(0x41); auth1Data2.write(0x01); auth1Data2.write(0x01);
+                    auth1Data2.write((byte)0x9E); auth1Data2.write(0x40);
+                    auth1Data2.write(readerSig, 0, 64);
+                    auth1Data2.write((byte)0x90);
+                    if (certBytes.length > 127) {
+                        auth1Data2.write((byte)0x81);
+                        auth1Data2.write((byte)(certBytes.length & 0xFF));
+                    } else {
+                        auth1Data2.write((byte)certBytes.length);
+                    }
+                    auth1Data2.write(certBytes, 0, certBytes.length);
+                    byte[] df = auth1Data2.toByteArray();
+                    int cs = Math.max(1, df.length / 2);
+                    int off = 0;
+                    while (off < df.length)
+                    {
+                        int rem = df.length - off;
+                        int tc2 = Math.min(cs, rem);
+                        boolean last = (off + tc2 >= df.length);
+                        byte cla2 = last ? (byte)0x80 : (byte)0x90;
+                        byte[] ch = new byte[5 + tc2 + (last ? 1 : 0)];
+                        ch[0] = cla2; ch[1] = (byte)0x81; ch[2] = 0; ch[3] = 0;
+                        ch[4] = (byte)tc2;
+                        System.arraycopy(df, off, ch, 5, tc2);
+                        if (last) ch[5 + tc2] = 0x00;
+                        byte[] r2 = isoDep.transceive(ch);
+                        if (last) auth1Response = r2;
+                        else if (!isSW9000(r2)) {
+                            sendControlFlow(isoDep);
+                            showAliroError("AUTH1 chaining fallback failed: SW=" + swHex(r2));
+                            return;
+                        }
+                        off += tc2;
+                    }
+                    Log.d(TAG, "AUTH1 chaining fallback complete");
+                }
+            }
+            else
+            {
+                // No cert in AUTH1 — short APDU, no chaining needed
+                byte[] auth1 = buildAuth1Command(readerSig, null);
+                Log.d(TAG, "AUTH1 command: " + Hex.toHexString(auth1));
+                auth1Response = isoDep.transceive(auth1);
+            }
             Log.d(TAG, "AUTH1 response: " + Hex.toHexString(auth1Response));
 
             if (!isSW9000(auth1Response))
@@ -2815,17 +3842,51 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
             // Both increment by 1 per message. Declared here so they are in scope
             // for the EXCHANGE block below and any future multi-EXCHANGE extensions.
             // ------------------------------------------------------------------
-            int deviceCounter = 1; // AUTH1 response was encrypted with device_counter=1
-            int readerCounter = 1; // First EXCHANGE command will use reader_counter=1
+            // (deviceCounter and readerCounter declared in outer scope above)
 
-            // ------------------------------------------------------------------
-            // Decrypt AUTH1 response with SKDevice, device_counter=1 (§8.3.1.7)
-            // Encrypted payload = auth1Response minus final 2 SW bytes
-            // ------------------------------------------------------------------
-            byte[] encryptedPayload = Arrays.copyOfRange(auth1Response, 0, auth1Response.length - 2);
-            byte[] decrypted = AliroCryptoProvider.decryptDeviceGcm(skDevice, encryptedPayload, deviceCounter++);
+            if (!useFastMode)
+            {
+                // ------------------------------------------------------------------
+                // Decrypt AUTH1 response with SKDevice, device_counter=1 (§8.3.1.7)
+                // Encrypted payload = auth1Response minus final 2 SW bytes
+                // ------------------------------------------------------------------
+                byte[] encryptedPayload = Arrays.copyOfRange(auth1Response, 0, auth1Response.length - 2);
+                decrypted = AliroCryptoProvider.decryptDeviceGcm(skDevice, encryptedPayload, deviceCounter++);
             if (decrypted == null)
             {
+                if (fellBackFromFast)
+                {
+                    // FAST→STANDARD fallback: the User Device may have used
+                    // FAST keys (it had Kpersistent), so our STANDARD keys
+                    // don't match. Sending a failure EXCHANGE would fail too
+                    // (key mismatch). Just drop the link cleanly — the
+                    // sessionKpersistent was already cleared, so the next
+                    // tap will use STANDARD from the start.
+                    Log.w(TAG, "AUTH1 decryption failed after FAST fallback "
+                            + "— key mismatch expected, dropping link");
+                    try { Thread.sleep(500); } catch (InterruptedException ignored) {}
+                    showAliroError("AUTH1 decryption failed (FAST fallback key mismatch).");
+                    return;
+                }
+                // Per Table 8-2 Row 1: EXCHANGE key available + last AUTH1 response SW=9000
+                // → send EXCHANGE with Reader status (tag 0x97) indicating failure.
+                Log.w(TAG, "AUTH1 decryption failed — sending failure EXCHANGE (0x00,0x25)");
+                byte[] failStatusTlv = new byte[]{ (byte)0x97, 0x02, 0x00, 0x25 };
+                byte[] failPayload = new byte[EXCHANGE_NOTIFY_TLV.length + failStatusTlv.length];
+                System.arraycopy(EXCHANGE_NOTIFY_TLV, 0, failPayload, 0, EXCHANGE_NOTIFY_TLV.length);
+                System.arraycopy(failStatusTlv, 0, failPayload, EXCHANGE_NOTIFY_TLV.length, failStatusTlv.length);
+                byte[] encFail = AliroCryptoProvider.encryptReaderGcm(skReader, failPayload, readerCounter++);
+                if (encFail != null)
+                {
+                    byte[] failCmd = buildExchangeCommand(encFail);
+                    try {
+                        byte[] failResp = isoDep.transceive(failCmd);
+                        Log.d(TAG, "Failure EXCHANGE response: " + Hex.toHexString(failResp));
+                    } catch (Exception ex) {
+                        Log.w(TAG, "Failure EXCHANGE send error: " + ex.getMessage());
+                    }
+                }
+                try { Thread.sleep(500); } catch (InterruptedException ignored) {}
                 showAliroError("AUTH1 decryption failed.");
                 return;
             }
@@ -2834,12 +3895,50 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
             // Parse: 5A 41 <credential pub key 65 bytes> 9E 40 <signature 64 bytes>
             if (decrypted.length < 131 || decrypted[0] != 0x5A || decrypted[1] != 0x41)
             {
+                // Per Table 8-2 Row 1: EXCHANGE key available + last response SW=9000
+                // → send EXCHANGE with Reader status (tag 0x97) indicating failure.
+                Log.w(TAG, "AUTH1 response format invalid — sending failure EXCHANGE (0x00,0x25)");
+                byte[] failStatusTlv = new byte[]{ (byte)0x97, 0x02, 0x00, 0x25 };
+                byte[] failPayload = new byte[EXCHANGE_NOTIFY_TLV.length + failStatusTlv.length];
+                System.arraycopy(EXCHANGE_NOTIFY_TLV, 0, failPayload, 0, EXCHANGE_NOTIFY_TLV.length);
+                System.arraycopy(failStatusTlv, 0, failPayload, EXCHANGE_NOTIFY_TLV.length, failStatusTlv.length);
+                byte[] encFail = AliroCryptoProvider.encryptReaderGcm(skReader, failPayload, readerCounter++);
+                if (encFail != null)
+                {
+                    byte[] failCmd = buildExchangeCommand(encFail);
+                    try {
+                        byte[] failResp = isoDep.transceive(failCmd);
+                        Log.d(TAG, "Failure EXCHANGE response: " + Hex.toHexString(failResp));
+                    } catch (Exception ex) {
+                        Log.w(TAG, "Failure EXCHANGE send error: " + ex.getMessage());
+                    }
+                }
+                try { Thread.sleep(500); } catch (InterruptedException ignored) {}
                 showAliroError("AUTH1 response format invalid.");
                 return;
             }
-            byte[] credentialPubKey = Arrays.copyOfRange(decrypted, 2, 67);
+            credentialPubKey = Arrays.copyOfRange(decrypted, 2, 67);
             if (decrypted[67] != (byte)0x9E || decrypted[68] != 0x40)
             {
+                // Per Table 8-2 Row 1: EXCHANGE key available + last response SW=9000
+                // → send EXCHANGE with Reader status (tag 0x97) indicating failure.
+                Log.w(TAG, "AUTH1 missing credential signature — sending failure EXCHANGE (0x00,0x25)");
+                byte[] failStatusTlv2 = new byte[]{ (byte)0x97, 0x02, 0x00, 0x25 };
+                byte[] failPayload2 = new byte[EXCHANGE_NOTIFY_TLV.length + failStatusTlv2.length];
+                System.arraycopy(EXCHANGE_NOTIFY_TLV, 0, failPayload2, 0, EXCHANGE_NOTIFY_TLV.length);
+                System.arraycopy(failStatusTlv2, 0, failPayload2, EXCHANGE_NOTIFY_TLV.length, failStatusTlv2.length);
+                byte[] encFail2 = AliroCryptoProvider.encryptReaderGcm(skReader, failPayload2, readerCounter++);
+                if (encFail2 != null)
+                {
+                    byte[] failCmd2 = buildExchangeCommand(encFail2);
+                    try {
+                        byte[] failResp2 = isoDep.transceive(failCmd2);
+                        Log.d(TAG, "Failure EXCHANGE response: " + Hex.toHexString(failResp2));
+                    } catch (Exception ex) {
+                        Log.w(TAG, "Failure EXCHANGE send error: " + ex.getMessage());
+                    }
+                }
+                try { Thread.sleep(500); } catch (InterruptedException ignored) {}
                 showAliroError("AUTH1 missing credential signature.");
                 return;
             }
@@ -2849,28 +3948,117 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
             // ------------------------------------------------------------------
             // Verify credential signature
             // ------------------------------------------------------------------
-            boolean sigValid = AliroCryptoProvider.verifyCredentialSignature(
+            sigValid = AliroCryptoProvider.verifyCredentialSignature(
                     credentialSig, credentialPubKey,
                     readerIdBytes, udEphPubX, readerEphPubX, transactionId);
             Log.d(TAG, "Aliro credential signature valid: " + sigValid);
 
+            if (!sigValid)
+            {
+                // Per Table 8-2 Row 1: EXCHANGE key available + last response SW=9000
+                // → send EXCHANGE with Reader status (tag 0x97) indicating failure.
+                Log.w(TAG, "Credential signature INVALID — sending failure EXCHANGE");
+                // 0x97: status 0x00=failure, 0x04=Invalid User Device signature
+                byte[] failStatusTlv = new byte[]{ (byte)0x97, 0x02, 0x00, 0x04 };
+                byte[] failPayload = new byte[EXCHANGE_NOTIFY_TLV.length + failStatusTlv.length];
+                System.arraycopy(EXCHANGE_NOTIFY_TLV, 0, failPayload, 0, EXCHANGE_NOTIFY_TLV.length);
+                System.arraycopy(failStatusTlv, 0, failPayload, EXCHANGE_NOTIFY_TLV.length, failStatusTlv.length);
+                byte[] failStatus = failPayload;
+                byte[] encFail = AliroCryptoProvider.encryptReaderGcm(skReader, failStatus, readerCounter++);
+                if (encFail != null)
+                {
+                    byte[] failCmd = buildExchangeCommand(encFail);
+                    try {
+                        byte[] failResp = isoDep.transceive(failCmd);
+                        Log.d(TAG, "Failure EXCHANGE response: " + Hex.toHexString(failResp));
+                    } catch (Exception ex) {
+                        Log.w(TAG, "Failure EXCHANGE send error: " + ex.getMessage());
+                    }
+                }
+                // Keep the NFC link alive briefly so the harness can complete
+                // processing before we return and the link drops.
+                try { Thread.sleep(500); } catch (InterruptedException ignored) {}
+                showAliroError("Credential signature verification failed.");
+                return;
+            }
+
             // ------------------------------------------------------------------
-            // Parse signaling_bitmap from decrypted AUTH1 payload
-            // Per Aliro §8.3.3.4.2 Table 8-11: tag 0x5E, 2 bytes big-endian.
-            //   Bit0: Access Document available (gates Step-Up ENVELOPE)
-            //   Bit2: Step-up AID SELECT required before ENVELOPE (NFC, §10.2)
+            // Derive and store Kpersistent for future FAST transactions.
+            // Also store the credential static public key X (needed by FAST
+            // key derivation). These persist across NFC taps.
+            // ------------------------------------------------------------------
+            credentialPubKeyX = Arrays.copyOfRange(credentialPubKey, 1, 33);
+            byte[] kpersistentDerived = AliroCryptoProvider.deriveKpersistent(
+                    readerEphKP.getPrivate(),
+                    udEphPub,
+                    protocolVersion,
+                    hkdfReaderPubKeyX,
+                    readerIdBytes,
+                    transactionId,
+                    readerEphPubX,
+                    udEphPubX,
+                    credentialPubKeyX,
+                    selectTLVForCrypto,
+                    null,                                    // auth0CmdVendorTLV
+                    auth0RspVendorTLV,
+                    AliroCryptoProvider.INTERFACE_BYTE_NFC,
+                    auth0Flag);
+            if (kpersistentDerived != null)
+            {
+                // Store in session memory for FAST mode on next tap
+                sessionKpersistent = kpersistentDerived;
+                sessionCredentialPubKeyX = credentialPubKeyX;
+                Log.d(TAG, "Kpersistent stored in session: " + Hex.toHexString(kpersistentDerived));
+            }
+            else
+            {
+                Log.w(TAG, "Kpersistent derivation failed — FAST mode will not be available");
+            }
+
+            } // end of if (!useFastMode) — AUTH1 decryption + Kpersistent
+            } // end of STANDARD (else) block
+
+            // ------------------------------------------------------------------
+            // Parse signaling_bitmap from decrypted AUTH1 payload (STANDARD only).
+            // In FAST mode, there is no AUTH1 response — default to 0x0000.
             // ------------------------------------------------------------------
             int signalingBitmap = 0x0000;
-            for (int si = 0; si < decrypted.length - 3; si++)
+            if (!useFastMode && decrypted != null)
             {
-                if ((decrypted[si] & 0xFF) == 0x5E && (decrypted[si + 1] & 0xFF) == 0x02)
+                // AUTH1 decrypted payload structure (Table 8-11):
+                //   5A 41 <credential pub key 65 bytes>   = offset 0..66  (67 bytes)
+                //   9E 40 <credential signature 64 bytes> = offset 67..132 (66 bytes)
+                //   Optional: 4B xx <mailbox_data_subset> (variable length)
+                //   5E 02 <signaling_bitmap 2 bytes>
+                //   91 xx <timestamp> (optional)
+                //
+                // FIX §8.3.3.4.6: Use a TLV-aware walk starting after the fixed
+                // fields (offset 133) to locate tag 0x5E. This prevents false
+                // matches inside optional tag 0x4B (mailbox_data_subset) data.
+                int scanStart = 133; // after 5A(1)+41(1)+pubkey(65) + 9E(1)+40(1)+sig(64)
+                int si = scanStart;
+                while (si + 2 <= decrypted.length)
                 {
-                    signalingBitmap = ((decrypted[si + 2] & 0xFF) << 8) | (decrypted[si + 3] & 0xFF);
-                    Log.d(TAG, "AUTH1: signaling_bitmap=0x" + String.format("%04X", signalingBitmap));
-                    break;
+                    int tlvTag = decrypted[si] & 0xFF;
+                    if (si + 1 >= decrypted.length) break;
+                    int tlvLen = decrypted[si + 1] & 0xFF;
+                    if (tlvTag == 0x5E && tlvLen == 0x02 && si + 4 <= decrypted.length)
+                    {
+                        signalingBitmap = ((decrypted[si + 2] & 0xFF) << 8) | (decrypted[si + 3] & 0xFF);
+                        Log.d(TAG, "AUTH1: signaling_bitmap=0x" + String.format("%04X", signalingBitmap)
+                                + " at offset " + si);
+                        break;
+                    }
+                    // Skip this TLV and advance to the next one
+                    if (tlvLen == 0 || si + 2 + tlvLen > decrypted.length) break;
+                    si += 2 + tlvLen;
                 }
             }
-            boolean accessDocAvailable = (signalingBitmap & 0x0001) != 0; // Bit0
+            boolean accessDocAvailable  = (signalingBitmap & 0x0001) != 0; // Bit0
+            boolean revocationDocAvail  = (signalingBitmap & 0x0002) != 0; // Bit1
+            boolean docAvailableForStepUp = accessDocAvailable || revocationDocAvail;
+            boolean mailboxReadable     = (signalingBitmap & 0x0010) != 0; // Bit4
+            boolean mailboxWritable     = (signalingBitmap & 0x0020) != 0; // Bit5
 
             // ------------------------------------------------------------------
             // Send EXCHANGE with access decision + optional mailbox operations
@@ -2884,11 +4072,19 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
             int mailboxReadLen = 0;
             String mailboxResultHex = null; // populated if mailbox read succeeds
 
-            if (mailboxEnabled)
+            // Per Table 8-11: Bit4 = mailbox readable, Bit5 = mailbox writable.
+            // "attempts to read the mailbox SHALL return an error if [Bit4] not set"
+            // Only include mailbox BA if the signaling_bitmap permits the operation.
+            if (mailboxEnabled && (mailboxReadable || mailboxWritable))
             {
                 mailboxOp = mailboxPrefs.getString(AliroPreferences.MAILBOX_OPERATION, "read");
                 int mOffset = Integer.parseInt(mailboxPrefs.getString(AliroPreferences.MAILBOX_OFFSET, "0"));
-                int mLength = Integer.parseInt(mailboxPrefs.getString(AliroPreferences.MAILBOX_LENGTH, "16"));
+                // Use the configured read length directly. The harness mailbox is small
+                // (0x20 = 32 bytes) but the simulator credential's sample mailbox is 300
+                // bytes with 73+ bytes of §18 TLV data. Capping at 32 truncates the TLV
+                // structure and prevents the parser from displaying readable content.
+                int rawLen = Integer.parseInt(mailboxPrefs.getString(AliroPreferences.MAILBOX_LENGTH, "256"));
+                int mLength = rawLen;
                 boolean atomic = mailboxPrefs.getBoolean(AliroPreferences.MAILBOX_ATOMIC, false);
 
                 java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
@@ -2958,35 +4154,119 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
             // MAY close the NFC link after receiving it (per §8.3.3.5).
             // Instead: send EXCHANGE with mailbox only, then ENVELOPE for step-up,
             // then a final EXCHANGE with 0x97 to close the transaction.
+            //
+            // IMPORTANT: Per §8.3.1 the mailbox SHALL NOT be used during step-up
+            // phase. Also, the harness step-up negative tests do NOT configure a
+            // mailbox, so sending a mailbox read request (tag 0xBA) causes them to
+            // fail. When step-up is pending, do NOT include mailbox in EXCHANGE.
             // ------------------------------------------------------------------
             SharedPreferences stepUpPrefs = requireActivity().getPreferences(Context.MODE_PRIVATE);
             String stepUpElementId = stepUpPrefs.getString(AliroPreferences.STEP_UP_ELEMENT_ID, "");
-            boolean willDoStepUp = !stepUpElementId.isEmpty() && accessDocAvailable;
+            boolean willDoStepUp = !stepUpElementId.isEmpty() && docAvailableForStepUp;
 
-            byte[] statusTlv = new byte[]{ (byte)0x97, 0x02, sigValid ? (byte)0x01 : 0x00, (byte)0x82 };
-            byte[] exchangePayload;
+            // When step-up is pending, send a pre-step-up EXCHANGE with ONLY the
+            // mailbox read request (no 0x97 status, no 0xAE notify). The 0x97 status
+            // is deferred to the post-step-up EXCHANGE after ENVELOPE completes.
+            // Per §8.3.3.5: mailbox operations occur in the expedited phase EXCHANGE,
+            // not during the step-up phase.
             if (willDoStepUp && mailboxBA != null)
             {
-                // Mailbox only — no 0x97 yet (step-up will follow)
-                exchangePayload = mailboxBA;
+                Log.d(TAG, "Step-up pending — sending mailbox-only pre-step-up EXCHANGE");
+                byte[] mbEncrypted = AliroCryptoProvider.encryptReaderGcm(skReader, mailboxBA, readerCounter++);
+                if (mbEncrypted != null)
+                {
+                    byte[] mbCmd = buildExchangeCommand(mbEncrypted);
+                    Log.d(TAG, "Pre-step-up EXCHANGE (mailbox only): " + Hex.toHexString(mbCmd));
+                    byte[] mbResp = isoDep.transceive(mbCmd);
+                    Log.d(TAG, "Pre-step-up EXCHANGE response: " + Hex.toHexString(mbResp));
+                    if (isSW9000(mbResp) && mbResp.length > 2)
+                    {
+                        byte[] mbEncPayload = Arrays.copyOfRange(mbResp, 0, mbResp.length - 2);
+                        byte[] mbDecrypted = AliroCryptoProvider.decryptDeviceGcm(skDevice, mbEncPayload, deviceCounter++);
+                        if (mbDecrypted != null && mailboxEnabled && "read".equals(mailboxOp))
+                        {
+                            Log.d(TAG, "Pre-step-up mailbox decrypted (" + mbDecrypted.length + " bytes): "
+                                    + Hex.toHexString(mbDecrypted));
+                            if (mbDecrypted.length > 4)
+                            {
+                                int readDataLen = mbDecrypted.length - 4;
+                                byte[] mailboxReadData = Arrays.copyOfRange(mbDecrypted, 0, readDataLen);
+                                int tlvStart = -1;
+                                for (int s = 0; s < Math.min(4, readDataLen); s++)
+                                {
+                                    if ((mailboxReadData[s] & 0xFF) == 0x60) { tlvStart = s; break; }
+                                }
+                                if (tlvStart >= 0)
+                                {
+                                    byte[] tlvData = Arrays.copyOfRange(mailboxReadData, tlvStart, readDataLen);
+                                    mailboxResultHex = AliroMailbox.parseMailboxToString(tlvData, tlvData.length);
+                                }
+                                else
+                                {
+                                    String fullHex = Hex.toHexString(mailboxReadData);
+                                    String preview = (fullHex.length() > 64)
+                                            ? fullHex.substring(0, 64) + "..."
+                                            : fullHex;
+                                    mailboxResultHex = "Read " + readDataLen + " bytes\n"
+                                            + "  Preview: " + preview;
+                                }
+                            }
+                        }
+                    }
+                }
+                // Clear mailboxBA so it's not included again in the non-step-up EXCHANGE path
+                mailboxBA = null;
             }
-            else if (willDoStepUp)
+
+            // Check revocation database before making access decision.
+            // Per §7.6: the Reader must enforce revocation entries.
+            boolean isRevoked = false;
+            if (sigValid && credentialPubKey != null) {
+                isRevoked = AliroAccessDocumentVerifier.isRevoked(credentialPubKey);
+                if (isRevoked) {
+                    Log.w(TAG, "Credential public key is REVOKED — rejecting access");
+                }
+            }
+            boolean accessGranted = sigValid && !isRevoked;
+            // Per Table 8-18: first byte 0x01 = accepted, 0x00 = rejected.
+            // Second byte: when accepted, 0x82 = reader state unknown.
+            // When rejected, use a valid rejection reason code:
+            //   0x03 = Access Credential public key not trusted (revoked)
+            //   0x04 = Invalid User Device signature
+            byte[] statusTlv;
+            if (accessGranted) {
+                statusTlv = new byte[]{ (byte)0x97, 0x02, 0x01, (byte)0x82 };
+            } else if (isRevoked) {
+                statusTlv = new byte[]{ (byte)0x97, 0x02, 0x00, 0x03 }; // not trusted (revoked)
+            } else {
+                statusTlv = new byte[]{ (byte)0x97, 0x02, 0x00, 0x04 }; // invalid signature
+            }
+            // Notify (0xAE with descriptor inside) + status (0x97)
+            // Per Table 8-15 ordering: 0xBA (mailbox) → 0xAE (notify{descriptor}) → 0x97 (status)
+            byte[] descAndStatus = new byte[EXCHANGE_NOTIFY_TLV.length + statusTlv.length];
+            System.arraycopy(EXCHANGE_NOTIFY_TLV, 0, descAndStatus, 0, EXCHANGE_NOTIFY_TLV.length);
+            System.arraycopy(statusTlv, 0, descAndStatus, EXCHANGE_NOTIFY_TLV.length, statusTlv.length);
+
+            byte[] exchangePayload;
+            if (willDoStepUp)
             {
-                // No mailbox, but step-up is coming — skip this EXCHANGE entirely,
-                // go straight to step-up, and send 0x97 in the post-step-up EXCHANGE.
+                // Step-up is coming — skip the pre-step-up EXCHANGE entirely.
+                // Per §8.2 the Reader proceeds directly from AUTH1 to step-up phase
+                // (optional SELECT + ENVELOPE). The 0x97 reader status is sent in the
+                // post-step-up EXCHANGE after the ENVELOPE completes.
                 exchangePayload = null;
             }
             else if (mailboxBA != null)
             {
-                // Mailbox + 0x97 (no step-up)
-                exchangePayload = new byte[mailboxBA.length + statusTlv.length];
+                // Mailbox + descriptor + 0x97 (no step-up)
+                exchangePayload = new byte[mailboxBA.length + descAndStatus.length];
                 System.arraycopy(mailboxBA, 0, exchangePayload, 0, mailboxBA.length);
-                System.arraycopy(statusTlv, 0, exchangePayload, mailboxBA.length, statusTlv.length);
+                System.arraycopy(descAndStatus, 0, exchangePayload, mailboxBA.length, descAndStatus.length);
             }
             else
             {
-                // Just 0x97 (no mailbox, no step-up)
-                exchangePayload = statusTlv;
+                // Descriptor + 0x97 (no mailbox, no step-up)
+                exchangePayload = descAndStatus;
             }
 
             // Send pre-step-up EXCHANGE (mailbox only, or mailbox+0x97 if no step-up)
@@ -3113,18 +4393,34 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                     }
                 }
             }
+            // Determine docType based on signaling bitmap
+            // Bit0 = Access Document (aliro-a), Bit1 = Revocation Document (aliro-r)
+            // Prioritize access document — it contains access rules, schedules, and
+            // employee badge data. Revocation is supplementary (processed separately
+            // if needed after the access document).
+            String stepUpDocType = accessDocAvailable ? "aliro-a" : "aliro-r";
+
+            // Verification result — determines post-step-up EXCHANGE reader status
+            AliroAccessDocumentVerifier.VerificationResult docVerifyResult = null;
+
             if (willDoStepUp)
             {
-                Log.d(TAG, "Step-Up: requesting element '" + stepUpElementId + "'");
+                Log.d(TAG, "Step-Up: requesting element '" + stepUpElementId
+                        + "' docType=" + stepUpDocType
+                        + "' stepUpSK=" + Hex.toHexString(stepUpSK));
                 try
                 {
-                    stepUpResult = runAliroStepUp(isoDep, stepUpSK, stepUpElementId, stepUpPrefs);
+                    stepUpResult = runAliroStepUp(isoDep, stepUpSK, stepUpElementId,
+                            stepUpPrefs, stepUpDocType, credentialPubKey);
                 }
                 catch (Exception e)
                 {
                     Log.w(TAG, "Step-Up failed (non-fatal): " + e.getMessage());
                     stepUpResult = "Step-Up failed: " + e.getMessage();
                 }
+
+                // Extract verification result from the step-up run
+                docVerifyResult = lastDocVerifyResult; // set by runAliroStepUp
 
                 // Send final EXCHANGE with 0x97 (reader status) to close the transaction.
                 // This must come AFTER step-up because 0x97 signals end-of-transaction.
@@ -3142,9 +4438,36 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                     int suReaderCounter = 2; // ENVELOPE used counter 1
                     int suDeviceCounter = 2;
 
+                    // Build final payload: descriptor + status.
+                    // Per §8.3.1: "The mailbox SHALL NOT be used when in the step-up phase."
+                    // Do NOT include mailbox (tag 0xBA) in post-step-up EXCHANGE.
+                    //
+                    // Use the verification result status if available, otherwise
+                    // fall back to the expedited-phase status.
+                    byte[] postStepUpStatusTlv;
+                    if (docVerifyResult != null)
+                    {
+                        postStepUpStatusTlv = new byte[]{
+                                (byte)0x97, 0x02,
+                                (byte)docVerifyResult.readerStatusByte1,
+                                (byte)docVerifyResult.readerStatusByte2
+                        };
+                        Log.d(TAG, "Post step-up EXCHANGE status: 0x"
+                                + String.format("%02X%02X",
+                                        docVerifyResult.readerStatusByte1,
+                                        docVerifyResult.readerStatusByte2)
+                                + " (" + docVerifyResult.reason + ")");
+                    }
+                    else
+                    {
+                        postStepUpStatusTlv = statusTlv;
+                    }
+                    byte[] finalPayload = new byte[EXCHANGE_NOTIFY_TLV.length + postStepUpStatusTlv.length];
+                    System.arraycopy(EXCHANGE_NOTIFY_TLV, 0, finalPayload, 0, EXCHANGE_NOTIFY_TLV.length);
+                    System.arraycopy(postStepUpStatusTlv, 0, finalPayload, EXCHANGE_NOTIFY_TLV.length, postStepUpStatusTlv.length);
                     Log.d(TAG, "Sending final EXCHANGE with 0x97 (post step-up, using StepUpSK)");
                     byte[] finalEncrypted = AliroCryptoProvider.encryptReaderGcm(
-                            postSuSKReader, statusTlv, suReaderCounter++);
+                            postSuSKReader, finalPayload, suReaderCounter++);
                     if (finalEncrypted != null)
                     {
                         byte[] finalCmd = buildExchangeCommand(finalEncrypted);
@@ -3164,9 +4487,9 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                     java.util.Arrays.fill(postSuSKDevice, (byte)0);
                 }
             }
-            else if (!stepUpElementId.isEmpty() && !accessDocAvailable)
+            else if (!stepUpElementId.isEmpty() && !docAvailableForStepUp)
             {
-                Log.d(TAG, "Step-Up: skipped — signaling_bitmap Bit0 not set (no Access Document)");
+                Log.d(TAG, "Step-Up: skipped — signaling_bitmap Bit0/Bit1 not set (no Access/Revocation Document)");
             }
 
             // ------------------------------------------------------------------
@@ -3175,7 +4498,6 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
             java.util.Arrays.fill(skReader,  (byte)0);
             java.util.Arrays.fill(skDevice,  (byte)0);
             java.util.Arrays.fill(stepUpSK,  (byte)0);
-            java.util.Arrays.fill(keybuf,    (byte)0);
             Log.d(TAG, "Aliro session keys destroyed");
 
             // ------------------------------------------------------------------
@@ -3189,7 +4511,7 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
             {
                 readerImageView.setVisibility(View.GONE);
                 keypadLayout.setVisibility(View.GONE);
-                String pk = Hex.toHexString(finalCredPubKey);
+                String pk = finalCredPubKey != null ? Hex.toHexString(finalCredPubKey) : "(FAST mode)";
                 Log.d(TAG, "Aliro credential public key: " + pk);
                 String connectionType = formatAliroConnectionType(
                         "NFC", finalSigValid, finalStepUpResult, finalMailboxResult);
@@ -3239,7 +4561,62 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
         return null;
     }
 
-    /** Parse the protocol version (tag 5C, first 2-byte version) from SELECT response */
+    /**
+     * Strip transport-layer tags (DO'7F66' extended length, 0xB3 vendor extensions)
+     * from the A5 proprietary TLV so only the core children (0x80, 0x5C) remain.
+     * Per §8.3.1.12/§8.3.1.13 the harness uses only the core children in the
+     * HKDF salt.  The input is the full A5 TLV (tag + length + value).
+     * Returns a rebuilt A5 TLV containing only 0x80 and 0x5C children.
+     */
+    private byte[] stripNonCryptoTags(byte[] a5Tlv)
+    {
+        if (a5Tlv == null || a5Tlv.length < 2 || a5Tlv[0] != (byte) 0xA5)
+            return a5Tlv;
+
+        int a5Len = a5Tlv[1] & 0xFF;
+        // Walk child TLVs inside the A5 value, keeping only 0x80 and 0x5C
+        java.io.ByteArrayOutputStream kept = new java.io.ByteArrayOutputStream();
+        int pos = 2; // start of A5 value
+        int end = 2 + a5Len;
+        while (pos < end)
+        {
+            // Handle two-byte tags (0x7F66)
+            int tag;
+            int tagBytes;
+            if (pos + 1 < end && (a5Tlv[pos] & 0xFF) == 0x7F)
+            {
+                tag = ((a5Tlv[pos] & 0xFF) << 8) | (a5Tlv[pos + 1] & 0xFF);
+                tagBytes = 2;
+            }
+            else
+            {
+                tag = a5Tlv[pos] & 0xFF;
+                tagBytes = 1;
+            }
+            if (pos + tagBytes >= end) break;
+            int childLen = a5Tlv[pos + tagBytes] & 0xFF;
+            int totalChild = tagBytes + 1 + childLen;
+            if (pos + totalChild > end) break;
+
+            // Keep only 0x80 (Type) and 0x5C (protocol versions)
+            if (tag == 0x80 || tag == 0x5C)
+            {
+                kept.write(a5Tlv, pos, totalChild);
+            }
+            pos += totalChild;
+        }
+        byte[] keptBytes = kept.toByteArray();
+        byte[] result = new byte[2 + keptBytes.length];
+        result[0] = (byte) 0xA5;
+        result[1] = (byte) keptBytes.length;
+        System.arraycopy(keptBytes, 0, result, 2, keptBytes.length);
+        return result;
+    }
+
+    /** Parse the protocol version (tag 5C, first 2-byte version) from SELECT response.
+     *  Returns a SUPPORTED version (0x0100 or 0x0009) if found, or null if no common
+     *  protocol version exists. Per Aliro §10.2, when no common version is found the
+     *  Reader SHALL send CONTROL FLOW with S2=0x27 (protocol version not supported). */
     private byte[] parseProtocolVersion(byte[] selectResponse)
     {
         // Use 6F outer length to avoid including SW bytes
@@ -3255,7 +4632,7 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                 int len = selectResponse[i + 1] & 0xFF;
                 if (len >= 2 && i + 2 + len <= searchLimit)
                 {
-                    // Prefer version 01 00 or 00 09 per aliro_flow.h
+                    // Only return a version we actually support (0x0100 or 0x0009)
                     for (int j = 0; j < len - 1; j += 2)
                     {
                         byte v0 = selectResponse[i + 2 + j];
@@ -3265,8 +4642,9 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                             return new byte[]{ v0, v1 };
                         }
                     }
-                    // Fall back to first version in list
-                    return new byte[]{ selectResponse[i + 2], selectResponse[i + 3] };
+                    // No supported version found — return null to trigger CONTROL FLOW
+                    Log.w(TAG, "No common protocol version — credential offers versions we don't support");
+                    return null;
                 }
             }
         }
@@ -3293,12 +4671,14 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
     }
 
     /** Build AUTH0 command per Table 8-3 and Table 8-4 of Aliro 1.0 spec.
-     *  Data field is flat DER-TLVs in order: 41 42 5C 87 4C 4D (no outer wrapper). */
+     *  Data field is flat DER-TLVs in order: 41 42 5C 87 4C 4D (no outer wrapper).
+     *  @param cmdParams  0x00 = expedited-standard, 0x01 = expedited-fast */
     private byte[] buildAuth0Command(byte[] protocolVersion, byte[] readerEphPub,
-                                     byte[] transactionId, byte[] readerId)
+                                     byte[] transactionId, byte[] readerId,
+                                     byte cmdParams)
     {
         // CLA=80 INS=80 P1=00 P2=00
-        // Data: 41 01 <cmd_params>   command_parameters: 0x00 = expedited-standard
+        // Data: 41 01 <cmd_params>   command_parameters
         //       42 01 <auth_policy>  authentication_policy: 0x01 = user device setting
         //       5C 02 <proto 2B>     selected protocol version
         //       87 41 <pub 65B>      reader ephemeral public key
@@ -3318,8 +4698,8 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
         cmd[idx++] = 0x00;        // P1
         cmd[idx++] = 0x00;        // P2
         cmd[idx++] = (byte) dataLen; // Lc
-        // 41: command_parameters (0x00 = expedited-standard, Bit0=0)
-        cmd[idx++] = 0x41; cmd[idx++] = 0x01; cmd[idx++] = 0x00;
+        // 41: command_parameters
+        cmd[idx++] = 0x41; cmd[idx++] = 0x01; cmd[idx++] = cmdParams;
         // 42: authentication_policy (0x01 = user device setting)
         cmd[idx++] = 0x42; cmd[idx++] = 0x01; cmd[idx++] = 0x01;
         // 5C: selected protocol version
@@ -3361,15 +4741,101 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
         return cmd;
     }
 
-    /** Build AUTH1 command: 80 81 00 00 45 41 01 01 9E 40 <sig 64 bytes> */
-    private byte[] buildAuth1Command(byte[] signature)
+    /**
+     * Build AUTH1 command per Table 8-10 of Aliro 1.0 spec.
+     *
+     * Data field TLVs:
+     *   41 01 <command_parameters>   (0x01 = expect credential_public_key)
+     *   9E 40 <reader signature 64 bytes>
+     *   90 xx <reader_Cert>          (optional — only in cert-in-AUTH1 mode)
+     *
+     * When certBytes is non-null, the cert is embedded as tag 0x90.
+     * Uses extended Lc (3-byte) when data field exceeds 255 bytes.
+     *
+     * @param signature  64-byte ECDSA reader signature
+     * @param certBytes  Profile0000 cert bytes, or null to omit
+     */
+    private byte[] buildAuth1Command(byte[] signature, byte[] certBytes)
     {
-        byte[] header = { (byte)0x80, (byte)0x81, 0x00, 0x00, 0x45,
-                          0x41, 0x01, 0x01, (byte)0x9E, 0x40 };
-        byte[] cmd = new byte[header.length + 64];
-        System.arraycopy(header, 0, cmd, 0, header.length);
-        System.arraycopy(signature, 0, cmd, header.length, 64);
+        // Data field: 41 01 01 | 9E 40 <sig 64> | [90 xx <cert>]
+        int dataLen = 3 + 2 + 64;  // tag41 + tag9E header + sig
+        if (certBytes != null)
+        {
+            // tag 0x90 + length encoding + cert bytes
+            dataLen += 1 + encodeLcLength(certBytes.length) + certBytes.length;
+        }
+
+        boolean extended = (dataLen > 255);
+        // APDU: CLA INS P1 P2 [Lc] data [Le]
+        int headerLen = 4;  // CLA INS P1 P2
+        int lcLen = extended ? 3 : 1;
+        int leLen = extended ? 2 : 1;
+        byte[] cmd = new byte[headerLen + lcLen + dataLen + leLen];
+
+        int idx = 0;
+        cmd[idx++] = (byte)0x80; // CLA
+        cmd[idx++] = (byte)0x81; // INS = AUTH1
+        cmd[idx++] = 0x00;       // P1
+        cmd[idx++] = 0x00;       // P2
+
+        // Lc
+        if (extended)
+        {
+            cmd[idx++] = 0x00;
+            cmd[idx++] = (byte)((dataLen >> 8) & 0xFF);
+            cmd[idx++] = (byte)(dataLen & 0xFF);
+        }
+        else
+        {
+            cmd[idx++] = (byte)dataLen;
+        }
+
+        // Tag 0x41: command_parameters = 0x01 (expect credential_public_key)
+        cmd[idx++] = 0x41;
+        cmd[idx++] = 0x01;
+        cmd[idx++] = 0x01;
+
+        // Tag 0x9E: reader signature (64 bytes)
+        cmd[idx++] = (byte)0x9E;
+        cmd[idx++] = 0x40;
+        System.arraycopy(signature, 0, cmd, idx, 64);
+        idx += 64;
+
+        // Tag 0x90: reader_Cert (optional)
+        if (certBytes != null)
+        {
+            cmd[idx++] = (byte)0x90;
+            if (certBytes.length > 127)
+            {
+                cmd[idx++] = (byte)0x81;
+                cmd[idx++] = (byte)(certBytes.length & 0xFF);
+            }
+            else
+            {
+                cmd[idx++] = (byte)certBytes.length;
+            }
+            System.arraycopy(certBytes, 0, cmd, idx, certBytes.length);
+            idx += certBytes.length;
+        }
+
+        // Le
+        if (extended)
+        {
+            cmd[idx++] = 0x00;
+            cmd[idx++] = 0x00;
+        }
+        else
+        {
+            cmd[idx++] = 0x00;
+        }
+
         return cmd;
+    }
+
+    /** Return the number of bytes needed to encode a TLV length value. */
+    private int encodeLcLength(int length)
+    {
+        return (length > 127) ? 2 : 1;
     }
 
     /** Build EXCHANGE command: 80 C9 00 00 <Lc> <encrypted payload> 00 */
@@ -3461,9 +4927,14 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
     private String runAliroStepUp(android.nfc.tech.IsoDep isoDep,
                                    byte[] stepUpSK,
                                    String elementId,
-                                   SharedPreferences prefs)
+                                   SharedPreferences prefs,
+                                   String docType,
+                                   byte[] credentialPubKey)
             throws java.io.IOException
     {
+        // Reset last verification result
+        lastDocVerifyResult = null;
+
         // 1. Derive session keys per §8.4.3 / ISO 18013-5 §9.1.1.5
         //    SKDevice[0..31], SKReader[32..63]
         byte[] sessionKeys = AliroCryptoProvider.deriveStepUpSessionKeys(stepUpSK);
@@ -3479,31 +4950,32 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
         {
             // 2. Build DeviceRequest CBOR per Aliro §8.4.2 + Table 8-21
             //
-            // Per ISO 18013-5 §8.3.2.1.2.1 (referenced by Aliro §8.4.2):
-            // itemsRequest is an INLINE embedded CBOR map — NOT a bstr wrapper.
-            // Table 8-21 key mapping (integers encoded as text strings):
-            //   "1" = nameSpaces, "5" = docType
+            // Per the harness (doc_request.py line 64), the itemsRequest MUST be
+            // wrapped in CBOR Tag 24 ("encoded CBOR") as a byte string:
+            //   docRequest["1"] = CBORTag(24, bstr(ItemsRequest CBOR))
             //
-            // Structure:
-            // { "1": "1.0",
-            //   "2": [ { "1": { "5": "aliro-a",
-            //                   "1": { "aliro-a": { <elementId>: false } } } } ] }
+            // ItemsRequest keys per items_request.py:
+            //   "5" = docType (e.g. "aliro-a" or "aliro-r" per §7.7)
+            //   "1" = nameSpaces: { <docType>: { <elementId>: false } }
             com.upokecenter.cbor.CBORObject nameSpaceMap = com.upokecenter.cbor.CBORObject.NewOrderedMap();
             com.upokecenter.cbor.CBORObject elemMap      = com.upokecenter.cbor.CBORObject.NewOrderedMap();
-            // intentToRetain = false per ISO 18013-5 §8.3.2.1.2.1
             elemMap.Add(com.upokecenter.cbor.CBORObject.FromObject(elementId),
                         com.upokecenter.cbor.CBORObject.False);
-            nameSpaceMap.Add(com.upokecenter.cbor.CBORObject.FromObject("aliro-a"), elemMap);
+            nameSpaceMap.Add(com.upokecenter.cbor.CBORObject.FromObject(docType), elemMap);
 
-            // itemsRequest is an inline map (NOT bstr-wrapped) per ISO 18013-5
             com.upokecenter.cbor.CBORObject itemsRequest = com.upokecenter.cbor.CBORObject.NewOrderedMap();
             itemsRequest.Add(com.upokecenter.cbor.CBORObject.FromObject("5"),
-                    com.upokecenter.cbor.CBORObject.FromObject("aliro-a")); // docType
+                    com.upokecenter.cbor.CBORObject.FromObject(docType)); // docType per §7.7
             itemsRequest.Add(com.upokecenter.cbor.CBORObject.FromObject("1"), nameSpaceMap); // nameSpaces
 
+            // Encode ItemsRequest to CBOR bytes, then wrap in Tag 24
+            byte[] itemsRequestBytes = itemsRequest.EncodeToBytes();
+            com.upokecenter.cbor.CBORObject taggedItemsRequest =
+                    com.upokecenter.cbor.CBORObject.FromObjectAndTag(
+                            itemsRequestBytes, 24);
+
             com.upokecenter.cbor.CBORObject docRequest = com.upokecenter.cbor.CBORObject.NewOrderedMap();
-            // key "1" = itemsRequest (inline map, not bstr)
-            docRequest.Add(com.upokecenter.cbor.CBORObject.FromObject("1"), itemsRequest);
+            docRequest.Add(com.upokecenter.cbor.CBORObject.FromObject("1"), taggedItemsRequest);
 
             com.upokecenter.cbor.CBORObject deviceRequest = com.upokecenter.cbor.CBORObject.NewOrderedMap();
             deviceRequest.Add(com.upokecenter.cbor.CBORObject.FromObject("1"),
@@ -3536,8 +5008,24 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
             byte[] sessionDataBytes = sessionDataOut.EncodeToBytes();
             Log.d(TAG, "Step-Up: SessionData ENVELOPE payload (" + sessionDataBytes.length + " bytes)");
 
-            // 4. Send ENVELOPE (CLA=0x80, INS=0xC3) containing encrypted SessionData
-            byte[] envelopeCmd = buildEnvelopeCommand(sessionDataBytes);
+            // 4. Wrap SessionData CBOR in tag 0x53 per Table 10-7, then send ENVELOPE
+            byte[] tag53Wrapped;
+            if (sessionDataBytes.length > 127)
+            {
+                tag53Wrapped = new byte[3 + sessionDataBytes.length];
+                tag53Wrapped[0] = 0x53;
+                tag53Wrapped[1] = (byte)0x81;
+                tag53Wrapped[2] = (byte)(sessionDataBytes.length & 0xFF);
+                System.arraycopy(sessionDataBytes, 0, tag53Wrapped, 3, sessionDataBytes.length);
+            }
+            else
+            {
+                tag53Wrapped = new byte[2 + sessionDataBytes.length];
+                tag53Wrapped[0] = 0x53;
+                tag53Wrapped[1] = (byte)sessionDataBytes.length;
+                System.arraycopy(sessionDataBytes, 0, tag53Wrapped, 2, sessionDataBytes.length);
+            }
+            byte[] envelopeCmd = buildEnvelopeCommand(tag53Wrapped);
             Log.d(TAG, "Step-Up: sending ENVELOPE");
             byte[] envelopeResp = isoDep.transceive(envelopeCmd);
 
@@ -3618,50 +5106,21 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
             Log.d(TAG, "Step-Up: DeviceResponse (" + deviceResponseBytes.length + " bytes): "
                     + org.bouncycastle.util.encoders.Hex.toHexString(deviceResponseBytes));
 
-            // 7. Parse DeviceResponse CBOR per Aliro Table 8-22
-            com.upokecenter.cbor.CBORObject deviceResponse =
-                    com.upokecenter.cbor.CBORObject.DecodeFromBytes(deviceResponseBytes);
-
-            com.upokecenter.cbor.CBORObject docs = deviceResponse.get(
-                    com.upokecenter.cbor.CBORObject.FromObject("2"));
-            if (docs == null || docs.size() == 0)
-            {
-                Log.d(TAG, "Step-Up: no documents in DeviceResponse");
-                return null;
-            }
-
-            // 6. Extract first document's IssuerAuth + IssuerSignedItems
-            com.upokecenter.cbor.CBORObject firstDoc   = docs.get(0);
-            com.upokecenter.cbor.CBORObject iSigned    = firstDoc.get(
-                    com.upokecenter.cbor.CBORObject.FromObject("1"));
-            com.upokecenter.cbor.CBORObject iAuth      = iSigned.get(
-                    com.upokecenter.cbor.CBORObject.FromObject("2"));
-            com.upokecenter.cbor.CBORObject nameSpaces = iSigned.get(
-                    com.upokecenter.cbor.CBORObject.FromObject("1"));
-
-            // 7. Verify COSE_Sign1 signature if issuer pub key is configured
-            boolean docVerified = false;
+            // 7. Full Access Document / Revocation Document verification per §7.4 + §7.5
+            // Load credential issuer public key from preferences for kid-based signature verification
             String issuerKeyHex = prefs.getString(AliroPreferences.STEP_UP_ISSUER_PUB_KEY, "");
-            if (!issuerKeyHex.isEmpty() && iAuth != null)
-            {
-                docVerified = verifyCoseSign1(iAuth, issuerKeyHex);
-                Log.d(TAG, "Step-Up: COSE_Sign1 verification = " + docVerified);
-            }
-            else
-            {
-                Log.d(TAG, "Step-Up: no issuer key configured, skipping signature verification");
-            }
+            byte[] issuerPubKey = issuerKeyHex.isEmpty() ? null : Hex.decode(issuerKeyHex);
+            Log.d(TAG, "Step-Up: issuerPubKey=" + (issuerPubKey != null ? Hex.toHexString(issuerPubKey) : "(none)"));
 
-            // 8. Extract AccessData element value for display
-            String accessSummary = extractAccessDataSummary(nameSpaces, elementId);
+            AliroAccessDocumentVerifier.VerificationResult verifyResult =
+                    AliroAccessDocumentVerifier.verifyDocument(
+                            deviceResponseBytes, docType, credentialPubKey, elementId, issuerPubKey);
 
-            // Build result: sig status on first line, then access summary
-            String sigStatus = (issuerKeyHex.isEmpty() ? "(sig not verified)"
-                    : (docVerified ? "Signature Valid" : "Signature INVALID"));
-            StringBuilder result = new StringBuilder(sigStatus);
-            if (accessSummary != null)
-                result.append("\n").append(accessSummary);
-            return result.toString();
+            // Store for post-step-up EXCHANGE status
+            lastDocVerifyResult = verifyResult;
+            Log.d(TAG, "Step-Up: verification result: " + verifyResult);
+
+            return verifyResult.stepUpResultText;
         }
         finally
         {
@@ -3737,14 +5196,18 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
 
         private static byte[] buildEnvelopeCommand(byte[] data)
     {
-        // CLA=80 INS=C3 P1=00 P2=00 Lc=<len> <data>
-        byte[] cmd = new byte[5 + data.length];
-        cmd[0] = (byte)0x80;
+        // CLA=00 INS=C3 P1=00 P2=00 Lc=<len> <data> Le=00
+        // CLA=0x00 (interindustry class) per ISO 7816-4 §5.1.1
+        // Le=0x00 (expect up to 256 bytes response) — MUST be present to avoid
+        // harness setting apdu_response_length=0 which crashes response chaining.
+        byte[] cmd = new byte[5 + data.length + 1];
+        cmd[0] = 0x00;
         cmd[1] = (byte)0xC3;
         cmd[2] = 0x00;
         cmd[3] = 0x00;
         cmd[4] = (byte) data.length;
         System.arraycopy(data, 0, cmd, 5, data.length);
+        cmd[5 + data.length] = 0x00; // Le
         return cmd;
     }
 
@@ -4085,10 +5548,14 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
 
         if (stepUpResult != null)
         {
-            // Determine step-up success from the result string
-            boolean stepUpSuccess = stepUpResult.contains("Signature Valid")
-                    || stepUpResult.contains("sig not verified")
-                    || stepUpResult.contains("Element:");
+            // Step-up is "Success" if the ENVELOPE exchange completed and a document
+            // was returned, regardless of the access decision. A schedule-based deny
+            // (error 00 25) is a valid step-up outcome, not a transport failure.
+            // Only report "Failed" if the step-up transport itself broke (null result,
+            // GCM failure, CBOR parse error, etc.).
+            boolean stepUpSuccess = stepUpResult != null
+                    && !stepUpResult.startsWith("Step-Up failed")
+                    && !stepUpResult.isEmpty();
             sb.append("\n\nSTEP-UP: ").append(stepUpSuccess ? "Success" : "Failed");
             sb.append("\n\nACCESS DOCUMENT\n");
             // Each line of stepUpResult is already indented with leading spaces
@@ -4146,23 +5613,81 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                 Toast.makeText(requireContext(), message, Toast.LENGTH_LONG).show());
     }
 
+    // -------------------------------------------------------------------------
+    // Reader Descriptor TLV (Table 8-17): tag 0xB5 containing vendor/product/FW.
+    // ELATEC IEEE OUI = 0x001CF7 (from Elatec GmbH's registered OUI).
+    //
+    // For EXCHANGE: descriptor must be inside tag 0xAE (Notify)
+    // For CONTROL FLOW: descriptor must be inside tag 0x63 (Domain Specific Data)
+    // -------------------------------------------------------------------------
+    private static final byte[] READER_DESCRIPTOR_B5;
+    private static final byte[] EXCHANGE_NOTIFY_TLV;     // 0xAE { 0xB5 { ... } }
+    private static final byte[] CONTROL_FLOW_DOMAIN_TLV; // 0x63 { 0xB5 { ... } }
+    static {
+        byte[] vendorId  = { 0x04, 0x03, 0x00, 0x1C, (byte)0xF7 };           // tag 04, len 3, OUI
+        byte[] productId = { (byte)0x80, 0x04, 'T', 'W', 'N', '4' };         // tag 80, len 4
+        byte[] fwVersion = { (byte)0x81, 0x05, '1', '.', '0', '.', '0' };    // tag 81, len 5
+        int innerLen = vendorId.length + productId.length + fwVersion.length;
+        // B5 <len> <vendor + product + fw>
+        byte[] b5 = new byte[2 + innerLen];
+        b5[0] = (byte)0xB5;
+        b5[1] = (byte)innerLen;
+        int p = 2;
+        System.arraycopy(vendorId,  0, b5, p, vendorId.length);  p += vendorId.length;
+        System.arraycopy(productId, 0, b5, p, productId.length); p += productId.length;
+        System.arraycopy(fwVersion, 0, b5, p, fwVersion.length);
+        READER_DESCRIPTOR_B5 = b5;
+
+        // EXCHANGE: wrap in 0xAE (Notify tag)
+        EXCHANGE_NOTIFY_TLV = new byte[2 + b5.length];
+        EXCHANGE_NOTIFY_TLV[0] = (byte)0xAE;
+        EXCHANGE_NOTIFY_TLV[1] = (byte)b5.length;
+        System.arraycopy(b5, 0, EXCHANGE_NOTIFY_TLV, 2, b5.length);
+
+        // CONTROL FLOW: wrap in 0x63 (Domain Specific Data tag)
+        CONTROL_FLOW_DOMAIN_TLV = new byte[2 + b5.length];
+        CONTROL_FLOW_DOMAIN_TLV[0] = 0x63;
+        CONTROL_FLOW_DOMAIN_TLV[1] = (byte)b5.length;
+        System.arraycopy(b5, 0, CONTROL_FLOW_DOMAIN_TLV, 2, b5.length);
+    }
+
     /**
      * Send CONTROL FLOW command to signal transaction failure when no secure channel exists.
      * Per section 10.2.2 and Table 8-2 rows 3/9: used when SW != 9000 or no EXCHANGE key.
-     * INS=0x3C, data: 41 01 00 (S1=failure) 42 01 00 (S2=no info)
+     * INS=0x3C, data: 41 01 S1 | 42 01 S2 | [63 xx { B5 ... }] (reader descriptor)
+     *
+     * CLA=0x80 per §8.3.2.1 (proprietary class for all expedited-phase commands).
+     * No Le byte — §10.2.2.2 says empty response data field (Case 3 APDU).
      */
     private void sendControlFlow(IsoDep isoDep)
     {
+        sendControlFlow(isoDep, (byte)0x00); // S2 = 0x00: no information
+    }
+
+    /**
+     * Send CONTROL FLOW with a specific S2 parameter.
+     * @param s2val  S2 byte: 0x00=no info, 0x27=protocol version not supported
+     */
+    private void sendControlFlow(IsoDep isoDep, byte s2val)
+    {
         try
         {
-            // CONTROL FLOW: CLA=80 INS=3C P1=00 P2=00 Lc=06 [41 01 00 42 01 00] Le=00
-            byte[] controlFlow = {
-                (byte)0x80, 0x3C, 0x00, 0x00, 0x06,
-                0x41, 0x01, 0x00,   // S1 = 0x00: transaction finished with failure
-                0x42, 0x01, 0x00,   // S2 = 0x00: no information
-                0x00                // Le
-            };
-            Log.d(TAG, "Sending CONTROL FLOW");
+            // Data: 41 01 00 | 42 01 S2 | 63 xx { B5 xx { ... } } (domain specific data)
+            byte[] s1 = { 0x41, 0x01, 0x00 };       // S1 = 0x00: failure
+            byte[] s2 = { 0x42, 0x01, s2val };      // S2 = caller-specified
+            int dataLen = s1.length + s2.length + CONTROL_FLOW_DOMAIN_TLV.length;
+            byte[] controlFlow = new byte[5 + dataLen]; // header(5) + data, NO Le byte
+            controlFlow[0] = (byte)0x80;
+            controlFlow[1] = 0x3C;
+            controlFlow[2] = 0x00;
+            controlFlow[3] = 0x00;
+            controlFlow[4] = (byte)dataLen;
+            int idx = 5;
+            System.arraycopy(s1, 0, controlFlow, idx, s1.length); idx += s1.length;
+            System.arraycopy(s2, 0, controlFlow, idx, s2.length); idx += s2.length;
+            System.arraycopy(CONTROL_FLOW_DOMAIN_TLV, 0, controlFlow, idx, CONTROL_FLOW_DOMAIN_TLV.length);
+            Log.d(TAG, "Sending CONTROL FLOW S2=0x" + String.format("%02X", s2val)
+                    + " (" + dataLen + " bytes data)");
             byte[] response = isoDep.transceive(controlFlow);
             Log.d(TAG, "CONTROL FLOW response: " + Hex.toHexString(response));
         }

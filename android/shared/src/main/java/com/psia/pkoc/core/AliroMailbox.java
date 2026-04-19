@@ -24,21 +24,21 @@ import java.nio.charset.StandardCharsets;
  *
  * Two vendor data entries:
  *
- *   Entry 0 — Reader Configuration (Type = 0x01), 43 bytes at offset 0:
- *     5 bytes  ASCII firmware version "2.1.0"
- *    14 bytes  ASCII reader serial   "ELA-TWN4-00042"
- *    22 bytes  ASCII access zone     "Building A, Main Lobby" (22 bytes ASCII)
- *     2 bytes  door ID (big-endian uint16) = 0x00 0x2A (door #42)
+ *   Entry 0 — Reader Configuration (Type = 0x01), 46 bytes at offset 0:
+ *     5 bytes  ASCII firmware version "3.2.1"
+ *    14 bytes  ASCII reader serial   "ELA-SEC-PC-001"
+ *    25 bytes  ASCII access zone     "ELATEC HQ - Main Entrance"
+ *     2 bytes  door ID (big-endian uint16) = 0x00 0x01 (door #1)
  *
- *   Entry 1 — Door Status (Type = 0x02), 9 bytes at offset 43:
+ *   Entry 1 — Door Status (Type = 0x02), 9 bytes at offset 46:
  *     1 byte   lock state: 0x01 = locked
- *     1 byte   battery %:  0x5F = 95 %
- *     1 byte   temperature °C: 0x16 = 22 °C
+ *     1 byte   battery %:  0x62 = 98 %
+ *     1 byte   temperature °C: 0x18 = 24 °C / 75 °F
  *     4 bytes  last-event unix timestamp (big-endian uint32) = 0x6818A480 = 2025-05-05 08:00:00 UTC
- *     2 bytes  total transactions today (big-endian uint16)  = 0x00 0xA3 = 163
+ *     2 bytes  total transactions today (big-endian uint16)  = 0x04 0xDF = 1,247
  *
- * Total data payload: 52 bytes.
- * Total mailbox size returned: 256 bytes (padded with 0x00).
+ * Total data payload: 55 bytes.
+ * Total mailbox size returned: 300 bytes (padded with 0x00).
  */
 public class AliroMailbox
 {
@@ -84,16 +84,16 @@ public class AliroMailbox
     {
         byte[] mailbox = new byte[MAILBOX_SIZE]; // pre-zeroed
 
-        // ---- Entry 0: Reader Configuration (43 bytes) ----
-        // Firmware version:  "2.1.0"           — 5 bytes ASCII
-        // Reader serial:     "ELA-TWN4-00042"  — 14 bytes ASCII
-        // Access zone:       "Building A, Main Lobby" — 22 bytes ASCII
-        // Door ID:           0x00 0x2A (door #42) — 2 bytes
-        byte[] fwVersion   = "2.1.0".getBytes(StandardCharsets.US_ASCII);          //  5 bytes
-        byte[] serial      = "ELA-TWN4-00042".getBytes(StandardCharsets.US_ASCII); // 14 bytes
-        byte[] zoneName    = "Building A, Main Lobby".getBytes(StandardCharsets.US_ASCII);  // 22 bytes (22 chars)
-        byte[] doorId      = { 0x00, 0x2A };                                       //  2 bytes
-        // Total: 5 + 14 + 22 + 2 = 43 bytes
+        // ---- Entry 0: Reader Configuration (46 bytes) ----
+        // Firmware version:  "3.2.1"              — 5 bytes ASCII
+        // Reader serial:     "ELA-SEC-PC-001"     — 14 bytes ASCII
+        // Access zone:       "ELATEC HQ - Main Entrance" — 25 bytes ASCII
+        // Door ID:           0x00 0x01 (door #1)  — 2 bytes
+        byte[] fwVersion   = "3.2.1".getBytes(StandardCharsets.US_ASCII);               //  5 bytes
+        byte[] serial      = "ELA-SEC-PC-001".getBytes(StandardCharsets.US_ASCII);      // 14 bytes
+        byte[] zoneName    = "ELATEC HQ - Main Entrance".getBytes(StandardCharsets.US_ASCII); // 25 bytes
+        byte[] doorId      = { 0x00, 0x01 };                                            //  2 bytes
+        // Total: 5 + 14 + 25 + 2 = 46 bytes
 
         // Assemble entry 0 payload
         byte[] entry0 = new byte[fwVersion.length + serial.length + zoneName.length + doorId.length];
@@ -102,20 +102,20 @@ public class AliroMailbox
         System.arraycopy(serial,     0, entry0, pos, serial.length);     pos += serial.length;
         System.arraycopy(zoneName,   0, entry0, pos, zoneName.length);   pos += zoneName.length;
         System.arraycopy(doorId,     0, entry0, pos, doorId.length);
-        // entry0.length == 43
+        // entry0.length == 46
 
         // ---- Entry 1: Door Status (9 bytes) ----
         // lock state:  0x01 (locked)
-        // battery:     0x5F (95 %)
-        // temperature: 0x16 (22 °C)
+        // battery:     0x62 (98 %)
+        // temperature: 0x18 (24 °C / 75 °F) — Palm City FL ambient
         // last event:  0x6818A480 = 2025-05-05 08:00:00 UTC (big-endian uint32)
-        // txn count:   0x00A3 = 163 (big-endian uint16)
+        // txn count:   0x04DF = 1,247 (big-endian uint16)
         long  lastEventTs   = 0x6818A480L; // 2025-05-05 08:00:00 UTC
-        int   txnCount      = 0x00A3;      // 163
+        int   txnCount      = 0x04DF;      // 1,247
         byte[] entry1 = {
             0x01,                                     // lock state: locked
-            0x5F,                                     // battery: 95%
-            0x16,                                     // temperature: 22°C
+            0x62,                                     // battery: 98%
+            0x18,                                     // temperature: 24°C / 75°F
             (byte)((lastEventTs >> 24) & 0xFF),       // timestamp MSB
             (byte)((lastEventTs >> 16) & 0xFF),
             (byte)((lastEventTs >>  8) & 0xFF),
@@ -127,7 +127,7 @@ public class AliroMailbox
 
         // ---- Offsets within the data section ----
         int offset0 = 0;                   // entry 0 starts at byte 0 of data section
-        int offset1 = entry0.length;       // entry 1 starts after entry 0 (offset = 43)
+        int offset1 = entry0.length;       // entry 1 starts after entry 0 (offset = 46)
 
         // ---- Index: 2 entries × 6 bytes each = 12 bytes ----
         // Each index entry: OUI[3] | Type[1] | Offset[2 big-endian]
@@ -148,15 +148,15 @@ public class AliroMailbox
         indexData[11] = (byte)( offset1        & 0xFF);
 
         // ---- Data section: entry0 || entry1 ----
-        int dataLen = entry0.length + entry1.length; // 43 + 9 = 52
+        int dataLen = entry0.length + entry1.length; // 46 + 9 = 55
 
         // ---- TLV framing ----
-        // 0x82 tag + 1 byte len + dataLen bytes of data  = 2 + 52 = 54
+        // 0x82 tag + 1 byte len + dataLen bytes of data  = 2 + 55 = 57
         // 0x81 tag + 1 byte len + 12 bytes of index      = 2 + 12 = 14
-        // inner content = 14 + 54 = 68
-        // 0x60 tag + 1 byte len + 68                     = 2 + 68 = 70 bytes total used
+        // inner content = 14 + 57 = 71
+        // 0x60 tag + 1 byte len + 71                     = 2 + 71 = 73 bytes total used
         int innerLen = (2 + indexData.length) + (2 + dataLen);
-        // innerLen = 68
+        // innerLen = 71
 
         if (innerLen + 2 > MAILBOX_SIZE)
         {
@@ -292,13 +292,13 @@ public class AliroMailbox
             {
                 case TYPE_READER_CONFIG:
                 {
-                    // 5 bytes firmware, 14 bytes serial, 22 bytes zone, 2 bytes door ID
+                    // 5 bytes firmware, 14 bytes serial, 25 bytes zone, 2 bytes door ID
                     sb.append("  Reader Config (OUI: ").append(ouiStr).append(")\n");
-                    if (remaining < 43) { sb.append("    [truncated]\n"); break; }
+                    if (remaining < 46) { sb.append("    [truncated]\n"); break; }
                     String fw   = new String(buf, start,      5,  StandardCharsets.US_ASCII).trim();
                     String ser  = new String(buf, start + 5,  14, StandardCharsets.US_ASCII).trim();
-                    String zone = new String(buf, start + 19, 22, StandardCharsets.US_ASCII).trim();
-                    int doorId  = ((buf[start + 41] & 0xFF) << 8) | (buf[start + 42] & 0xFF);
+                    String zone = new String(buf, start + 19, 25, StandardCharsets.US_ASCII).trim();
+                    int doorId  = ((buf[start + 44] & 0xFF) << 8) | (buf[start + 45] & 0xFF);
                     sb.append("    Firmware:     ").append(fw).append("\n");
                     sb.append("    Serial:       ").append(ser).append("\n");
                     sb.append("    Zone:         ").append(zone).append("\n");
@@ -323,7 +323,8 @@ public class AliroMailbox
                                   : String.format("0x%02X", lockState);
                     sb.append("    Lock:         ").append(lockStr).append("\n");
                     sb.append(String.format("    Battery:      %d%%\n", battery));
-                    sb.append(String.format("    Temperature:  %d\u00b0C\n", tempC));
+                    int tempF = (int) Math.round(tempC * 9.0 / 5.0 + 32);
+                    sb.append(String.format("    Temperature:  %d\u00b0C / %d\u00b0F\n", tempC, tempF));
                     sb.append(String.format("    Transactions: %d\n", txnCount));
                     break;
                 }

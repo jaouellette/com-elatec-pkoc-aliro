@@ -4,18 +4,8 @@ import android.content.Context;
 import android.content.SharedPreferences;
 import android.util.Log;
 
-import org.bouncycastle.asn1.ASN1EncodableVector;
-import org.bouncycastle.asn1.ASN1Integer;
-import org.bouncycastle.asn1.ASN1ObjectIdentifier;
-import org.bouncycastle.asn1.DERBitString;
-import org.bouncycastle.asn1.DEROctetString;
-import org.bouncycastle.asn1.DERSequence;
-import org.bouncycastle.asn1.DERTaggedObject;
-import org.bouncycastle.asn1.DERUTF8String;
-import org.bouncycastle.asn1.DERUTCTime;
-import org.bouncycastle.asn1.x500.X500Name;
-import org.bouncycastle.asn1.x509.AlgorithmIdentifier;
-import org.bouncycastle.asn1.x509.SubjectPublicKeyInfo;
+import org.bouncycastle.asn1.ASN1Sequence;
+import org.bouncycastle.asn1.ASN1TaggedObject;
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
 import org.bouncycastle.util.encoders.Hex;
 
@@ -32,7 +22,6 @@ import java.security.Security;
 import java.security.Signature;
 import java.security.interfaces.ECPublicKey;
 import java.security.spec.ECGenParameterSpec;
-import java.security.spec.PKCS8EncodedKeySpec;
 import java.text.SimpleDateFormat;
 import java.util.Arrays;
 import java.util.Calendar;
@@ -50,6 +39,24 @@ import org.json.JSONObject;
  * Provisioning generates a complete Issuer CA + reader keypair/certificate
  * and stores everything needed for strict-mode reader validation and
  * for export to a physical reader device via JSON / QR code.
+ *
+ * Profile0000 compressed certificate encoding follows Aliro 1.0 spec §13.3
+ * (26-42802-001 pages 166-168) ASN.1 schema with IMPLICIT TAGS:
+ *
+ *   Profile0000 ::= SEQUENCE {
+ *       profile    OCTET STRING (SIZE (2)),     -- raw 0x04 tag, value 0x0000
+ *       data       Profile0000Data              -- inner SEQUENCE
+ *   }
+ *
+ *   Profile0000Data ::= SEQUENCE {
+ *       serialNumber  [0] OCTET STRING (SIZE (1..20)) OPTIONAL,
+ *       issuer        [1] OCTET STRING (SIZE (1..32)) OPTIONAL,
+ *       notBefore     [2] OCTET STRING (SIZE (13..15)) OPTIONAL,
+ *       notAfter      [3] OCTET STRING (SIZE (13..15)) OPTIONAL,
+ *       subject       [4] OCTET STRING (SIZE (1..32)) OPTIONAL,
+ *       publicKey     [5] OCTET STRING,
+ *       signature     [6] OCTET STRING
+ *   }
  *
  * All preferences are stored in the "AliroProvisioning" SharedPreferences file.
  */
@@ -113,27 +120,28 @@ public class AliroProvisioningManager
         try
         {
             // ------------------------------------------------------------------
-            // 1. Generate Issuer CA keypair (P-256)
-            // ------------------------------------------------------------------
-            KeyPair issuerCAKeyPair = generateP256KeyPair();
-            byte[] issuerCAPubUncompressed = getUncompressedPublicKey(issuerCAKeyPair);
-            byte[] issuerCAPrivRaw         = getPrivateKeyRaw(issuerCAKeyPair);
-
-            Log.d(TAG, "Issuer CA pub: " + Hex.toHexString(issuerCAPubUncompressed));
-
-            // ------------------------------------------------------------------
-            // 2. Generate reader keypair (P-256)
+            // 1. Generate a single P-256 keypair for the reader.
+            //
+            // Per Aliro §6.2, the reader_group_identifier_key SHALL be exactly
+            // one of: (a) Reader System Issuer CA public key, or (b) the
+            // reader's own public key. Using the same key for both (self-signed
+            // cert) satisfies both options and allows a single harness config
+            // to work across no-cert and cert test flows.
             // ------------------------------------------------------------------
             KeyPair readerKeyPair   = generateP256KeyPair();
             byte[] readerPubUncomp  = getUncompressedPublicKey(readerKeyPair);
             byte[] readerPrivRaw    = getPrivateKeyRaw(readerKeyPair);
 
+            Log.d(TAG, "Reader pub (= issuer CA pub): " + Hex.toHexString(readerPubUncomp));
+
             // ------------------------------------------------------------------
-            // 3. Build reader_group_identifier: first 16 bytes of SHA-256(issuerCA_pub_uncompressed)
+            // 2. Build reader_group_identifier: first 16 bytes of SHA-256(reader_pub)
+            //    Since reader key = issuer CA key, this is the same regardless
+            //    of whether cert or no-cert mode is used.
             // ------------------------------------------------------------------
             MessageDigest sha256 = MessageDigest.getInstance("SHA-256");
-            byte[] issuerPubHash   = sha256.digest(issuerCAPubUncompressed);
-            byte[] readerGroupId   = Arrays.copyOfRange(issuerPubHash, 0, 16);
+            byte[] readerPubHash   = sha256.digest(readerPubUncomp);
+            byte[] readerGroupId   = Arrays.copyOfRange(readerPubHash, 0, 16);
 
             // ------------------------------------------------------------------
             // 4. reader_group_sub_identifier: 16 random bytes
@@ -154,10 +162,12 @@ public class AliroProvisioningManager
             byte[] serialNumber = new byte[4];
             new SecureRandom().nextBytes(serialNumber);
 
-            // authorityKeyId = SHA-1 of issuer CA public key (uncompressed)
-            byte[] authorityKeyId = computeAuthorityKeyId(issuerCAPubUncompressed);
+            // authorityKeyId = SHA-1 of the signing key's public key.
+            // Since self-signed, this is SHA-1 of the reader's own public key.
+            // Per §13.3 and RFC 5280 §4.2.1.1.
+            byte[] authorityKeyId = computeAuthorityKeyId(readerPubUncomp);
 
-            // Dates
+            // Dates — UTCTime format: YYMMDDHHMMSSZ
             SimpleDateFormat utcFmt = new SimpleDateFormat("yyMMddHHmmss'Z'", Locale.US);
             utcFmt.setTimeZone(TimeZone.getTimeZone("UTC"));
             Date now   = new Date();
@@ -172,18 +182,19 @@ public class AliroProvisioningManager
             byte[] subject = "ELATEC-Reader".getBytes("UTF-8");
 
             // publicKey field in profile0000: 0x00 || 0x04 || X(32) || Y(32) = 66 bytes
+            // First byte 0x00 = unused bits count for BIT STRING encoding
             byte[] pubKeyField = new byte[66];
             pubKeyField[0] = 0x00;  // unused bits byte
             pubKeyField[1] = 0x04;  // uncompressed marker
             System.arraycopy(readerPubUncomp, 1, pubKeyField, 2, 64); // skip 0x04 prefix
 
             // ------------------------------------------------------------------
-            // Build reference TBS certificate for signing
+            // Build reference TBS certificate for signing.
+            // Per §13.3, the TBS MUST match the reference X.509 template on
+            // page 168 — including all three extensions (AKI, BasicConstraints,
+            // KeyUsage). The issuer CN in the TBS uses DEFAULT_ISSUER ("issuer")
+            // because we omit the issuer field from the compressed cert.
             // ------------------------------------------------------------------
-            // Use the default issuer name ("issuer") because the profile0000
-            // compressed format does not store the issuer field — the verifier
-            // will reconstruct the TBS with DEFAULT_ISSUER, so we must sign
-            // with the same value to get a matching hash.
             byte[] tbsDer = buildReferenceTBS(
                     serialNumber,
                     DEFAULT_ISSUER,
@@ -194,10 +205,9 @@ public class AliroProvisioningManager
                     authorityKeyId);
 
             // ------------------------------------------------------------------
-            // Sign TBS with issuer CA private key using ECDSA-SHA256
+            // Sign TBS with reader's own private key (self-signed cert)
             // ------------------------------------------------------------------
-            byte[] tbsHash = sha256.digest(tbsDer);
-            byte[] sigDer  = signEcdsaSha256(issuerCAKeyPair.getPrivate(), tbsDer);
+            byte[] sigDer  = signEcdsaSha256(readerKeyPair.getPrivate(), tbsDer);
 
             // signature field: 0x00 (unused bits) || DER ECDSA-Sig-Value
             byte[] signatureField = new byte[1 + sigDer.length];
@@ -205,10 +215,11 @@ public class AliroProvisioningManager
             System.arraycopy(sigDer, 0, signatureField, 1, sigDer.length);
 
             // ------------------------------------------------------------------
-            // Build profile0000 certificate
+            // Build profile0000 compressed certificate (§13.3 ASN.1 schema)
             // ------------------------------------------------------------------
             byte[] readerCertBytes = buildProfile0000(
                     serialNumber,
+                    null,           // issuer: null = omit (use default "issuer")
                     notBefore,
                     notAfter,
                     subject,
@@ -224,8 +235,9 @@ public class AliroProvisioningManager
                     .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
                     .edit();
 
-            editor.putString(KEY_ISSUER_CA_PRIV,  Hex.toHexString(issuerCAPrivRaw));
-            editor.putString(KEY_ISSUER_CA_PUB,   Hex.toHexString(issuerCAPubUncompressed));
+            // Self-signed: issuer CA key = reader key
+            editor.putString(KEY_ISSUER_CA_PRIV,  Hex.toHexString(readerPrivRaw));
+            editor.putString(KEY_ISSUER_CA_PUB,   Hex.toHexString(readerPubUncomp));
             editor.putString(KEY_READER_PRIV,     Hex.toHexString(readerPrivRaw));
             editor.putString(KEY_READER_ID,       Hex.toHexString(readerId));
             editor.putString(KEY_READER_CERT,     Hex.toHexString(readerCertBytes));
@@ -490,18 +502,23 @@ public class AliroProvisioningManager
     /**
      * Verify a profile0000 compressed certificate against a known Issuer CA public key.
      *
-     * The profile0000 structure (§13.3) contains:
-     *   SEQUENCE {
-     *     profileId       [0] OCTET STRING (2 bytes: 00 00)
-     *     serialNumber    [1] OCTET STRING
-     *     notBefore       [2] UTCTime
-     *     notAfter        [3] UTCTime
-     *     subject         [4] UTF8String bytes
-     *     publicKey       [5] BIT STRING (66 bytes: 00 04 X Y)
-     *     signature       [6] BIT STRING (00 || DER ECDSA)
+     * Per Aliro §13.3, the Profile0000 structure is:
+     *
+     *   SEQUENCE {                         -- Profile0000 (outer)
+     *     OCTET STRING (2 bytes: 0x0000)   -- profile identifier
+     *     SEQUENCE {                       -- Profile0000Data (inner)
+     *       [0] serialNumber  OPTIONAL
+     *       [1] issuer        OPTIONAL
+     *       [2] notBefore     OPTIONAL
+     *       [3] notAfter      OPTIONAL
+     *       [4] subject       OPTIONAL
+     *       [5] publicKey     (mandatory)
+     *       [6] signature     (mandatory)
+     *     }
      *   }
      *
-     * We reconstruct the TBS from fields [0]..[5] and verify the signature in field [6].
+     * We extract fields from the inner SEQUENCE, reconstruct the reference TBS
+     * using the spec template (§13.3 page 168), and verify the ECDSA-SHA256 signature.
      *
      * @param certBytes    raw profile0000 DER bytes
      * @param issuerPubKey 65-byte uncompressed issuer CA public key
@@ -511,18 +528,43 @@ public class AliroProvisioningManager
     {
         try
         {
-            // Parse the profile0000 SEQUENCE
+            // Parse the outer SEQUENCE
             org.bouncycastle.asn1.ASN1InputStream asn1in =
                     new org.bouncycastle.asn1.ASN1InputStream(certBytes);
-            org.bouncycastle.asn1.ASN1Sequence outerSeq =
-                    (org.bouncycastle.asn1.ASN1Sequence) asn1in.readObject();
+            ASN1Sequence outerSeq = (ASN1Sequence) asn1in.readObject();
             asn1in.close();
 
-            // The profile0000 is built as a flat SEQUENCE with IMPLICIT TAGGED
-            // elements [0]..[6].  Walk all elements and extract by tag number.
-            // BouncyCastle may parse implicit tags as ASN1TaggedObject (base class)
-            // rather than DERTaggedObject, so check the base class.
+            if (outerSeq.size() < 2)
+            {
+                Log.w(TAG, "verifyProfile0000Cert: outer SEQUENCE has fewer than 2 elements");
+                return false;
+            }
 
+            // Element 0: profile OCTET STRING — must be 0x0000
+            byte[] profileId;
+            try {
+                profileId = org.bouncycastle.asn1.ASN1OctetString.getInstance(
+                        outerSeq.getObjectAt(0)).getOctets();
+            } catch (Exception e) {
+                Log.w(TAG, "verifyProfile0000Cert: first element is not OCTET STRING: " + e);
+                return false;
+            }
+            if (profileId.length != 2 || profileId[0] != 0x00 || profileId[1] != 0x00)
+            {
+                Log.w(TAG, "verifyProfile0000Cert: invalid profile ID: " + Hex.toHexString(profileId));
+                return false;
+            }
+
+            // Element 1: Profile0000Data SEQUENCE
+            ASN1Sequence dataSeq;
+            try {
+                dataSeq = ASN1Sequence.getInstance(outerSeq.getObjectAt(1));
+            } catch (Exception e) {
+                Log.w(TAG, "verifyProfile0000Cert: second element is not SEQUENCE: " + e);
+                return false;
+            }
+
+            // Extract fields from the inner SEQUENCE using implicit context tags [0]..[6]
             byte[] serialNumber = DEFAULT_SERIAL;
             byte[] issuer       = DEFAULT_ISSUER;
             byte[] notBefore    = DEFAULT_NOT_BEFORE;
@@ -531,15 +573,13 @@ public class AliroProvisioningManager
             byte[] publicKey    = null;
             byte[] sigField     = null;
 
-            Log.d(TAG, "verifyProfile0000Cert: parsing " + outerSeq.size() + " elements");
-            for (int idx = 0; idx < outerSeq.size(); idx++)
+            Log.d(TAG, "verifyProfile0000Cert: parsing " + dataSeq.size() + " data elements");
+            for (int idx = 0; idx < dataSeq.size(); idx++)
             {
-                org.bouncycastle.asn1.ASN1Encodable el = outerSeq.getObjectAt(idx);
-                // Check for tagged object (implicit tags)
-                if (el instanceof org.bouncycastle.asn1.ASN1TaggedObject)
+                org.bouncycastle.asn1.ASN1Encodable el = dataSeq.getObjectAt(idx);
+                if (el instanceof ASN1TaggedObject)
                 {
-                    org.bouncycastle.asn1.ASN1TaggedObject tagged =
-                            (org.bouncycastle.asn1.ASN1TaggedObject) el;
+                    ASN1TaggedObject tagged = (ASN1TaggedObject) el;
                     int tagNo = tagged.getTagNo();
                     byte[] octets;
                     try {
@@ -552,8 +592,8 @@ public class AliroProvisioningManager
                     Log.d(TAG, "  tag[" + tagNo + "] = " + octets.length + " bytes");
                     switch (tagNo)
                     {
-                        case 0: /* profileId — skip */ break;
-                        case 1: serialNumber = octets; break;
+                        case 0: serialNumber = octets; break;
+                        case 1: issuer       = octets; break;
                         case 2: notBefore    = octets; break;
                         case 3: notAfter     = octets; break;
                         case 4: subject      = octets; break;
@@ -566,7 +606,7 @@ public class AliroProvisioningManager
             if (publicKey == null || sigField == null)
             {
                 Log.w(TAG, "verifyProfile0000Cert: missing publicKey (" + (publicKey != null)
-                        + ") or signature (" + (sigField != null) + "), elements=" + outerSeq.size());
+                        + ") or signature (" + (sigField != null) + "), elements=" + dataSeq.size());
                 return false;
             }
 
@@ -607,150 +647,353 @@ public class AliroProvisioningManager
     // =========================================================================
 
     /**
-     * Build the Aliro profile0000 compressed certificate (§13.3).
+     * Build the Aliro profile0000 compressed certificate per §13.3 ASN.1 schema.
      *
-     * ASN.1 schema:
-     *   Profile0000Certificate ::= SEQUENCE {
-     *     profileId             [0] IMPLICIT OCTET STRING,   -- 00 00
-     *     serialNumber          [1] IMPLICIT OCTET STRING,
-     *     notBefore             [2] IMPLICIT UTCTime,
-     *     notAfter              [3] IMPLICIT UTCTime,
-     *     subject               [4] IMPLICIT OCTET STRING,   -- UTF-8 bytes
-     *     publicKey             [5] IMPLICIT BIT STRING,     -- 00 04 X Y
-     *     signature             [6] IMPLICIT BIT STRING      -- 00 || DER ECDSA
+     * Correct structure (two nested SEQUENCEs):
+     *
+     *   SEQUENCE {                                -- Profile0000 (outer)
+     *     OCTET STRING { 0x00, 0x00 }             -- profile (raw tag 0x04)
+     *     SEQUENCE {                              -- Profile0000Data (inner)
+     *       [0] IMPLICIT OCTET STRING serial      -- tag 0x80 (if non-default)
+     *       [1] IMPLICIT OCTET STRING issuer      -- tag 0x81 (if non-default)
+     *       [2] IMPLICIT OCTET STRING notBefore   -- tag 0x82 (if non-default)
+     *       [3] IMPLICIT OCTET STRING notAfter    -- tag 0x83 (if non-default)
+     *       [4] IMPLICIT OCTET STRING subject     -- tag 0x84 (if non-default)
+     *       [5] IMPLICIT OCTET STRING publicKey   -- tag 0x85 (mandatory)
+     *       [6] IMPLICIT OCTET STRING signature   -- tag 0x86 (mandatory)
+     *     }
      *   }
+     *
+     * Fields that match their default value (§13.3 page 167) are omitted.
+     * The issuer parameter may be null to indicate "use default" (omit from cert).
+     *
+     * NOTE: We use manual DER encoding rather than BouncyCastle DERTaggedObject
+     * to guarantee correct tag bytes (0x80-0x86). BouncyCastle's implicit tagging
+     * can produce incorrect tags on some Android versions.
      */
     private static byte[] buildProfile0000(
             byte[] serialNumber,
+            byte[] issuer,          // null = omit (use default "issuer")
             byte[] notBefore,
             byte[] notAfter,
             byte[] subject,
-            byte[] publicKey,
+            byte[] publicKey,       // 66 bytes: 0x00 || 0x04 || X || Y
             byte[] signature) throws Exception
     {
-        ASN1EncodableVector v = new ASN1EncodableVector();
+        ByteArrayOutputStream dataStream = new ByteArrayOutputStream();
 
-        // [0] profileId OCTET STRING
-        v.add(new DERTaggedObject(false, 0, new DEROctetString(PROFILE_ID)));
-        // [1] serialNumber OCTET STRING
-        v.add(new DERTaggedObject(false, 1, new DEROctetString(serialNumber)));
-        // [2] notBefore UTCTime (raw bytes stored as OCTET STRING in compressed form)
-        v.add(new DERTaggedObject(false, 2, new DEROctetString(notBefore)));
-        // [3] notAfter UTCTime
-        v.add(new DERTaggedObject(false, 3, new DEROctetString(notAfter)));
-        // [4] subject UTF8String bytes as OCTET STRING
-        v.add(new DERTaggedObject(false, 4, new DEROctetString(subject)));
-        // [5] publicKey BIT STRING
-        v.add(new DERTaggedObject(false, 5, new DEROctetString(publicKey)));
-        // [6] signature BIT STRING
-        v.add(new DERTaggedObject(false, 6, new DEROctetString(signature)));
+        // [0] serialNumber — omit if matches default
+        if (serialNumber != null && !Arrays.equals(serialNumber, DEFAULT_SERIAL))
+        {
+            writeDerImplicitTag(dataStream, 0, serialNumber);
+        }
 
-        return new DERSequence(v).getEncoded();
+        // [1] issuer — omit if null or matches default
+        if (issuer != null && !Arrays.equals(issuer, DEFAULT_ISSUER))
+        {
+            writeDerImplicitTag(dataStream, 1, issuer);
+        }
+
+        // [2] notBefore — omit if matches default
+        if (notBefore != null && !Arrays.equals(notBefore, DEFAULT_NOT_BEFORE))
+        {
+            writeDerImplicitTag(dataStream, 2, notBefore);
+        }
+
+        // [3] notAfter — omit if matches default
+        if (notAfter != null && !Arrays.equals(notAfter, DEFAULT_NOT_AFTER))
+        {
+            writeDerImplicitTag(dataStream, 3, notAfter);
+        }
+
+        // [4] subject — omit if matches default
+        if (subject != null && !Arrays.equals(subject, DEFAULT_SUBJECT))
+        {
+            writeDerImplicitTag(dataStream, 4, subject);
+        }
+
+        // [5] publicKey — mandatory
+        writeDerImplicitTag(dataStream, 5, publicKey);
+
+        // [6] signature — mandatory
+        writeDerImplicitTag(dataStream, 6, signature);
+
+        byte[] dataContent = dataStream.toByteArray();
+
+        // Build inner SEQUENCE (Profile0000Data): tag 0x30 + length + content
+        ByteArrayOutputStream innerSeqStream = new ByteArrayOutputStream();
+        innerSeqStream.write(0x30);
+        writeDerLength(innerSeqStream, dataContent.length);
+        innerSeqStream.write(dataContent);
+        byte[] innerSeq = innerSeqStream.toByteArray();
+
+        // Build profile OCTET STRING: tag 0x04 + length 0x02 + { 0x00, 0x00 }
+        byte[] profileOctetString = new byte[] { 0x04, 0x02, 0x00, 0x00 };
+
+        // Build outer SEQUENCE (Profile0000): tag 0x30 + length + (profile + data)
+        int outerContentLen = profileOctetString.length + innerSeq.length;
+        ByteArrayOutputStream outerStream = new ByteArrayOutputStream();
+        outerStream.write(0x30);
+        writeDerLength(outerStream, outerContentLen);
+        outerStream.write(profileOctetString);
+        outerStream.write(innerSeq);
+
+        return outerStream.toByteArray();
+    }
+
+    /**
+     * Write a context-specific implicit tagged value: tag byte 0x80|tagNum, then DER length, then value.
+     */
+    private static void writeDerImplicitTag(ByteArrayOutputStream out, int tagNum, byte[] value)
+            throws Exception
+    {
+        out.write(0x80 | tagNum);  // context-specific, primitive
+        writeDerLength(out, value.length);
+        out.write(value);
+    }
+
+    /**
+     * Write a DER length encoding to the stream.
+     */
+    private static void writeDerLength(ByteArrayOutputStream out, int length) throws Exception
+    {
+        if (length < 0x80)
+        {
+            out.write(length);
+        }
+        else if (length < 0x100)
+        {
+            out.write(0x81);
+            out.write(length);
+        }
+        else
+        {
+            out.write(0x82);
+            out.write((length >> 8) & 0xFF);
+            out.write(length & 0xFF);
+        }
     }
 
     /**
      * Build the reference X.509 TBS certificate used for signature computation.
      *
-     * Follows the template from Aliro §13.3 / page 168:
-     *   TBSCertificate ::= SEQUENCE {
-     *     version              [0] EXPLICIT INTEGER (v3 = 2)
-     *     serialNumber             INTEGER
-     *     signature                AlgorithmIdentifier (ecdsa-with-SHA256)
-     *     issuer                   Name (CN=issuer)
-     *     validity                 Validity { notBefore, notAfter }
-     *     subject                  Name (CN=subject)
-     *     subjectPublicKeyInfo     SubjectPublicKeyInfo (EC P-256, uncompressed)
-     *     extensions          [3] EXPLICIT Extensions { authorityKeyIdentifier }
-     *   }
+     * This method constructs the TBS to exactly match the reference X.509
+     * template from Aliro §13.3 page 168. The harness decompresses a
+     * profile0000 cert by inserting fields into this same template, so the
+     * TBS we sign MUST be byte-for-byte identical to what the harness
+     * reconstructs.
+     *
+     * The reference template includes THREE extensions (all required by §13.2):
+     *   1. Authority Key Identifier (2.5.29.35) — non-critical
+     *   2. Basic Constraints (2.5.29.19) — critical, CA:FALSE
+     *   3. Key Usage (2.5.29.15) — critical, digitalSignature only
      */
     private static byte[] buildReferenceTBS(
             byte[] serialNumber,
-            byte[] issuer,
-            byte[] notBefore,
-            byte[] notAfter,
-            byte[] subject,
-            byte[] publicKey,   // 66-byte profile0000 format: 00 04 X Y
-            byte[] authorityKeyId) throws Exception
+            byte[] issuerCN,        // UTF-8 bytes for issuer Common Name
+            byte[] notBefore,       // UTCTime string bytes (e.g. "260417000000Z")
+            byte[] notAfter,        // UTCTime string bytes
+            byte[] subjectCN,       // UTF-8 bytes for subject Common Name
+            byte[] publicKey,       // 66-byte profile0000 format: 00 04 X Y
+            byte[] authorityKeyId)  // 20-byte SHA-1 of issuer CA public key
+            throws Exception
     {
-        // Algorithm identifier: ecdsa-with-SHA256
-        AlgorithmIdentifier ecdsaSha256AlgId = new AlgorithmIdentifier(
-                new ASN1ObjectIdentifier(OID_ECDSA_SHA256));
+        // OID byte values
+        byte[] oidEcdsaSha256 = Hex.decode("2a8648ce3d040302");
+        byte[] oidEcPubKey    = Hex.decode("2a8648ce3d0201");
+        byte[] oidSecp256r1   = Hex.decode("2a8648ce3d030107");
+        byte[] oidCN          = Hex.decode("550403");
+        byte[] oidAKI         = Hex.decode("551d23");
+        byte[] oidBasicConst  = Hex.decode("551d13");
+        byte[] oidKeyUsage    = Hex.decode("551d0f");
 
-        // Algorithm identifier for the subject public key: id-ecPublicKey + secp256r1
-        AlgorithmIdentifier ecAlgId = new AlgorithmIdentifier(
-                new ASN1ObjectIdentifier(OID_EC_PUBLIC_KEY),
-                new ASN1ObjectIdentifier(OID_SECP256R1));
+        ByteArrayOutputStream tbs = new ByteArrayOutputStream();
 
-        // SubjectPublicKeyInfo: extract actual EC point from publicKey (skip 00 prefix byte)
-        // publicKey[0] = 0x00 (unused bits), publicKey[1..65] = 04 X Y
-        byte[] ecPoint = Arrays.copyOfRange(publicKey, 1, publicKey.length); // 65 bytes: 04 X Y
-        SubjectPublicKeyInfo spki = new SubjectPublicKeyInfo(ecAlgId,
-                new DERBitString(ecPoint).getBytes());
+        // Version [0] EXPLICIT INTEGER 2 (v3)
+        byte[] versionInt = derInteger(new byte[] { 0x02 });
+        byte[] version = derExplicitTag(0, versionInt);
 
-        // Version [0] EXPLICIT v3 (value 2)
-        DERTaggedObject version = new DERTaggedObject(true, 0, new ASN1Integer(2));
+        // SerialNumber INTEGER (positive BigInteger)
+        byte[] serialInt = derInteger(serialNumber);
 
-        // SerialNumber INTEGER (treat bytes as positive BigInteger)
-        ASN1Integer serialInt = new ASN1Integer(new BigInteger(1, serialNumber));
+        // Signature AlgorithmIdentifier: SEQUENCE { OID ecdsa-with-SHA256 }
+        byte[] sigAlg = derSequence(derOid(oidEcdsaSha256));
 
-        // Issuer Name: CN=<issuer string>
-        X500Name issuerName = new X500Name("CN=" + new String(issuer, "UTF-8"));
+        // Issuer: SEQUENCE { SET { SEQUENCE { OID(CN), UTF8String(issuerCN) } } }
+        byte[] issuerRdn = derSequence(derOid(oidCN), derUtf8String(issuerCN));
+        byte[] issuerSet = derSet(issuerRdn);
+        byte[] issuerName = derSequence(issuerSet);
 
-        // Validity
-        ASN1EncodableVector validityVec = new ASN1EncodableVector();
-        validityVec.add(new DERUTCTime(new String(notBefore, "ASCII")));
-        validityVec.add(new DERUTCTime(new String(notAfter, "ASCII")));
-        DERSequence validity = new DERSequence(validityVec);
+        // Validity: SEQUENCE { UTCTime(notBefore), UTCTime(notAfter) }
+        byte[] validity = derSequence(derUtcTime(notBefore), derUtcTime(notAfter));
 
-        // Subject Name: CN=<subject string>
-        X500Name subjectName = new X500Name("CN=" + new String(subject, "UTF-8"));
+        // Subject: SEQUENCE { SET { SEQUENCE { OID(CN), UTF8String(subjectCN) } } }
+        byte[] subjectRdn = derSequence(derOid(oidCN), derUtf8String(subjectCN));
+        byte[] subjectSet = derSet(subjectRdn);
+        byte[] subjectName = derSequence(subjectSet);
 
-        // SubjectPublicKeyInfo (rebuild properly)
-        byte[] ecPointFull = Arrays.copyOfRange(publicKey, 1, publicKey.length); // 04 X Y
-        SubjectPublicKeyInfo spkiProper = new SubjectPublicKeyInfo(
-                new AlgorithmIdentifier(
-                        new ASN1ObjectIdentifier(OID_EC_PUBLIC_KEY),
-                        new ASN1ObjectIdentifier(OID_SECP256R1)),
-                ecPointFull);
+        // SubjectPublicKeyInfo: SEQUENCE { AlgorithmId, BIT STRING }
+        // publicKey = [00 04 X Y] (66 bytes) — includes unused-bits byte
+        byte[] spkiAlg = derSequence(derOid(oidEcPubKey), derOid(oidSecp256r1));
+        byte[] spkiBitString = derBitString(publicKey);
+        byte[] spki = derSequence(spkiAlg, spkiBitString);
 
-        // Authority Key Identifier extension
-        // Extension OID: 2.5.29.35, value: SEQUENCE { [0] keyIdentifier }
-        ASN1EncodableVector akiContentVec = new ASN1EncodableVector();
-        akiContentVec.add(new DERTaggedObject(false, 0, new DEROctetString(authorityKeyId)));
-        byte[] akiContent = new DERSequence(akiContentVec).getEncoded();
+        // Extensions [3] EXPLICIT SEQUENCE { ext1, ext2, ext3 }
 
-        ASN1EncodableVector akiExtVec = new ASN1EncodableVector();
-        akiExtVec.add(new ASN1ObjectIdentifier("2.5.29.35"));
-        akiExtVec.add(new DEROctetString(akiContent));
-        DERSequence akiExt = new DERSequence(akiExtVec);
+        // Extension 1: Authority Key Identifier (non-critical)
+        //   SEQUENCE { OID(2.5.29.35), OCTET STRING { SEQUENCE { [0] keyIdentifier } } }
+        byte[] akiImplicit = derImplicitTag(0, authorityKeyId);
+        byte[] akiValue = derSequence(akiImplicit);
+        byte[] akiExt = derSequence(derOid(oidAKI), derOctetString(akiValue));
 
-        ASN1EncodableVector extListVec = new ASN1EncodableVector();
-        extListVec.add(akiExt);
-        DERSequence extList = new DERSequence(extListVec);
-        DERTaggedObject extensions = new DERTaggedObject(true, 3, extList);
+        // Extension 2: Basic Constraints (critical, CA:FALSE)
+        //   SEQUENCE { OID(2.5.29.19), BOOLEAN TRUE, OCTET STRING { SEQUENCE {} } }
+        byte[] bcValue = derSequence();  // empty SEQUENCE = CA:FALSE
+        byte[] bcExt = derSequence(derOid(oidBasicConst), derBoolean(true), derOctetString(bcValue));
 
-        // Build TBSCertificate SEQUENCE
-        ASN1EncodableVector tbsVec = new ASN1EncodableVector();
-        tbsVec.add(version);
-        tbsVec.add(serialInt);
-        tbsVec.add(ecdsaSha256AlgId);
-        tbsVec.add(issuerName);
-        tbsVec.add(validity);
-        tbsVec.add(subjectName);
-        tbsVec.add(spkiProper);
-        tbsVec.add(extensions);
+        // Extension 3: Key Usage (critical, digitalSignature)
+        //   SEQUENCE { OID(2.5.29.15), BOOLEAN TRUE, OCTET STRING { BIT STRING { 07 80 } } }
+        byte[] kuBitString = new byte[] { 0x03, 0x02, 0x07, (byte)0x80 };
+        byte[] kuExt = derSequence(derOid(oidKeyUsage), derBoolean(true), derOctetString(kuBitString));
 
-        return new DERSequence(tbsVec).getEncoded();
+        byte[] extList = derSequence(akiExt, bcExt, kuExt);
+        byte[] extensions = derExplicitTag(3, extList);
+
+        // Assemble TBS SEQUENCE
+        byte[] tbsContent = concat(version, serialInt, sigAlg, issuerName, validity,
+                subjectName, spki, extensions);
+        return derSequence(tbsContent);
     }
 
     /**
-     * Compute the Authority Key Identifier as SHA-1 of the uncompressed public key (65 bytes).
-     * Per RFC 5280 §4.2.1.1 and Aliro §13.3 recommendation.
+     * Compute the Authority Key Identifier as SHA-1 of the uncompressed public key
+     * (65 bytes: 04 || X || Y). Per RFC 5280 §4.2.1.1 and Aliro §13.3.
      */
     private static byte[] computeAuthorityKeyId(byte[] issuerPubKeyUncompressed) throws Exception
     {
         MessageDigest sha1 = MessageDigest.getInstance("SHA-1");
         return sha1.digest(issuerPubKeyUncompressed);
+    }
+
+    // =========================================================================
+    // Private helpers: manual DER encoding
+    // =========================================================================
+    // We use manual encoding to guarantee correct tag bytes, avoiding
+    // BouncyCastle DERTaggedObject quirks on different Android versions.
+
+    private static byte[] derSequence(byte[]... contents) throws Exception
+    {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        for (byte[] c : contents) out.write(c);
+        byte[] content = out.toByteArray();
+        ByteArrayOutputStream result = new ByteArrayOutputStream();
+        result.write(0x30);
+        writeDerLength(result, content.length);
+        result.write(content);
+        return result.toByteArray();
+    }
+
+    private static byte[] derSet(byte[]... contents) throws Exception
+    {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        for (byte[] c : contents) out.write(c);
+        byte[] content = out.toByteArray();
+        ByteArrayOutputStream result = new ByteArrayOutputStream();
+        result.write(0x31);
+        writeDerLength(result, content.length);
+        result.write(content);
+        return result.toByteArray();
+    }
+
+    private static byte[] derInteger(byte[] value) throws Exception
+    {
+        // Ensure positive: if high bit set, prepend 0x00
+        byte[] encoded = value;
+        if (value.length > 0 && (value[0] & 0x80) != 0)
+        {
+            encoded = new byte[value.length + 1];
+            System.arraycopy(value, 0, encoded, 1, value.length);
+        }
+        ByteArrayOutputStream result = new ByteArrayOutputStream();
+        result.write(0x02);
+        writeDerLength(result, encoded.length);
+        result.write(encoded);
+        return result.toByteArray();
+    }
+
+    private static byte[] derOid(byte[] oidBytes) throws Exception
+    {
+        ByteArrayOutputStream result = new ByteArrayOutputStream();
+        result.write(0x06);
+        writeDerLength(result, oidBytes.length);
+        result.write(oidBytes);
+        return result.toByteArray();
+    }
+
+    private static byte[] derOctetString(byte[] value) throws Exception
+    {
+        ByteArrayOutputStream result = new ByteArrayOutputStream();
+        result.write(0x04);
+        writeDerLength(result, value.length);
+        result.write(value);
+        return result.toByteArray();
+    }
+
+    private static byte[] derBitString(byte[] value) throws Exception
+    {
+        ByteArrayOutputStream result = new ByteArrayOutputStream();
+        result.write(0x03);
+        writeDerLength(result, value.length);
+        result.write(value);
+        return result.toByteArray();
+    }
+
+    private static byte[] derUtf8String(byte[] value) throws Exception
+    {
+        ByteArrayOutputStream result = new ByteArrayOutputStream();
+        result.write(0x0C);
+        writeDerLength(result, value.length);
+        result.write(value);
+        return result.toByteArray();
+    }
+
+    private static byte[] derUtcTime(byte[] value) throws Exception
+    {
+        ByteArrayOutputStream result = new ByteArrayOutputStream();
+        result.write(0x17);
+        writeDerLength(result, value.length);
+        result.write(value);
+        return result.toByteArray();
+    }
+
+    private static byte[] derBoolean(boolean value) throws Exception
+    {
+        return new byte[] { 0x01, 0x01, value ? (byte)0xFF : (byte)0x00 };
+    }
+
+    private static byte[] derExplicitTag(int tagNum, byte[] content) throws Exception
+    {
+        ByteArrayOutputStream result = new ByteArrayOutputStream();
+        result.write(0xA0 | tagNum);  // context-specific, constructed
+        writeDerLength(result, content.length);
+        result.write(content);
+        return result.toByteArray();
+    }
+
+    private static byte[] derImplicitTag(int tagNum, byte[] value) throws Exception
+    {
+        ByteArrayOutputStream result = new ByteArrayOutputStream();
+        result.write(0x80 | tagNum);  // context-specific, primitive
+        writeDerLength(result, value.length);
+        result.write(value);
+        return result.toByteArray();
+    }
+
+    private static byte[] concat(byte[]... arrays) throws Exception
+    {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        for (byte[] a : arrays) out.write(a);
+        return out.toByteArray();
     }
 
     // =========================================================================
@@ -795,16 +1038,14 @@ public class AliroProvisioningManager
         // ECPrivateKey ::= SEQUENCE { version INTEGER, privateKey OCTET STRING, ... }
         org.bouncycastle.asn1.ASN1InputStream asn1in =
                 new org.bouncycastle.asn1.ASN1InputStream(encoded);
-        org.bouncycastle.asn1.ASN1Sequence pkcs8 =
-                (org.bouncycastle.asn1.ASN1Sequence) asn1in.readObject();
+        ASN1Sequence pkcs8 = (ASN1Sequence) asn1in.readObject();
         asn1in.close();
         // Element 2 is the OCTET STRING wrapping the ECPrivateKey
         byte[] ecPrivDer = org.bouncycastle.asn1.ASN1OctetString.getInstance(
                 pkcs8.getObjectAt(2)).getOctets();
         org.bouncycastle.asn1.ASN1InputStream asn1in2 =
                 new org.bouncycastle.asn1.ASN1InputStream(ecPrivDer);
-        org.bouncycastle.asn1.ASN1Sequence ecPrivSeq =
-                (org.bouncycastle.asn1.ASN1Sequence) asn1in2.readObject();
+        ASN1Sequence ecPrivSeq = (ASN1Sequence) asn1in2.readObject();
         asn1in2.close();
         byte[] privOctets = org.bouncycastle.asn1.ASN1OctetString.getInstance(
                 ecPrivSeq.getObjectAt(1)).getOctets();

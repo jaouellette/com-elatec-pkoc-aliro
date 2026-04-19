@@ -164,6 +164,36 @@
             android:fontFamily="monospace"
             android:textSize="13sp"
             android:maxLines="4"
+            android:layout_marginBottom="12dp" />
+
+        <!-- Cert Delivery Mode -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Cert Delivery Mode"
+            android:textSize="14sp"
+            android:textStyle="bold"
+            android:textColor="@color/colorTextPrimary"
+            android:layout_marginBottom="4dp" />
+
+        <Spinner
+            android:id="@+id/spinnerCertMode"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="8dp" />
+
+        <CheckBox
+            android:id="@+id/chkForceChaining"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Force command chaining (for WITH_CHAINING tests)"
+            android:layout_marginBottom="8dp" />
+
+        <CheckBox
+            android:id="@+id/chkFastMode"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="FAST mode (use Kpersistent from prior STANDARD)"
             android:layout_marginBottom="32dp" />
 
         <!-- Step-Up divider -->

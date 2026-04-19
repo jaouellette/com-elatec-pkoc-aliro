@@ -78,8 +78,11 @@ public class Aliro_HostApduService extends HostApduService
     // B7 (User Device Descriptor) is placed OUTSIDE 6F, at the top level of the SELECT
     // response, per the harness TLV structure: TLV_SELECT_RSP expects [0x6F, 0xB7].
     //
-    // This TLV is also used verbatim in HKDF salt (§8.3.1.13), so its exact
-    // byte sequence must be consistent between SELECT and deriveKeys().
+    // This full A5 TLV (including DO'7F66') is passed verbatim to deriveKeys /
+    // deriveFastKeys / deriveKpersistent as the HKDF salt input, per §8.3.1.13
+    // Table 10-2 ("0xA5 proprietary information TLV").  The reader performs the
+    // same computation using the full A5 structure.  Both sides must use identical
+    // bytes; the three HKDF call sites below all pass PROPRIETARY_TLV unchanged.
     private static final byte[] PROPRIETARY_TLV = {
         (byte)0xA5, 0x15,                                 // A5 length = 21 (without B7)
         (byte)0x80, 0x02, 0x00, 0x00,                     // Response type
@@ -561,7 +564,26 @@ public class Aliro_HostApduService extends HostApduService
                 }
                 else
                 {
-                    Log.d(TAG, "AUTH0: group_id=" + groupIdHex + " not in multi-group map (will use config/LOAD CERT key)");
+                    // Not in static test map — try provisioned reader_group_identifier_key.
+                    // Per §6.2 the credential stores the reader_group_identifier_key
+                    // (reader pub key or issuer CA pub key) when the Access Credential
+                    // is provisioned. With self-signed certs these are the same key.
+                    String provGroupId = AliroProvisioningManager.getAuthorizedReaderGroupIdHex(this);
+                    if (provGroupId != null && groupIdHex.equalsIgnoreCase(provGroupId))
+                    {
+                        byte[] provKey = AliroProvisioningManager.getIssuerCAPubKey(this);
+                        if (provKey != null && provKey.length == 65)
+                        {
+                            readerStaticPubKey = provKey;
+                            readerStaticPubKeyX = Arrays.copyOfRange(provKey, 1, 33);
+                            Log.d(TAG, "AUTH0: provisioned reader key matched for group_id=" + groupIdHex
+                                    + " -> pubKeyX=" + Hex.toHexString(readerStaticPubKeyX));
+                        }
+                    }
+                    if (readerStaticPubKey == null)
+                    {
+                        Log.d(TAG, "AUTH0: group_id=" + groupIdHex + " not in multi-group map (will use config/LOAD CERT key)");
+                    }
                 }
             }
 
@@ -621,7 +643,7 @@ public class Aliro_HostApduService extends HostApduService
             // auth0Flag = [command_parameters (0x41), authentication_policy (0x42)]
             // command_parameters (tag 0x41): 0x00 = standard, 0x01 = fast
             // authentication_policy (tag 0x42): 0x01=UD, 0x02=UD+force, 0x03=force user auth
-            boolean fastMode = (cmdParams == 0x01);
+            boolean fastMode = (cmdParams & 0x01) == 0x01;
             Log.d(TAG, "AUTH0: fastMode=" + fastMode + " cmdParams=" + String.format("%02x", cmdParams));
 
             // Build response data: 86 41 <UD eph pub key 65 bytes>
@@ -682,7 +704,7 @@ public class Aliro_HostApduService extends HostApduService
                             readerEphPubX,
                             udEphPubX,
                             credPubKeyX,
-                            PROPRIETARY_TLV,
+                            PROPRIETARY_TLV, // full A5 TLV including DO'7F66' — matches harness HKDF
                             auth0CmdVendorExt,   // vendor ext from AUTH0 command (may be null)
                             auth0RspVendorExt,   // vendor ext from AUTH0 response (null for us)
                             AliroCryptoProvider.INTERFACE_BYTE_NFC,
@@ -1078,32 +1100,59 @@ public class Aliro_HostApduService extends HostApduService
             Log.d(TAG, "AUTH1 data: " + Hex.toHexString(data));
 
             // Parse TLVs: find 41 (command_parameters), 9E (signature), 90 (reader_cert)
+            // Uses BER-TLV length decoding: single-byte for values < 0x80,
+            // 0x81 = next byte is actual length, 0x82 = next two bytes big-endian.
             byte[] readerSig = null;
             byte[] auth1ReaderCert = null;
             auth1CmdParams = 0x00; // default: key_slot
             int i = 0;
-            while (i < data.length - 1)
+            while (i < data.length)
             {
-                byte tag = data[i];
-                int  len = data[i + 1] & 0xFF;
-                i += 2;
-                if (i + len > data.length) break;
-                if (tag == (byte)0x41 && len == 1)
+                // Need at least tag + length byte
+                if (i + 1 >= data.length) break;
+                int tag = data[i] & 0xFF;
+                int lenByte = data[i + 1] & 0xFF;
+                int len;
+                int valOff;
+                if (lenByte < 0x80)
                 {
-                    auth1CmdParams = data[i];
+                    len = lenByte;
+                    valOff = i + 2;
+                }
+                else if (lenByte == 0x81)
+                {
+                    if (i + 2 >= data.length) break;
+                    len = data[i + 2] & 0xFF;
+                    valOff = i + 3;
+                }
+                else if (lenByte == 0x82)
+                {
+                    if (i + 3 >= data.length) break;
+                    len = ((data[i + 2] & 0xFF) << 8) | (data[i + 3] & 0xFF);
+                    valOff = i + 4;
+                }
+                else
+                {
+                    // Unsupported length encoding — stop parsing
+                    break;
+                }
+                if (valOff + len > data.length) break;
+                if (tag == 0x41 && len == 1)
+                {
+                    auth1CmdParams = data[valOff];
                     Log.d(TAG, "AUTH1: command_parameters = " + String.format("%02X", auth1CmdParams));
                 }
-                else if (tag == (byte)0x9E && len == 64)
+                else if (tag == 0x9E && len == 64)
                 {
-                    readerSig = Arrays.copyOfRange(data, i, i + 64);
+                    readerSig = Arrays.copyOfRange(data, valOff, valOff + 64);
                 }
-                else if (tag == (byte)0x90 && len > 0)
+                else if (tag == 0x90 && len > 0)
                 {
                     // reader_Cert per Table 8-10 — optional, same format as LOAD CERT
-                    auth1ReaderCert = Arrays.copyOfRange(data, i, i + len);
+                    auth1ReaderCert = Arrays.copyOfRange(data, valOff, valOff + len);
                     Log.d(TAG, "AUTH1: found reader_cert (" + len + " bytes)");
                 }
-                i += len;
+                i = valOff + len;
             }
 
             // If reader cert was included in AUTH1 (instead of LOAD CERT), parse it
@@ -1197,7 +1246,7 @@ public class Aliro_HostApduService extends HostApduService
                     transactionId,
                     readerEphPubX,
                     udEphPubX,
-                    PROPRIETARY_TLV,
+                    PROPRIETARY_TLV, // full A5 TLV including DO'7F66' — matches harness HKDF
                     auth0CmdVendorExt,   // vendor ext from AUTH0 command (may be null)
                     auth0RspVendorExt,   // vendor ext from AUTH0 response (null for us)
                     AliroCryptoProvider.INTERFACE_BYTE_NFC,
@@ -1218,6 +1267,7 @@ public class Aliro_HostApduService extends HostApduService
             if (credSig == null)
             {
                 Log.e(TAG, "AUTH1: credential signature failed");
+                zeroSessionKeys();
                 return SW_ERROR;
             }
 
@@ -1299,6 +1349,7 @@ public class Aliro_HostApduService extends HostApduService
             if (encrypted == null)
             {
                 Log.e(TAG, "AUTH1: encryption failed");
+                zeroSessionKeys();
                 return SW_ERROR;
             }
 
@@ -1326,7 +1377,7 @@ public class Aliro_HostApduService extends HostApduService
                             readerEphPubX,
                             udEphPubX,
                             credPubX,
-                            PROPRIETARY_TLV,
+                            PROPRIETARY_TLV, // full A5 TLV including DO'7F66' — matches harness HKDF
                             auth0CmdVendorExt,
                             auth0RspVendorExt,
                             AliroCryptoProvider.INTERFACE_BYTE_NFC,
@@ -1371,6 +1422,7 @@ public class Aliro_HostApduService extends HostApduService
         catch (Exception e)
         {
             Log.e(TAG, "AUTH1 error", e);
+            zeroSessionKeys();
             return SW_ERROR;
         }
     }
@@ -1466,6 +1518,7 @@ public class Aliro_HostApduService extends HostApduService
             if (decrypted == null)
             {
                 Log.e(TAG, "EXCHANGE: decryption failed (readerCounter was " + (readerCounter - 1) + ")");
+                zeroSessionKeys();
                 return SW_ERROR;
             }
             Log.d(TAG, "EXCHANGE decrypted: " + Hex.toHexString(decrypted));
@@ -1547,6 +1600,7 @@ public class Aliro_HostApduService extends HostApduService
             if (encryptedResponse == null)
             {
                 Log.e(TAG, "EXCHANGE: response encryption failed (deviceCounter was " + (deviceCounter - 1) + ")");
+                zeroSessionKeys();
                 return SW_ERROR;
             }
             byte[] response = new byte[encryptedResponse.length + 2];
@@ -1558,6 +1612,7 @@ public class Aliro_HostApduService extends HostApduService
         catch (Exception e)
         {
             Log.e(TAG, "EXCHANGE error", e);
+            zeroSessionKeys();
             return SW_ERROR;
         }
     }
@@ -2573,6 +2628,18 @@ public class Aliro_HostApduService extends HostApduService
     // Misc helpers
     // -------------------------------------------------------------------------
 
+    /**
+     * Zero and null all session key material.
+     * Must be called on every error path after deriveKeys() returns, and in resetState().
+     */
+    private void zeroSessionKeys()
+    {
+        if (skReader       != null) { Arrays.fill(skReader,       (byte)0); skReader       = null; }
+        if (skDevice       != null) { Arrays.fill(skDevice,       (byte)0); skDevice       = null; }
+        if (stepUpSKReader != null) { Arrays.fill(stepUpSKReader, (byte)0); stepUpSKReader = null; }
+        if (stepUpSKDevice != null) { Arrays.fill(stepUpSKDevice, (byte)0); stepUpSKDevice = null; }
+    }
+
     private void resetState()
     {
         state             = State.IDLE;
@@ -2589,11 +2656,8 @@ public class Aliro_HostApduService extends HostApduService
         readerStaticPubKeyX  = null;
         readerStaticPubKey   = null;
         // Zero session keys before nulling per section 8.3.3.1
-        if (skReader  != null) { java.util.Arrays.fill(skReader,  (byte)0); skReader  = null; }
-        if (skDevice  != null) { java.util.Arrays.fill(skDevice,  (byte)0); skDevice  = null; }
-        if (stepUpSK  != null) { java.util.Arrays.fill(stepUpSK,  (byte)0); stepUpSK  = null; }
-        if (stepUpSKReader != null) { java.util.Arrays.fill(stepUpSKReader, (byte)0); stepUpSKReader = null; }
-        if (stepUpSKDevice != null) { java.util.Arrays.fill(stepUpSKDevice, (byte)0); stepUpSKDevice = null; }
+        zeroSessionKeys();
+        if (stepUpSK  != null) { Arrays.fill(stepUpSK,  (byte)0); stepUpSK  = null; }
         inStepUpPhase = false;
         // Reset per-message counters
         readerCounter = 1; // first EXCHANGE command uses 1

@@ -25,6 +25,35 @@ public class AliroPreferences
     public static final String READER_CERTIFICATE = "aliro_reader_certificate";
 
     /**
+     * Certificate delivery mode for reader certification testing.
+     *   "none"      — no certificate sent (no-cert flow)
+     *   "load_cert" — send cert via separate LOAD CERT command (INS D1)
+     *   "auth1"     — embed cert in AUTH1 command (tag 0x90)
+     * Default is "load_cert" when cert + issuer key are configured.
+     */
+    public static final String CERT_DELIVERY_MODE = "aliro_cert_delivery_mode";
+    public static final String CERT_MODE_NONE      = "none";
+    public static final String CERT_MODE_LOAD_CERT = "load_cert";
+    public static final String CERT_MODE_AUTH1     = "auth1";
+
+    /**
+     * Boolean: force command chaining when sending LOAD CERT or AUTH1 with cert.
+     * When true, the cert data is split across multiple chained APDUs
+     * (CLA 0x90 for non-final, 0x80 for final) per §8.3.2.2.
+     * Default false (single APDU).
+     */
+    public static final String CERT_FORCE_CHAINING = "aliro_cert_force_chaining";
+
+    /**
+     * FAST mode state — stored after a successful STANDARD transaction.
+     * Kpersistent (64-char hex, 32 bytes) and credential static public key X
+     * (64-char hex, 32 bytes) are needed for FAST AUTH0 key derivation.
+     */
+    public static final String KPERSISTENT         = "aliro_kpersistent";
+    public static final String CREDENTIAL_PUB_KEY_X = "aliro_credential_pub_key_x";
+    public static final String FAST_MODE_ENABLED    = "aliro_fast_mode_enabled";
+
+    /**
      * DataElementIdentifier to request in the Step-Up phase DeviceRequest.
      * e.g. "access", "administrator", "floor1".
      * Empty string means Step-Up is disabled.

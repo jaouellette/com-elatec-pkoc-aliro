@@ -338,59 +338,34 @@ public class CredentialAliroConfigFragment extends Fragment
 
     private void applyTestHarnessConfig()
     {
-        String groupIdHex = editTestHarnessGroupId.getText().toString()
-                .trim().replaceAll("\\s+", "").replaceAll("[^0-9a-fA-F]", "").toLowerCase(java.util.Locale.US);
-        String issuerCaHex = editTestHarnessIssuerCa.getText().toString()
-                .trim().replaceAll("\\s+", "").replaceAll("[^0-9a-fA-F]", "").toLowerCase(java.util.Locale.US);
+        // Always reset to CSA test harness defaults — this is the entire purpose
+        // of this button. The text fields show whatever was previously provisioned,
+        // but "APPLY TEST HARNESS CONFIG" must always restore the known-good CSA
+        // defaults regardless of what the fields currently contain.
+        String groupIdHex  = DEFAULT_TH_GROUP_ID.toLowerCase(java.util.Locale.US);
+        String issuerCaHex = DEFAULT_TH_ISSUER_CA.toLowerCase(java.util.Locale.US);
+        String readerPubHex = DEFAULT_TH_READER_PUB.toLowerCase(java.util.Locale.US);
 
-        boolean hasGroup = !groupIdHex.isEmpty();
-        boolean hasIssuer = !issuerCaHex.isEmpty();
+        // Apply to provisioning storage
+        AliroProvisioningManager.setAuthorizedReaderGroupId(requireContext(), groupIdHex);
+        AliroProvisioningManager.setIssuerCAPubKey(requireContext(), issuerCaHex);
+        AliroProvisioningManager.setTestHarnessReaderPubKey(requireContext(), readerPubHex);
 
-        String readerPubHex = editTestHarnessReaderPubKey.getText().toString()
-                .trim().replaceAll("\\s+", "").replaceAll("[^0-9a-fA-F]", "").toLowerCase(java.util.Locale.US);
-        boolean hasReaderPub = !readerPubHex.isEmpty();
+        // Disable strict mode for test harness — harness uses a simulated reader
+        // that won't match real provisioned credentials
+        AliroProvisioningManager.setStrictMode(requireContext(), false);
+        if (chkStrictMode != null) chkStrictMode.setChecked(false);
 
-        if (hasGroup && groupIdHex.length() != 32)
-        {
-            showStatus("Reader Group ID must be exactly 32 hex characters (16 bytes).", false);
-            return;
-        }
-        if (hasIssuer && issuerCaHex.length() != 130)
-        {
-            showStatus("Issuer CA must be exactly 130 hex characters (65 bytes).", false);
-            return;
-        }
-        if (hasIssuer && !issuerCaHex.startsWith("04"))
-        {
-            showStatus("Issuer CA must start with 04 (uncompressed EC point).", false);
-            return;
-        }
-        if (hasReaderPub && readerPubHex.length() != 130)
-        {
-            showStatus("Reader Public Key must be exactly 130 hex characters (65 bytes).", false);
-            return;
-        }
-        if (hasReaderPub && !readerPubHex.startsWith("04"))
-        {
-            showStatus("Reader Public Key must start with 04 (uncompressed EC point).", false);
-            return;
-        }
+        // Update the text fields on screen to reflect the applied defaults
+        if (editTestHarnessGroupId != null) editTestHarnessGroupId.setText(groupIdHex);
+        if (editTestHarnessIssuerCa != null) editTestHarnessIssuerCa.setText(issuerCaHex);
+        if (editTestHarnessReaderPubKey != null) editTestHarnessReaderPubKey.setText(readerPubHex);
 
-        if (hasGroup)
-            AliroProvisioningManager.setAuthorizedReaderGroupId(requireContext(), groupIdHex);
-        if (hasIssuer)
-            AliroProvisioningManager.setIssuerCAPubKey(requireContext(), issuerCaHex);
-        if (hasReaderPub)
-            AliroProvisioningManager.setTestHarnessReaderPubKey(requireContext(), readerPubHex);
-
-        // Do NOT enable strict mode for test harness — leave it unchecked
-
-        StringBuilder msg = new StringBuilder("\u2713 Test Harness config applied.");
-        if (hasGroup)  msg.append("\nGroup ID: ").append(groupIdHex.substring(0, 8)).append("...");
-        if (hasIssuer) msg.append("\nIssuer CA: ").append(issuerCaHex.substring(0, 8)).append("...");
-        if (hasReaderPub) msg.append("\nReader Key: ").append(readerPubHex.substring(0, 8)).append("...");
-
-        showStatus(msg.toString(), true);
+        showStatus("\u2713 Test Harness config reset to CSA defaults.\n"
+                + "Group ID: " + groupIdHex.substring(0, 8) + "...\n"
+                + "Issuer CA: " + issuerCaHex.substring(0, 8) + "...\n"
+                + "Reader Key: " + readerPubHex.substring(0, 8) + "...\n"
+                + "Strict Mode: OFF", true);
         refreshProvisioningStatus();
     }
 

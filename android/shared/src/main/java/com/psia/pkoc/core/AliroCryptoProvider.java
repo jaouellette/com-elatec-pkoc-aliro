@@ -15,6 +15,7 @@ import org.bouncycastle.jce.provider.BouncyCastleProvider;
 import org.bouncycastle.util.BigIntegers;
 
 import java.math.BigInteger;
+import java.util.Arrays;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
 import java.security.MessageDigest;
@@ -25,6 +26,8 @@ import java.security.interfaces.ECPublicKey;
 import java.security.spec.ECGenParameterSpec;
 
 import javax.crypto.KeyAgreement;
+
+import org.bouncycastle.util.encoders.Hex;
 
 /**
  * Cryptographic helpers for the Aliro Expedited Standard NFC/BLE flow.
@@ -633,6 +636,19 @@ public class AliroCryptoProvider
             sha256.update(credentialPubKeyX);
             byte[] saltHash = sha256.digest(); // 32-byte salt
 
+            Log.d(TAG, "deriveFastKeys salt inputs:"
+                    + " readerPubKeyX=" + Hex.toHexString(readerPubKeyX)
+                    + " readerID=" + Hex.toHexString(readerID)
+                    + " interfaceByte=" + String.format("%02x", interfaceByte)
+                    + " protoVer=" + Hex.toHexString(selectedProtocolVersion)
+                    + " readerEphX=" + Hex.toHexString(readerEphPubKeyX)
+                    + " txnId=" + Hex.toHexString(transactionID)
+                    + " flag=" + Hex.toHexString(flag)
+                    + " selectTLV=" + Hex.toHexString(selectProprietaryTLV)
+                    + " credPubKeyX=" + Hex.toHexString(credentialPubKeyX));
+            Log.d(TAG, "deriveFastKeys saltHash=" + Hex.toHexString(saltHash)
+                    + " kpersistent=" + Hex.toHexString(kpersistent));
+
             // HKDF-Extract: PRK = HMAC-SHA256(salt_fast_hash, Kpersistent)
             // IKM is Kpersistent directly — no ECDH
             byte[] prk = hmacSha256(saltHash, kpersistent);
@@ -674,7 +690,10 @@ public class AliroCryptoProvider
                 idx += 32;
                 n++;
             }
-            Log.d(TAG, "deriveFastKeys: " + outputSize + " bytes derived");
+            Log.d(TAG, "deriveFastKeys: " + outputSize + " bytes derived"
+                    + " [0..31]=" + Hex.toHexString(Arrays.copyOfRange(output, 0, 32))
+                    + " [32..63]=" + Hex.toHexString(Arrays.copyOfRange(output, 32, 64))
+                    + " [64..95]=" + Hex.toHexString(Arrays.copyOfRange(output, 64, Math.min(96, output.length))));
             return output;
         }
         catch (Exception e)
@@ -706,6 +725,28 @@ public class AliroCryptoProvider
         // IV = 12 zero bytes
         byte[] iv = new byte[12];
         return gcm(true, key, iv, payload);
+    }
+
+    /**
+     * Decrypt and verify an AUTH0 response cryptogram.
+     *
+     * Per Aliro §8.3.1.11:
+     *   - Key: CryptogramSK (32 bytes from deriveFastKeys offset 0)
+     *   - IV: 12 zero bytes
+     *   - No AAD
+     *   - Input: ciphertext || 16-byte GCM tag (64 bytes total per Table 8-5)
+     *   - Returns plaintext (48 bytes per Table 8-6) on success, null if GCM
+     *     tag verification fails (Kpersistent mismatch).
+     *
+     * @param key            32-byte CryptogramSK
+     * @param ciphertextTag  ciphertext || authentication_tag (64 bytes)
+     * @return plaintext on success, or null if authentication fails
+     */
+    public static byte[] decryptCryptogram(byte[] key, byte[] ciphertextTag)
+    {
+        // IV = 12 zero bytes
+        byte[] iv = new byte[12];
+        return gcm(false, key, iv, ciphertextTag);
     }
 
     // -------------------------------------------------------------------------

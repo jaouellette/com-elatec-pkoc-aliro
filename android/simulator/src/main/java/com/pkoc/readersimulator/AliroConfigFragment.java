@@ -1,9 +1,12 @@
 package com.pkoc.readersimulator;
 
+import android.app.AlertDialog;
 import android.content.Context;
 import android.content.SharedPreferences;
 import android.os.Bundle;
+import android.text.Editable;
 import android.text.TextUtils;
+import android.text.TextWatcher;
 import android.view.LayoutInflater;
 import android.view.View;
 import android.view.ViewGroup;
@@ -15,6 +18,7 @@ import android.widget.EditText;
 import android.widget.Spinner;
 import android.widget.TextView;
 
+import androidx.activity.OnBackPressedCallback;
 import androidx.activity.result.ActivityResultLauncher;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
@@ -44,6 +48,23 @@ public class AliroConfigFragment extends Fragment
     private EditText editStepUpIssuerPubKey;
     private TextView txtStatus;
 
+    // Cert delivery mode
+    private Spinner  spinnerCertMode;
+    private static final String[] CERT_MODE_VALUES = {
+            AliroPreferences.CERT_MODE_NONE,
+            AliroPreferences.CERT_MODE_LOAD_CERT,
+            AliroPreferences.CERT_MODE_AUTH1
+    };
+    private static final String[] CERT_MODE_LABELS = {
+            "None (no cert)",
+            "LOAD CERT command",
+            "Embed in AUTH1"
+    };
+
+    // Chaining + FAST mode
+    private CheckBox chkForceChaining;
+    private CheckBox chkFastMode;
+
     // Mailbox fields
     private CheckBox chkMailboxEnabled;
     private Spinner  spinnerMailboxOperation;
@@ -57,6 +78,10 @@ public class AliroConfigFragment extends Fragment
     private EditText editMailboxSetValue;
     private TextView lblMailboxSetValue;
     private CheckBox chkMailboxAtomic;
+
+    // Dirty tracking — prompts user to save when navigating away
+    private boolean dirty = false;
+    private boolean loadingPrefs = false; // suppress dirty during initial load
 
     // Separate launchers for two different QR scan purposes
     private final ActivityResultLauncher<ScanOptions> qrScanLauncher =
@@ -90,6 +115,15 @@ public class AliroConfigFragment extends Fragment
         Button btnScanQr        = view.findViewById(R.id.btnScanIssuerKeyQr);
         Button btnImportConfig  = view.findViewById(R.id.btnImportFromCredential);
 
+        // Cert delivery mode spinner
+        spinnerCertMode = view.findViewById(R.id.spinnerCertMode);
+        ArrayAdapter<String> certModeAdapter = new ArrayAdapter<>(
+                requireContext(), android.R.layout.simple_spinner_item, CERT_MODE_LABELS);
+        certModeAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        spinnerCertMode.setAdapter(certModeAdapter);
+        chkForceChaining = view.findViewById(R.id.chkForceChaining);
+        chkFastMode      = view.findViewById(R.id.chkFastMode);
+
         // Mailbox bindings
         chkMailboxEnabled       = view.findViewById(R.id.chkMailboxEnabled);
         spinnerMailboxOperation = view.findViewById(R.id.spinnerMailboxOperation);
@@ -121,11 +155,92 @@ public class AliroConfigFragment extends Fragment
             @Override public void onNothingSelected(AdapterView<?> parent) {}
         });
 
+        loadingPrefs = true;
         loadFromPreferences();
+        loadingPrefs = false;
 
         btnSave.setOnClickListener(v -> saveToPreferences());
         btnScanQr.setOnClickListener(v -> launchQrScanner());
         btnImportConfig.setOnClickListener(v -> launchImportConfigScanner());
+
+        // ---------------------------------------------------------------
+        // Dirty tracking: mark form as dirty when any field changes.
+        // Suppressed during loadFromPreferences() via loadingPrefs flag.
+        // ---------------------------------------------------------------
+        TextWatcher dirtyWatcher = new TextWatcher()
+        {
+            @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+            @Override public void onTextChanged(CharSequence s, int start, int before, int count) {}
+            @Override public void afterTextChanged(Editable s)
+            {
+                if (!loadingPrefs) dirty = true;
+            }
+        };
+        editReaderPrivateKey.addTextChangedListener(dirtyWatcher);
+        editReaderId.addTextChangedListener(dirtyWatcher);
+        editReaderIssuerPublicKey.addTextChangedListener(dirtyWatcher);
+        editReaderCertificate.addTextChangedListener(dirtyWatcher);
+        editStepUpElementId.addTextChangedListener(dirtyWatcher);
+        editStepUpIssuerPubKey.addTextChangedListener(dirtyWatcher);
+        editMailboxOffset.addTextChangedListener(dirtyWatcher);
+        editMailboxData.addTextChangedListener(dirtyWatcher);
+        editMailboxSetValue.addTextChangedListener(dirtyWatcher);
+
+        AdapterView.OnItemSelectedListener dirtySpinnerListener =
+                new AdapterView.OnItemSelectedListener()
+        {
+            @Override public void onItemSelected(AdapterView<?> p, View v, int pos, long id)
+            {
+                if (!loadingPrefs) dirty = true;
+            }
+            @Override public void onNothingSelected(AdapterView<?> p) {}
+        };
+        spinnerCertMode.setOnItemSelectedListener(dirtySpinnerListener);
+        // Note: spinnerMailboxOperation already has a listener for visibility;
+        // dirty is also set via the TextWatcher on dependent fields.
+
+        CheckBox.OnCheckedChangeListener dirtyCheckListener =
+                (buttonView, isChecked) -> { if (!loadingPrefs) dirty = true; };
+        chkForceChaining.setOnCheckedChangeListener(dirtyCheckListener);
+        chkFastMode.setOnCheckedChangeListener(dirtyCheckListener);
+        chkMailboxEnabled.setOnCheckedChangeListener(dirtyCheckListener);
+        chkMailboxAtomic.setOnCheckedChangeListener(dirtyCheckListener);
+
+        // ---------------------------------------------------------------
+        // Intercept back navigation: prompt to save if dirty
+        // ---------------------------------------------------------------
+        requireActivity().getOnBackPressedDispatcher().addCallback(
+                getViewLifecycleOwner(), new OnBackPressedCallback(true)
+        {
+            @Override
+            public void handleOnBackPressed()
+            {
+                if (dirty)
+                {
+                    new AlertDialog.Builder(requireContext())
+                            .setTitle("Unsaved Changes")
+                            .setMessage("You have unsaved changes. Save before leaving?")
+                            .setPositiveButton("Save", (d, w) -> {
+                                saveToPreferences();
+                                dirty = false;
+                                setEnabled(false);
+                                requireActivity().getOnBackPressedDispatcher().onBackPressed();
+                            })
+                            .setNegativeButton("Discard", (d, w) -> {
+                                dirty = false;
+                                setEnabled(false);
+                                requireActivity().getOnBackPressedDispatcher().onBackPressed();
+                            })
+                            .setNeutralButton("Cancel", null)
+                            .show();
+                }
+                else
+                {
+                    setEnabled(false);
+                    requireActivity().getOnBackPressedDispatcher().onBackPressed();
+                }
+            }
+        });
     }
 
     private void updateMailboxFieldVisibility(String op)
@@ -161,6 +276,23 @@ public class AliroConfigFragment extends Fragment
                 prefs.getString(AliroPreferences.STEP_UP_ELEMENT_ID, ""));
         editStepUpIssuerPubKey.setText(
                 prefs.getString(AliroPreferences.STEP_UP_ISSUER_PUB_KEY, ""));
+
+        // Load cert delivery mode
+        String savedCertMode = prefs.getString(AliroPreferences.CERT_DELIVERY_MODE,
+                AliroPreferences.CERT_MODE_LOAD_CERT);
+        spinnerCertMode.setSelection(1); // default: LOAD CERT
+        for (int i = 0; i < CERT_MODE_VALUES.length; i++)
+        {
+            if (CERT_MODE_VALUES[i].equals(savedCertMode))
+            {
+                spinnerCertMode.setSelection(i);
+                break;
+            }
+        }
+
+        // Load chaining + FAST
+        chkForceChaining.setChecked(prefs.getBoolean(AliroPreferences.CERT_FORCE_CHAINING, false));
+        chkFastMode.setChecked(prefs.getBoolean(AliroPreferences.FAST_MODE_ENABLED, false));
 
         // Load mailbox config
         chkMailboxEnabled.setChecked(prefs.getBoolean(AliroPreferences.MAILBOX_ENABLED, false));
@@ -243,6 +375,14 @@ public class AliroConfigFragment extends Fragment
         editor.putString(AliroPreferences.STEP_UP_ELEMENT_ID,    stepUpElementId);
         editor.putString(AliroPreferences.STEP_UP_ISSUER_PUB_KEY, stepUpIssuerKey);
 
+        // Save cert delivery mode + chaining
+        editor.putString(AliroPreferences.CERT_DELIVERY_MODE,
+                CERT_MODE_VALUES[spinnerCertMode.getSelectedItemPosition()]);
+        editor.putBoolean(AliroPreferences.CERT_FORCE_CHAINING,
+                chkForceChaining.isChecked());
+        editor.putBoolean(AliroPreferences.FAST_MODE_ENABLED,
+                chkFastMode.isChecked());
+
         // Save mailbox config
         editor.putBoolean(AliroPreferences.MAILBOX_ENABLED,
                 chkMailboxEnabled.isChecked());
@@ -259,8 +399,13 @@ public class AliroConfigFragment extends Fragment
         editor.putBoolean(AliroPreferences.MAILBOX_ATOMIC,
                 chkMailboxAtomic.isChecked());
 
-        editor.apply();
+        // Use commit() (synchronous) instead of apply() (asynchronous) so that
+        // the preference is guaranteed to be on disk before the process can die
+        // between tests. This prevents CERT_DELIVERY_MODE and other settings from
+        // reverting to defaults if the Activity is recreated by the test harness.
+        editor.commit();
 
+        dirty = false;
         showStatus("Saved.", true);
     }
 
@@ -346,11 +491,11 @@ public class AliroConfigFragment extends Fragment
                 editStepUpElementId.setText("access");
             }
 
-            // Auto-fill Step-Up Issuer Public Key with the same issuer pub key
-            if (editStepUpIssuerPubKey.getText().toString().trim().isEmpty())
-            {
-                editStepUpIssuerPubKey.setText(issuerPubKey);
-            }
+            // NOTE: Do NOT auto-fill Step-Up Issuer Public Key from the Reader CA key.
+            // The Reader Issuer CA key (issuerPubKey) signs the reader certificate.
+            // The Step-Up Issuer key signs the Access/Revocation Documents on the
+            // credential side — it's a completely different keypair. Use the
+            // credential app's COPY KEY button to get the correct value.
 
             showStatus("\u2713 Reader config imported\n"
                     + "Reader ID: " + readerId.substring(0, Math.min(8, readerId.length())) + "...\n"

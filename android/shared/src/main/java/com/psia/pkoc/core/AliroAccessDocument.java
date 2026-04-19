@@ -492,6 +492,23 @@ public class AliroAccessDocument
             editor.putString(KEY_DOC_VALID_UNTIL, until.toString());
             editor.apply();
 
+            Log.d(TAG, "Generated realistic sample Access Document: " + cborBytes.length + " bytes");
+
+            // 13. Also generate paired Revocation Document with the SAME issuer keypair
+            // so both documents verify against the same issuer public key / kid.
+            // Without this, the revocation document would retain a stale issuer key
+            // from a previous generateTestDocument() call, causing kid mismatch.
+            String revocResult = generateRevocationDocument(context, elementIdentifier, validDays,
+                    issuerKP, issuerPubBytes);
+            if (revocResult != null)
+            {
+                Log.d(TAG, "Generated paired Revocation Document for sample");
+            }
+            else
+            {
+                Log.w(TAG, "Revocation Document generation failed (non-fatal)");
+            }
+
             String summary = "Sample document generated.\n"
                     + "ID: ELATEC001\n"
                     + "Element: " + elementIdentifier + "\n"
@@ -500,7 +517,6 @@ public class AliroAccessDocument
                     + "Valid until: " + until.toString().substring(0, 10) + "\n"
                     + "Issuer key: " + issuerHex.substring(0, 16) + "...\n"
                     + "Size: " + cborBytes.length + " bytes";
-            Log.d(TAG, "Generated realistic sample Access Document: " + cborBytes.length + " bytes");
             return summary;
         }
         catch (Exception e)
@@ -693,13 +709,13 @@ public class AliroAccessDocument
      *   ],
      *   3: [                            // Schedules
      *     {                             // Schedule 0: Mon-Fri 07:00-19:00 UTC
-     *       0: 1745971200,              // startPeriod: 2025-04-30 00:00:00 UTC
+     *       0: 1745996400,              // startPeriod: 2025-04-30 07:00:00 UTC (TOD=07:00)
      *       1: 1777507200,              // endPeriod:   2026-04-30 00:00:00 UTC
      *       2: [43200, 0x1F, 2, 1, 0], // 12h, Mon-Fri, Weekly, every 1 week
      *       3: 0x01                     // flags: Time_in_UTC
      *     },
      *     {                             // Schedule 1: Sat-Sun 09:00-17:00 UTC
-     *       0: 1745971200,
+     *       0: 1746003600,              // startPeriod: 2025-04-30 09:00:00 UTC (TOD=09:00)
      *       1: 1777507200,
      *       2: [28800, 0x60, 2, 1, 0], // 8h, Sat+Sun, Weekly, every 1 week
      *       3: 0x01
@@ -747,7 +763,10 @@ public class AliroAccessDocument
         accessRules.Add(rule1);
 
         // ---- Schedule 0: Weekday 07:00-19:00 UTC (Mon-Fri, recurring weekly) ----
-        // startPeriod: 2025-04-30 00:00:00 UTC = 1745971200
+        // startPeriod: 2025-04-30 07:00:00 UTC = 1745996400
+        //   The time-of-day component of startPeriod (07:00 UTC = 25200s past midnight)
+        //   defines when the recurring daily window opens. Combined with duration=43200s
+        //   (12 hours), the window is 07:00-19:00 UTC on each applicable day.
         // endPeriod:   2026-04-30 00:00:00 UTC = 1777507200
         // durationSeconds: 12 * 3600 = 43200
         // dayMask: Mon-Fri = bits 0-4 = 0x1F
@@ -762,12 +781,14 @@ public class AliroAccessDocument
         recRule0.Add(CBORObject.FromObject(0));     // ordinal: unused
 
         CBORObject schedule0 = CBORObject.NewOrderedMap();
-        schedule0.Add(CBORObject.FromObject(0), CBORObject.FromObject(1745971200L)); // startPeriod
-        schedule0.Add(CBORObject.FromObject(1), CBORObject.FromObject(1777507200L)); // endPeriod
+        schedule0.Add(CBORObject.FromObject(0), CBORObject.FromObject(1745996400L)); // startPeriod: 2025-04-30 07:00 UTC
+        schedule0.Add(CBORObject.FromObject(1), CBORObject.FromObject(1777507200L)); // endPeriod:   2026-04-30 00:00 UTC
         schedule0.Add(CBORObject.FromObject(2), recRule0);                            // recurrenceRule
         schedule0.Add(CBORObject.FromObject(3), CBORObject.FromObject(0x01));         // flags: UTC
 
         // ---- Schedule 1: Weekend 09:00-17:00 UTC (Sat-Sun, recurring weekly) ----
+        // startPeriod: 2025-04-30 09:00:00 UTC = 1746003600
+        //   TOD = 09:00 UTC = 32400s. Window = [09:00, 09:00+28800) = [09:00, 17:00) UTC.
         // durationSeconds: 8 * 3600 = 28800
         // dayMask: Sat+Sun = bits 5,6 = 0x60
         CBORObject recRule1 = CBORObject.NewArray();
@@ -778,8 +799,8 @@ public class AliroAccessDocument
         recRule1.Add(CBORObject.FromObject(0));     // ordinal: unused
 
         CBORObject schedule1 = CBORObject.NewOrderedMap();
-        schedule1.Add(CBORObject.FromObject(0), CBORObject.FromObject(1745971200L)); // startPeriod
-        schedule1.Add(CBORObject.FromObject(1), CBORObject.FromObject(1777507200L)); // endPeriod
+        schedule1.Add(CBORObject.FromObject(0), CBORObject.FromObject(1746003600L)); // startPeriod: 2025-04-30 09:00 UTC
+        schedule1.Add(CBORObject.FromObject(1), CBORObject.FromObject(1777507200L)); // endPeriod:   2026-04-30 00:00 UTC
         schedule1.Add(CBORObject.FromObject(2), recRule1);                            // recurrenceRule
         schedule1.Add(CBORObject.FromObject(3), CBORObject.FromObject(0x01));         // flags: UTC
 
