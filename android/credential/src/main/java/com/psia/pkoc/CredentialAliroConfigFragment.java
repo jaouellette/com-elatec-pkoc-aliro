@@ -74,6 +74,7 @@ public class CredentialAliroConfigFragment extends Fragment
     private TextView    txtDocumentStatus;
     private Button      btnGenerateTest;
     private Button      btnLoadSampleDoc;
+    private Button      btnAddElement;
     private Button      btnImport;
     private Button      btnClear;
     private Button      btnCopyIssuerKey;
@@ -81,7 +82,28 @@ public class CredentialAliroConfigFragment extends Fragment
     private LinearLayout layoutIssuerKey;
     private TextView    txtIssuerKeyPreview;
     private EditText    editElementId;
+    private EditText    editEmployeeId;
+    private Spinner     spinnerSchedulePreset;
     private TextView    txtStatus;
+
+    // Multi-document UI (Aliro 1.0 §8.4.2 multi-element)
+    private Spinner     spinnerStoredDocs;
+    private Button      btnCreateNewDoc;
+    private Button      btnDeleteCurrentDoc;
+    private Button      btnRefreshValidity;
+    /** True when we are programmatically updating spinnerStoredDocs and want
+     *  to suppress the OnItemSelected callback to avoid recursive refresh. */
+    private boolean     suppressDocSpinnerEvent = false;
+
+    // Edit-element-in-place UI (preserves issuer keypair / kid per §7.3)
+    private Spinner     spinnerExistingElements;
+    /** Recursion guard for spinnerExistingElements: programmatic adapter
+     *  rebuilds and selection changes from refresh shouldn't fire the
+     *  per-element form-populate handler. */
+    private boolean     suppressElemSpinnerEvent = false;
+    /** Sentinel for the "(new element…)" first row of spinnerExistingElements;
+     *  when this is selected the form is in fresh-add mode. */
+    private static final String NEW_ELEMENT_LABEL = "(new element\u2026)";
 
     // Mailbox viewer
     private TextView    txtMailboxSize;
@@ -95,6 +117,19 @@ public class CredentialAliroConfigFragment extends Fragment
     private static final String MAILBOX_PREF_KEY   = "mailbox";
     private static final String[] MAILBOX_SIZES       = { "64", "128", "256", "512", "1024" };
     private static final String[] MAILBOX_SIZE_LABELS  = { "64 bytes", "128 bytes", "256 bytes", "512 bytes", "1024 bytes" };
+
+    /**
+     * Schedule preset labels, in {@link AliroAccessDocument.SchedulePreset#values()}
+     * order so spinner position maps 1:1 to enum ordinal. Update both arrays
+     * together if a new preset is added on the production side.
+     */
+    private static final String[] SCHEDULE_PRESET_LABELS = {
+            "Always Allow (24x7)",
+            "Weekday + Weekend (legacy sample)",
+            "Weekday Extended (06:00-22:00)",
+            "Weekend 24h (Secure only)",
+            "Night Shift (Mon-Fri 22:00-06:00)"
+    };
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
     private final Handler         uiHandler = new Handler(Looper.getMainLooper());
@@ -123,6 +158,7 @@ public class CredentialAliroConfigFragment extends Fragment
         txtDocumentStatus  = view.findViewById(R.id.txtAccessDocStatus);
         btnGenerateTest    = view.findViewById(R.id.btnGenerateTestDoc);
         btnLoadSampleDoc   = view.findViewById(R.id.btnLoadSampleDoc);
+        btnAddElement      = view.findViewById(R.id.btnAddElement);
         btnImport          = view.findViewById(R.id.btnImportDoc);
         btnClear           = view.findViewById(R.id.btnClearDoc);
         btnCopyIssuerKey   = view.findViewById(R.id.btnCopyIssuerKey);
@@ -130,7 +166,50 @@ public class CredentialAliroConfigFragment extends Fragment
         layoutIssuerKey    = view.findViewById(R.id.layoutIssuerKey);
         txtIssuerKeyPreview = view.findViewById(R.id.txtIssuerKeyPreview);
         editElementId      = view.findViewById(R.id.editElementIdentifier);
+        editEmployeeId     = view.findViewById(R.id.editEmployeeId);
+        spinnerSchedulePreset = view.findViewById(R.id.spinnerSchedulePreset);
         txtStatus          = view.findViewById(R.id.txtCredAliroStatus);
+
+        // Multi-doc UI (Aliro 1.0 §8.4.2 multi-element)
+        spinnerStoredDocs    = view.findViewById(R.id.spinnerStoredDocs);
+        btnCreateNewDoc      = view.findViewById(R.id.btnCreateNewDoc);
+        btnDeleteCurrentDoc  = view.findViewById(R.id.btnDeleteCurrentDoc);
+        btnRefreshValidity   = view.findViewById(R.id.btnRefreshValidity);
+
+        // Edit-element UI: spinner of elements in the currently selected
+        // document. Selecting one populates the form so the user can edit
+        // it and tap "Update Element" to apply the change in place.
+        spinnerExistingElements = view.findViewById(R.id.spinnerExistingElements);
+        if (spinnerExistingElements != null)
+        {
+            spinnerExistingElements.setOnItemSelectedListener(
+                    new android.widget.AdapterView.OnItemSelectedListener()
+                    {
+                        @Override public void onItemSelected(
+                                android.widget.AdapterView<?> parent,
+                                android.view.View v, int position, long id)
+                        {
+                            if (suppressElemSpinnerEvent) return;
+                            Object selected = parent.getItemAtPosition(position);
+                            String label = (selected != null) ? selected.toString() : "";
+                            onExistingElementSelected(label);
+                        }
+                        @Override public void onNothingSelected(
+                                android.widget.AdapterView<?> parent) { }
+                    });
+        }
+
+        // Schedule Preset spinner — labels in same order as
+        // AliroAccessDocument.SchedulePreset.values() so position maps
+        // directly to enum ordinal.
+        ArrayAdapter<String> presetAdapter = new ArrayAdapter<>(
+                requireContext(), android.R.layout.simple_spinner_item, SCHEDULE_PRESET_LABELS);
+        presetAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        spinnerSchedulePreset.setAdapter(presetAdapter);
+        // Default selection: WEEKDAY_AND_WEEKEND (legacy sample) — position 1.
+        // Keeps "Generate Test Doc" / "Load Sample Doc" producing the same
+        // bytes they always did when the user hasn't picked a preset.
+        spinnerSchedulePreset.setSelection(1);
 
         // Mailbox viewer
         txtMailboxSize        = view.findViewById(R.id.txtMailboxSize);
@@ -170,6 +249,7 @@ public class CredentialAliroConfigFragment extends Fragment
 
         btnGenerateTest.setOnClickListener(v -> generateTestDocument());
         btnLoadSampleDoc.setOnClickListener(v -> loadSampleDocument());
+        btnAddElement.setOnClickListener(v -> addElementToDocument());
         btnImport.setOnClickListener(v -> showImportDialog());
         btnClear.setOnClickListener(v -> clearDocument());
         btnCopyIssuerKey.setOnClickListener(v -> copyIssuerKeyToClipboard());
@@ -177,6 +257,21 @@ public class CredentialAliroConfigFragment extends Fragment
         btnInitMailbox.setOnClickListener(v -> initializeMailbox());
         btnLoadSampleMailbox.setOnClickListener(v -> loadSampleMailbox());
         btnClearMailbox.setOnClickListener(v -> clearMailbox());
+
+        // Multi-doc handlers
+        btnCreateNewDoc.setOnClickListener(v -> showCreateNewDocumentDialog());
+        btnDeleteCurrentDoc.setOnClickListener(v -> confirmDeleteCurrentDocument());
+        btnRefreshValidity.setOnClickListener(v -> confirmRefreshValidity());
+        spinnerStoredDocs.setOnItemSelectedListener(new android.widget.AdapterView.OnItemSelectedListener()
+        {
+            @Override
+            public void onItemSelected(android.widget.AdapterView<?> parent, View v, int pos, long id)
+            {
+                if (suppressDocSpinnerEvent) return;
+                onStoredDocSelected(pos);
+            }
+            @Override public void onNothingSelected(android.widget.AdapterView<?> parent) { }
+        });
     }
 
     @Override
@@ -376,42 +471,77 @@ public class CredentialAliroConfigFragment extends Fragment
     private void refreshDocumentStatus()
     {
         if (!isAdded()) return;
-        SharedPreferences prefs = requireContext()
-                .getSharedPreferences(AliroAccessDocument.PREFS_NAME, Context.MODE_PRIVATE);
 
-        boolean hasDoc = prefs.contains(AliroAccessDocument.KEY_ACCESS_DOC);
-        if (!hasDoc)
+        // Update the multi-doc spinner first so the rest of the status text
+        // reflects the currently-selected document.
+        refreshStoredDocsSpinner();
+
+        Context ctx  = requireContext();
+        String docId = AliroAccessDocument.getCurrentDocumentId(ctx);
+
+        if (docId == null)
         {
             txtDocumentStatus.setText("No Access Document stored.");
-            txtDocumentStatus.setTextColor(requireContext().getColor(android.R.color.darker_gray));
+            txtDocumentStatus.setTextColor(ctx.getColor(android.R.color.darker_gray));
             btnClear.setEnabled(false);
+            btnDeleteCurrentDoc.setEnabled(false);
+            layoutIssuerKey.setVisibility(View.GONE);
             return;
         }
 
-        String mode       = prefs.getString(AliroAccessDocument.KEY_DOC_MODE,        "\u2014");
-        String elementId  = prefs.getString(AliroAccessDocument.KEY_ELEMENT_ID,      "\u2014");
-        String validUntil = prefs.getString(AliroAccessDocument.KEY_DOC_VALID_UNTIL, "\u2014");
-        String issuerHex  = prefs.getString(AliroAccessDocument.KEY_ISSUER_PUB_KEY,  "");
-        byte[] docBytes   = AliroAccessDocument.getDocumentBytes(requireContext());
+        String mode       = AliroAccessDocument.getDocumentMode(ctx, docId);
+        if (mode.isEmpty()) mode = "\u2014";
+        String validUntil = AliroAccessDocument.getDocumentValidUntil(ctx, docId);
+        if (validUntil.isEmpty()) validUntil = "\u2014";
+        String issuerHex  = AliroAccessDocument.getIssuerPubKeyHex(ctx, docId);
+        byte[] docBytes   = AliroAccessDocument.getDocumentBytes(ctx, docId);
         int size          = docBytes != null ? docBytes.length : 0;
 
-        // Show validity date shortened
+        java.util.List<String> elementIds =
+                AliroAccessDocument.getElementIdentifiers(ctx, docId);
+        String elementsLine;
+        if (elementIds.isEmpty())
+        {
+            elementsLine = "Elements: \u2014 (empty document — add an element)";
+        }
+        else if (elementIds.size() == 1)
+        {
+            elementsLine = "Element: " + elementIds.get(0);
+        }
+        else
+        {
+            StringBuilder sb = new StringBuilder("Elements (").append(elementIds.size()).append("): ");
+            for (int i = 0; i < elementIds.size(); i++)
+            {
+                if (i > 0) sb.append(", ");
+                sb.append(elementIds.get(i));
+            }
+            elementsLine = sb.toString();
+        }
+
+        // Position-of-N for context.
+        int totalDocs = AliroAccessDocument.getDocumentIds(ctx).size();
+        int idxOfThis = AliroAccessDocument.getDocumentIds(ctx).indexOf(docId) + 1;
+        String headerLine = "Document " + idxOfThis + " of " + totalDocs
+                + ": " + AliroAccessDocument.getDocumentLabel(ctx, docId);
+
         if (validUntil.length() > 10) validUntil = validUntil.substring(0, 10);
 
-        String status = "Mode: " + mode.toUpperCase() + "\n"
-                + "Element ID: " + elementId + "\n"
+        String status = headerLine + "\n"
+                + "Mode: " + mode.toUpperCase() + "\n"
+                + elementsLine + "\n"
                 + "Valid until: " + (validUntil.isEmpty() ? "unknown" : validUntil) + "\n"
                 + "Size: " + size + " bytes";
 
         txtDocumentStatus.setText(status);
-        txtDocumentStatus.setTextColor(requireContext().getColor(R.color.colorAccent));
-        btnClear.setEnabled(true);
+        txtDocumentStatus.setTextColor(ctx.getColor(R.color.colorAccent));
+        btnClear.setEnabled(docBytes != null);
+        btnDeleteCurrentDoc.setEnabled(true);
 
-        // Show issuer key row if a key is available
+        // Show issuer key row if a key is available for this document
         if (!issuerHex.isEmpty())
         {
             layoutIssuerKey.setVisibility(View.VISIBLE);
-            // Preview: first 16 chars + "…" + last 8 chars
             String preview = issuerHex.length() > 24
                     ? issuerHex.substring(0, 16) + "\u2026" + issuerHex.substring(issuerHex.length() - 8)
                     : issuerHex;
@@ -422,11 +552,334 @@ public class CredentialAliroConfigFragment extends Fragment
             layoutIssuerKey.setVisibility(View.GONE);
         }
 
-        // Pre-fill element ID field
-        if (editElementId.getText().toString().isEmpty())
+        // Repopulate the existing-elements spinner. The form fields are
+        // controlled by whichever element is selected there; we don't pre-fill
+        // editElementId here anymore (the spinner handler does it).
+        refreshExistingElementsSpinner();
+    }
+
+    /**
+     * Repopulate the Stored Documents spinner with one entry per stored
+     * document. Each label shows {@code "<userLabel> — kid: xxxxxxxx —
+     * N elements"} so the user can tell them apart at a glance. The
+     * current document is auto-selected.
+     */
+    private void refreshStoredDocsSpinner()
+    {
+        if (!isAdded() || spinnerStoredDocs == null) return;
+        Context ctx = requireContext();
+        java.util.List<String> ids = AliroAccessDocument.getDocumentIds(ctx);
+        java.util.List<String> labels = new java.util.ArrayList<>();
+        if (ids.isEmpty())
         {
-            editElementId.setText(elementId);
+            labels.add("(no documents stored)");
         }
+        else
+        {
+            for (String id : ids)
+            {
+                String label = AliroAccessDocument.getDocumentLabel(ctx, id);
+                String pubHex = AliroAccessDocument.getIssuerPubKeyHex(ctx, id);
+                String kid = "????";
+                if (pubHex != null && pubHex.length() >= 16)
+                {
+                    // Mirror computeKidHex logic for display: SHA-256("key-identifier" || pub)[0:8]
+                    try
+                    {
+                        java.security.MessageDigest sha = java.security.MessageDigest.getInstance("SHA-256");
+                        sha.update("key-identifier".getBytes());
+                        sha.update(org.bouncycastle.util.encoders.Hex.decode(pubHex));
+                        byte[] digest = sha.digest();
+                        kid = org.bouncycastle.util.encoders.Hex.toHexString(
+                                java.util.Arrays.copyOfRange(digest, 0, 8));
+                    }
+                    catch (Exception ignore) { }
+                }
+                int elemCount = AliroAccessDocument.getElementIdentifiers(ctx, id).size();
+                labels.add(label + "  \u2014  kid: " + kid + "\u2026  \u2014  "
+                        + elemCount + " elem" + (elemCount == 1 ? "" : "s"));
+            }
+        }
+        ArrayAdapter<String> adapter = new ArrayAdapter<>(
+                ctx, android.R.layout.simple_spinner_item, labels);
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+
+        suppressDocSpinnerEvent = true;
+        try
+        {
+            spinnerStoredDocs.setAdapter(adapter);
+            spinnerStoredDocs.setEnabled(!ids.isEmpty());
+            String current = AliroAccessDocument.getCurrentDocumentId(ctx);
+            if (current != null)
+            {
+                int idx = ids.indexOf(current);
+                if (idx >= 0) spinnerStoredDocs.setSelection(idx);
+            }
+        }
+        finally { suppressDocSpinnerEvent = false; }
+    }
+
+    /** Spinner-selection callback: switch the current document. */
+    private void onStoredDocSelected(int position)
+    {
+        if (!isAdded()) return;
+        Context ctx = requireContext();
+        java.util.List<String> ids = AliroAccessDocument.getDocumentIds(ctx);
+        if (position < 0 || position >= ids.size()) return;
+        String docId = ids.get(position);
+        if (docId.equals(AliroAccessDocument.getCurrentDocumentId(ctx))) return;
+        AliroAccessDocument.setCurrentDocumentId(ctx, docId);
+        refreshDocumentStatus();
+        showStatus("Selected: " + AliroAccessDocument.getDocumentLabel(ctx, docId), true);
+    }
+
+    /**
+     * Repopulate the Existing Elements spinner with one entry per element
+     * in the currently selected document, plus a "(new element…)" sentinel
+     * as the first row. Selection is preserved when possible: if the
+     * previously-selected element label still exists we keep it; otherwise
+     * fall back to "(new element…)" so the form is in fresh-add mode.
+     *
+     * <p>Programmatically rebuilding the adapter triggers OnItemSelected, so
+     * the call is bracketed by {@link #suppressElemSpinnerEvent} to avoid
+     * spuriously clobbering the form fields the user is typing into.
+     */
+    private void refreshExistingElementsSpinner()
+    {
+        if (!isAdded() || spinnerExistingElements == null) return;
+        Context ctx = requireContext();
+        String docId = AliroAccessDocument.getCurrentDocumentId(ctx);
+
+        // Capture previous selection so we can preserve it across a refresh
+        Object prevSelObj = spinnerExistingElements.getSelectedItem();
+        String prevSel    = prevSelObj != null ? prevSelObj.toString() : null;
+
+        java.util.List<String> labels = new java.util.ArrayList<>();
+        labels.add(NEW_ELEMENT_LABEL);
+        if (docId != null)
+        {
+            labels.addAll(AliroAccessDocument.getElementIdentifiers(ctx, docId));
+        }
+
+        suppressElemSpinnerEvent = true;
+        try
+        {
+            ArrayAdapter<String> adapter = new ArrayAdapter<>(
+                    ctx, android.R.layout.simple_spinner_item, labels);
+            adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+            spinnerExistingElements.setAdapter(adapter);
+
+            int selPos = 0; // default: "(new element…)"
+            if (prevSel != null)
+            {
+                int idx = labels.indexOf(prevSel);
+                if (idx >= 0) selPos = idx;
+            }
+            spinnerExistingElements.setSelection(selPos);
+        }
+        finally
+        {
+            suppressElemSpinnerEvent = false;
+        }
+
+        // Apply button label / form state for the (possibly reset) selection
+        Object cur = spinnerExistingElements.getSelectedItem();
+        applyExistingElementSelectionToForm(cur != null ? cur.toString() : NEW_ELEMENT_LABEL,
+                                             /* populateForm = */ false);
+    }
+
+    /**
+     * Called when the user picks a row in the Existing Elements spinner.
+     * If the row is "(new element…)", clear the form for a fresh add and
+     * reset the action button to "Add Element to Document". Otherwise
+     * load that element's stored {@link AliroAccessDocument.AccessDocConfig}
+     * back into the form fields and switch the action button to
+     * "Update Element".
+     */
+    private void onExistingElementSelected(String label)
+    {
+        applyExistingElementSelectionToForm(label, /* populateForm = */ true);
+    }
+
+    /**
+     * Shared body for spinner-driven selection + post-refresh re-application.
+     * When {@code populateForm} is false we only update the button label /
+     * editability state (used during refresh so we don't overwrite fields
+     * the user is mid-typing). When true we also load the stored values.
+     */
+    private void applyExistingElementSelectionToForm(String label, boolean populateForm)
+    {
+        if (label == null) label = NEW_ELEMENT_LABEL;
+        boolean isNew = NEW_ELEMENT_LABEL.equals(label);
+
+        if (btnAddElement != null)
+        {
+            btnAddElement.setText(isNew ? "Add Element to Document" : "Update Element");
+        }
+
+        if (!populateForm) return;
+
+        if (isNew)
+        {
+            // Fresh-add mode: clear form so the user starts clean. Don't
+            // wipe the schedule preset spinner — leave whatever the user
+            // last picked, since "(new element…)" right after editing
+            // floor1 likely intends a similar config for floor2.
+            if (editElementId  != null) editElementId.setText("");
+            if (editEmployeeId != null) editEmployeeId.setText("");
+            return;
+        }
+
+        // Edit mode: load the stored element's config into the form.
+        Context ctx = requireContext();
+        String docId = AliroAccessDocument.getCurrentDocumentId(ctx);
+        AliroAccessDocument.AccessDocConfig cfg =
+                AliroAccessDocument.getElementConfig(ctx, docId, label);
+        if (cfg == null)
+        {
+            showStatus("Could not load element '" + label
+                    + "'. Pick a Schedule Preset to overwrite.", false);
+            if (editElementId  != null) editElementId.setText(label);
+            if (editEmployeeId != null) editEmployeeId.setText("");
+            return;
+        }
+
+        if (editElementId  != null) editElementId.setText(cfg.name);
+        if (editEmployeeId != null) editEmployeeId.setText(cfg.employeeId);
+        if (spinnerSchedulePreset != null && cfg.preset != null)
+        {
+            int ord = cfg.preset.ordinal();
+            if (ord >= 0 && ord < spinnerSchedulePreset.getCount())
+            {
+                spinnerSchedulePreset.setSelection(ord);
+            }
+        }
+        showStatus("Loaded '" + label + "' for editing. Tap Update Element to apply.", true);
+    }
+
+    /**
+     * Prompt the user for a label, then create a new empty document slot
+     * with a fresh issuer keypair (Aliro 1.0 §8.4.2). The new document
+     * becomes the current document; existing documents are preserved.
+     */
+    private void showCreateNewDocumentDialog()
+    {
+        if (!isAdded()) return;
+        Context ctx = requireContext();
+        int next = AliroAccessDocument.getDocumentIds(ctx).size() + 1;
+        final EditText input = new EditText(ctx);
+        input.setHint("Document " + next);
+        input.setSingleLine(true);
+
+        new androidx.appcompat.app.AlertDialog.Builder(ctx)
+                .setTitle("Create New Document")
+                .setMessage("Each document has its own issuer keypair (its own kid). The reader needs the matching Step-Up Issuer Public Key for each document it should trust. Per Aliro 1.0 §8.4.2.")
+                .setView(input)
+                .setPositiveButton("Create", (dlg, which) ->
+                {
+                    String label = input.getText().toString().trim();
+                    if (label.isEmpty()) label = "Document " + (AliroAccessDocument.getDocumentIds(ctx).size() + 1);
+                    String docId = AliroAccessDocument.createNewDocument(ctx, label);
+                    if (docId != null)
+                    {
+                        showStatus("\u2713 Created '" + label + "' (empty). Add an element to populate it.", true);
+                        refreshDocumentStatus();
+                    }
+                    else
+                    {
+                        showStatus("Failed to create document. Check logs.", false);
+                    }
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    /** Confirm + delete the currently-selected document. */
+    private void confirmDeleteCurrentDocument()
+    {
+        if (!isAdded()) return;
+        Context ctx = requireContext();
+        String docId = AliroAccessDocument.getCurrentDocumentId(ctx);
+        if (docId == null)
+        {
+            showStatus("No document selected.", false);
+            return;
+        }
+        String label = AliroAccessDocument.getDocumentLabel(ctx, docId);
+        new androidx.appcompat.app.AlertDialog.Builder(ctx)
+                .setTitle("Delete Document?")
+                .setMessage("This will delete '" + label + "' (docId=" + docId
+                        + ") and its issuer keypair. The reader will no longer be able to verify this document. Existing other documents are unaffected.")
+                .setPositiveButton("Delete", (dlg, which) ->
+                {
+                    AliroAccessDocument.removeDocument(ctx, docId);
+                    showStatus("\u2713 Deleted '" + label + "'.", true);
+                    refreshDocumentStatus();
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    /**
+     * Confirm + refresh the validity window of the currently-selected
+     * document. Bumps the document-level validUntil to {@code now + 5y}
+     * and rewrites every schedule's endPeriod to 2030-01-01 (matching
+     * {@code FAR_FUTURE_END_PERIOD} on the storage side). The issuer
+     * keypair is reused so kid stays stable per Aliro 1.0 §7.3 / §8.4.2.
+     */
+    private void confirmRefreshValidity()
+    {
+        if (!isAdded()) return;
+        Context ctx = requireContext();
+        String docId = AliroAccessDocument.getCurrentDocumentId(ctx);
+        if (docId == null)
+        {
+            showStatus("No document selected.", false);
+            return;
+        }
+        String label = AliroAccessDocument.getDocumentLabel(ctx, docId);
+
+        // Compute new endpoints. Document validUntil = now + 5y; per-schedule
+        // endPeriod = 2030-01-01 00:00 UTC. Both are spec-conformant uint32
+        // epoch seconds, well past any near-term test horizon, and applied
+        // identically to every element regardless of preset.
+        final long FAR_FUTURE_END_EPOCH = 1893456000L; // 2030-01-01 00:00 UTC
+        final int  FIVE_YEARS_DAYS      = 5 * 365;
+
+        new androidx.appcompat.app.AlertDialog.Builder(ctx)
+                .setTitle("Refresh Validity?")
+                .setMessage("Bump '" + label + "'\u2019s validity to expire "
+                        + FIVE_YEARS_DAYS + " days from now and rewrite every schedule's "
+                        + "endPeriod to 2030-01-01. The issuer keypair (and kid) are "
+                        + "preserved \u2014 no reader changes needed. AccessRules, "
+                        + "Capabilities, dayMasks, and time-of-day windows are all kept "
+                        + "as-is.")
+                .setPositiveButton("Refresh", (dlg, which) ->
+                {
+                    btnRefreshValidity.setEnabled(false);
+                    showStatus("Refreshing validity for '" + label + "'\u2026", false);
+                    executor.execute(() ->
+                    {
+                        String result = AliroAccessDocument.refreshDocumentValidity(
+                                ctx, docId, FIVE_YEARS_DAYS, FAR_FUTURE_END_EPOCH);
+                        uiHandler.post(() ->
+                        {
+                            if (!isAdded()) return;
+                            btnRefreshValidity.setEnabled(true);
+                            if (result != null)
+                            {
+                                showStatus("\u2713 " + result, true);
+                                refreshDocumentStatus();
+                            }
+                            else
+                            {
+                                showStatus("Failed to refresh validity. Check logs.", false);
+                            }
+                        });
+                    });
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
     }
 
     // -------------------------------------------------------------------------
@@ -532,6 +985,153 @@ public class CredentialAliroConfigFragment extends Fragment
     }
 
     // -------------------------------------------------------------------------
+    // Add element to existing document (multi-element support per Aliro §7.3)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Add another element to the currently stored Access Document, reusing its
+     * issuer keypair so the kid stays stable. If no document is stored yet,
+     * this creates a new one — same end result as Load Sample Doc, but the
+     * mental model from the user's perspective is "I'm building up the set of
+     * elements this credential carries."
+     *
+     * Per Aliro 1.0 §7.3, an Access Document may contain multiple
+     * IssuerSignedItems sharing one IssuerAuth. The reader configures which
+     * single element it requests via Step-Up Element ID; switching from
+     * "floor1" to "floor2" without re-importing the issuer key now works
+     * because both are signed by the same persistent key.
+     */
+    private void addElementToDocument()
+    {
+        String elementId = editElementId.getText().toString().trim();
+        if (TextUtils.isEmpty(elementId))
+        {
+            showStatus("Enter an Element Identifier first (e.g. floor1, floor2).", false);
+            return;
+        }
+
+        // Detect edit-vs-add based on the existing-elements spinner: if the
+        // user picked an existing element row, we're updating in place
+        // (storage layer reuses the issuer keypair → kid is preserved).
+        final boolean isUpdate = isEditingExistingElement();
+        final String verbing = isUpdate ? "Updating" : "Adding";
+        final String verbed  = isUpdate ? "Updated"  : "Added";
+
+        final AliroAccessDocument.AccessDocConfig config = currentDocConfig(elementId);
+        showStatus(verbing + " element '" + elementId + "' (id="
+                + config.employeeId + ", preset=" + config.preset.name() + ")...", false);
+        btnAddElement.setEnabled(false);
+
+        executor.execute(() ->
+        {
+            byte[] credPubKeyBytes = getCredentialPublicKeyBytes();
+            if (credPubKeyBytes == null)
+            {
+                uiHandler.post(() ->
+                {
+                    if (!isAdded()) return;
+                    showStatus("Credential keypair not found. Open the main screen first.", false);
+                    btnAddElement.setEnabled(true);
+                });
+                return;
+            }
+
+            // Honor the per-document Employee/Badge ID + Schedule Preset
+            // pulled from the UI. Each Add Element call appends a fresh
+            // IssuerSignedItem to the existing document with these custom
+            // values, so stored elements are visibly distinct when the
+            // verifier reads them back. The issuer keypair is reused so kid
+            // stays stable across the whole multi-element document
+            // (Aliro 1.0 §7.3). When elementId matches an existing entry the
+            // storage layer replaces it in place — same code path serves
+            // both add and edit.
+            String result = AliroAccessDocument.addAccessElement(
+                    requireContext(), credPubKeyBytes, elementId, 365, config);
+
+            uiHandler.post(() ->
+            {
+                if (!isAdded()) return;
+                btnAddElement.setEnabled(true);
+                if (result != null)
+                {
+                    showStatus("\u2713 " + verbed + ": " + result, true);
+                    refreshDocumentStatus();
+                    // Keep the just-saved element selected so the user can
+                    // see it in the spinner. refreshExistingElementsSpinner
+                    // ran via refreshDocumentStatus and may have reset to
+                    // "(new element…)"; explicitly re-select the saved id.
+                    selectExistingElementInSpinner(elementId);
+                }
+                else
+                {
+                    showStatus("Failed to " + (isUpdate ? "update" : "add")
+                            + " element. Check logs.", false);
+                }
+            });
+        });
+    }
+
+    /**
+     * @return true when the existing-elements spinner currently has a real
+     *         element selected (i.e. anything other than "(new element…)").
+     */
+    private boolean isEditingExistingElement()
+    {
+        if (spinnerExistingElements == null) return false;
+        Object cur = spinnerExistingElements.getSelectedItem();
+        return cur != null && !NEW_ELEMENT_LABEL.equals(cur.toString());
+    }
+
+    /**
+     * Move the existing-elements spinner selection to the named element if
+     * it's present in the adapter. Used after a save so the just-saved row
+     * stays highlighted.
+     */
+    private void selectExistingElementInSpinner(String elementId)
+    {
+        if (spinnerExistingElements == null || elementId == null) return;
+        ArrayAdapter<?> adapter = (ArrayAdapter<?>) spinnerExistingElements.getAdapter();
+        if (adapter == null) return;
+        for (int i = 0; i < adapter.getCount(); i++)
+        {
+            Object item = adapter.getItem(i);
+            if (item != null && elementId.equals(item.toString()))
+            {
+                suppressElemSpinnerEvent = true;
+                try { spinnerExistingElements.setSelection(i); }
+                finally { suppressElemSpinnerEvent = false; }
+                applyExistingElementSelectionToForm(elementId, /* populateForm = */ false);
+                return;
+            }
+        }
+    }
+
+    /**
+     * Read the current per-document configuration from the UI fields:
+     * Element Identifier (passed in), Employee/Badge ID (defaults to
+     * "ELATEC001" if blank), and Schedule Preset (spinner position →
+     * AliroAccessDocument.SchedulePreset enum value).
+     */
+    private AliroAccessDocument.AccessDocConfig currentDocConfig(String elementId)
+    {
+        String employeeId = editEmployeeId != null
+                ? editEmployeeId.getText().toString().trim()
+                : "";
+        if (TextUtils.isEmpty(employeeId)) employeeId = "ELATEC001";
+
+        AliroAccessDocument.SchedulePreset preset =
+                AliroAccessDocument.SchedulePreset.WEEKDAY_AND_WEEKEND;
+        if (spinnerSchedulePreset != null)
+        {
+            int pos = spinnerSchedulePreset.getSelectedItemPosition();
+            AliroAccessDocument.SchedulePreset[] all =
+                    AliroAccessDocument.SchedulePreset.values();
+            if (pos >= 0 && pos < all.length) preset = all[pos];
+        }
+        return new AliroAccessDocument.AccessDocConfig(elementId, employeeId, preset);
+    }
+
+    // -------------------------------------------------------------------------
     // Import document
     // -------------------------------------------------------------------------
 
@@ -595,30 +1195,44 @@ public class CredentialAliroConfigFragment extends Fragment
     private void copyIssuerKeyToClipboard()
     {
         if (!isAdded()) return;
-        SharedPreferences prefs = requireContext()
-                .getSharedPreferences(AliroAccessDocument.PREFS_NAME, Context.MODE_PRIVATE);
-        String issuerHex = prefs.getString(AliroAccessDocument.KEY_ISSUER_PUB_KEY, "");
-        if (issuerHex.isEmpty())
+        Context ctx = requireContext();
+        String docId = AliroAccessDocument.getCurrentDocumentId(ctx);
+        if (docId == null)
         {
-            showStatus("No issuer key stored.", false);
+            showStatus("No document selected — create one first.", false);
+            return;
+        }
+        String issuerHex = AliroAccessDocument.getIssuerPubKeyHex(ctx, docId);
+        if (issuerHex == null || issuerHex.isEmpty())
+        {
+            showStatus("No issuer key stored for this document.", false);
             return;
         }
         ClipboardManager clipboard = (ClipboardManager)
-                requireContext().getSystemService(Context.CLIPBOARD_SERVICE);
+                ctx.getSystemService(Context.CLIPBOARD_SERVICE);
         ClipData clip = ClipData.newPlainText("Aliro Issuer Public Key", issuerHex);
         clipboard.setPrimaryClip(clip);
-        showStatus("Issuer key copied to clipboard.", true);
+        String label = AliroAccessDocument.getDocumentLabel(ctx, docId);
+        showStatus("Issuer key for '" + label + "' copied to clipboard.\n"
+                + "Paste into the reader's Step-Up Issuer Public Key field. "
+                + "If the reader already has keys for other documents, append "
+                + "this one with a comma in between.", true);
     }
 
     private void showIssuerKeyQrDialog()
     {
         if (!isAdded()) return;
-        SharedPreferences prefs = requireContext()
-                .getSharedPreferences(AliroAccessDocument.PREFS_NAME, Context.MODE_PRIVATE);
-        String issuerHex = prefs.getString(AliroAccessDocument.KEY_ISSUER_PUB_KEY, "");
-        if (issuerHex.isEmpty())
+        Context ctx = requireContext();
+        String docId = AliroAccessDocument.getCurrentDocumentId(ctx);
+        if (docId == null)
         {
-            showStatus("No issuer key stored.", false);
+            showStatus("No document selected — create one first.", false);
+            return;
+        }
+        String issuerHex = AliroAccessDocument.getIssuerPubKeyHex(ctx, docId);
+        if (issuerHex == null || issuerHex.isEmpty())
+        {
+            showStatus("No issuer key stored for this document.", false);
             return;
         }
 
@@ -629,14 +1243,18 @@ public class CredentialAliroConfigFragment extends Fragment
             return;
         }
 
-        ImageView imageView = new ImageView(requireContext());
+        ImageView imageView = new ImageView(ctx);
         imageView.setImageBitmap(qrBitmap);
-        int padding = (int)(24 * requireContext().getResources().getDisplayMetrics().density);
+        int padding = (int)(24 * ctx.getResources().getDisplayMetrics().density);
         imageView.setPadding(padding, padding, padding, padding);
 
-        new AlertDialog.Builder(requireContext())
-                .setTitle("Scan on Reader Device")
-                .setMessage("Scan this QR code in the simulator\u2019s Aliro Config \u2192 Step-Up Issuer Public Key field.")
+        String label = AliroAccessDocument.getDocumentLabel(ctx, docId);
+        new AlertDialog.Builder(ctx)
+                .setTitle("Issuer Public Key — " + label)
+                .setMessage("Scan this QR code in the reader\u2019s Aliro Config \u2192 "
+                        + "Step-Up Issuer Public Key field. "
+                        + "If the reader already trusts other documents, append this "
+                        + "one with a comma after scanning (Aliro 1.0 \u00a77.7).")
                 .setView(imageView)
                 .setPositiveButton("Done", null)
                 .show();
@@ -668,13 +1286,24 @@ public class CredentialAliroConfigFragment extends Fragment
 
     private void clearDocument()
     {
-        new AlertDialog.Builder(requireContext())
-                .setTitle("Clear Access Document")
-                .setMessage("Remove the stored Access Document? The credential will still work for expedited-phase transactions.")
+        Context ctx = requireContext();
+        String docId = AliroAccessDocument.getCurrentDocumentId(ctx);
+        if (docId == null)
+        {
+            showStatus("No document to clear.", false);
+            return;
+        }
+        String label = AliroAccessDocument.getDocumentLabel(ctx, docId);
+        new AlertDialog.Builder(ctx)
+                .setTitle("Clear Document")
+                .setMessage("Remove the currently-selected Access Document ('" + label
+                        + "')? Other stored documents are unaffected. The credential "
+                        + "will still work for expedited-phase transactions and other "
+                        + "stored documents.")
                 .setPositiveButton("Clear", (d, w) ->
                 {
-                    AliroAccessDocument.clearDocument(requireContext());
-                    showStatus("Access Document cleared.", true);
+                    AliroAccessDocument.clearDocument(ctx);
+                    showStatus("Document '" + label + "' cleared.", true);
                     refreshDocumentStatus();
                 })
                 .setNegativeButton("Cancel", null)

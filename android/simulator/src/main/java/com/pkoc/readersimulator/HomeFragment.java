@@ -154,6 +154,8 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
     private ImageView readerImageView;
     private LinearLayout keypadLayout;
     private boolean keypadPositioned = false;
+    /** Cached ScrollView so setKeypadVisibility() can flip its bottom anchor in lockstep. */
+    private android.view.View scrollViewForResultArea;
 
     private TextView pinDisplay;
     private boolean isDisplayingResult = false;
@@ -225,6 +227,9 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
 
                     // Parse step-up result using the SAME full verifier as NFC
                     // Both transports must produce identical verification results.
+                    // Multi-element responses (Aliro 1.0 §8.4.2) are sliced
+                    // into one DeviceResponse per document so each is verified
+                    // by the same single-doc verifier path the NFC flow uses.
                     String bleStepUpResult = null;
                     if (deviceResponse != null)
                     {
@@ -233,22 +238,58 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                             byte[] credPubKeyBytes = (credPubKeyHex != null && !credPubKeyHex.isEmpty())
                                     ? org.bouncycastle.util.encoders.Hex.decode(credPubKeyHex) : null;
 
-                            // Load step-up issuer key and element ID from prefs (same as NFC path)
+                            // Load step-up issuer key(s) and element ID from prefs.
+                            // The Step-Up Issuer Public Key field accepts a single
+                            // hex value or a CSV list (Aliro 1.0 §7.7) — multiple
+                            // stored documents may carry different issuers.
                             SharedPreferences stepUpPrefs = requireActivity().getPreferences(Context.MODE_PRIVATE);
                             String issuerKeyHex = stepUpPrefs.getString(AliroPreferences.STEP_UP_ISSUER_PUB_KEY, "");
-                            byte[] issuerPubKey = issuerKeyHex.isEmpty() ? null
-                                    : org.bouncycastle.util.encoders.Hex.decode(issuerKeyHex);
+                            java.util.List<byte[]> trustedIssuerKeys = parseIssuerPubKeyList(issuerKeyHex);
 
                             // Determine docType: prefer aliro-a (access) over aliro-r (revocation)
                             String docType = "aliro-a";
 
-                            AliroAccessDocumentVerifier.VerificationResult verifyResult =
-                                    AliroAccessDocumentVerifier.verifyDocument(
-                                            deviceResponse, docType, credPubKeyBytes,
-                                            stepUpElemId, issuerPubKey);
+                            java.util.List<String> requestedIds = parseElementIdList(stepUpElemId);
+                            java.util.List<byte[]> slices = sliceDeviceResponsePerDocument(deviceResponse);
 
-                            lastDocVerifyResult = verifyResult;
-                            bleStepUpResult = verifyResult.stepUpResultText;
+                            if (slices.isEmpty())
+                            {
+                                byte[] fallbackKey = trustedIssuerKeys.isEmpty() ? null : trustedIssuerKeys.get(0);
+                                AliroAccessDocumentVerifier.VerificationResult verifyResult =
+                                        AliroAccessDocumentVerifier.verifyDocument(
+                                                deviceResponse, docType, credPubKeyBytes,
+                                                requestedIds.get(0), fallbackKey);
+                                lastDocVerifyResult = verifyResult;
+                                bleStepUpResult = verifyResult.stepUpResultText;
+                            }
+                            else
+                            {
+                                StringBuilder combined = new StringBuilder();
+                                AliroAccessDocumentVerifier.VerificationResult lastVr = null;
+                                for (int i = 0; i < slices.size(); i++)
+                                {
+                                    String sliceElementId = (i < requestedIds.size())
+                                            ? requestedIds.get(i)
+                                            : requestedIds.get(requestedIds.size() - 1);
+                                    byte[] sliceIssuerKey = trustedIssuerKeys.isEmpty()
+                                            ? null
+                                            : pickIssuerKeyForKid(slices.get(i), trustedIssuerKeys);
+                                    AliroAccessDocumentVerifier.VerificationResult vr =
+                                            AliroAccessDocumentVerifier.verifyDocument(
+                                                    slices.get(i), docType, credPubKeyBytes,
+                                                    sliceElementId, sliceIssuerKey);
+                                    lastVr = vr;
+                                    if (vr.stepUpResultText != null && !vr.stepUpResultText.isEmpty())
+                                    {
+                                        if (combined.length() > 0) combined.append("\n\n");
+                                        combined.append(vr.stepUpResultText);
+                                    }
+                                }
+                                lastDocVerifyResult = lastVr;
+                                bleStepUpResult = (combined.length() > 0)
+                                        ? combined.toString()
+                                        : (lastVr != null ? lastVr.stepUpResultText : null);
+                            }
                             Log.d(TAG, "BLE Step-Up verification: " + bleStepUpResult);
                         }
                         catch (Exception e)
@@ -314,8 +355,7 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                     connectionType = formatAliroConnectionType("BLE", sigValid, bleStepUpResult, bleMailboxParsed);
 
                     // Show the credential result screen — same as Aliro NFC
-                    readerImageView.setVisibility(View.GONE);
-                    keypadLayout.setVisibility(View.GONE);
+                    setKeypadVisibility(View.GONE);
                     displayPublicKeyInfo(credPubKeyHex, connectionType);
 
                     ToneGenerator toneGen = new ToneGenerator(AudioManager.STREAM_RING, 100);
@@ -390,19 +430,42 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
         keypadLayout = view.findViewById(R.id.keypadLayout);
         keypadPositioned = false;
 
+        // ---------------------------------------------------------------
+        // Adaptive ScrollView bottom constraint
+        // ---------------------------------------------------------------
+        // The fragment_home.xml layout clamps the ScrollView's bottom to
+        // guidelineKeypadTop (55%) so the protocol toggle + buttons can never
+        // spill into the keypad's first row. That works perfectly while the
+        // keypad is visible, but during a result display we hide both the
+        // reader image and the keypad — and the guideline doesn't move with
+        // them. The ScrollView would then waste the lower 45% of the screen,
+        // truncating long Aliro multi-element verification results.
+        //
+        // We expose setKeypadVisibility(int) which both flips the keypad's
+        // visibility AND updates the ScrollView's bottom anchor in the same
+        // call, so the two stay in sync without relying on layout-pass timing
+        // (an earlier OnLayoutChangeListener attempt raced against the parent
+        // ConstraintLayout's measure pass and left the constraint stale by
+        // one frame). All keypad show/hide call sites use this helper.
+        // ---------------------------------------------------------------
+        scrollViewForResultArea = view.findViewById(R.id.scrollView);
+        // Apply initial state — keypad starts visible, so anchor to guideline.
+        applyScrollViewBottomConstraint();
+
         // Position the keypad overlay once the reader image has been measured.
-        // Using OnGlobalLayoutListener instead of post() guarantees the image
-        // has valid dimensions — post() can fire before layout is complete
-        // when the fragment view is recreated after navigating back.
+        // OnGlobalLayoutListener may fire multiple times before measurement is
+        // complete — especially when navigating back to this fragment from
+        // another screen (e.g. credential read). We hold the listener until
+        // positionKeypad returns true (image and root both have non-zero
+        // height), then remove it to avoid wasting frames.
         readerImage.getViewTreeObserver().addOnGlobalLayoutListener(
                 new android.view.ViewTreeObserver.OnGlobalLayoutListener() {
                     @Override
                     public void onGlobalLayout() {
-                        positionKeypad(readerImage, view);
-                        // Remove after first successful positioning to avoid
-                        // re-running on every subsequent layout pass.
-                        readerImage.getViewTreeObserver()
-                                .removeOnGlobalLayoutListener(this);
+                        if (positionKeypad(readerImage, view)) {
+                            readerImage.getViewTreeObserver()
+                                    .removeOnGlobalLayoutListener(this);
+                        }
                     }
                 });
 
@@ -479,13 +542,37 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
         // Refresh mode label in case LEAF mode was toggled in LEAF Config
         updateModeLabel();
 
-        // Re-position keypad if it hasn't been positioned yet (can happen
-        // when returning from another fragment and the OnGlobalLayoutListener
-        // from onViewCreated already fired before layout was ready).
-        // Also handles rotation / config changes.
-        if (!keypadPositioned && readerImageView != null && getView() != null) {
-            readerImageView.post(() -> positionKeypad(readerImageView, getView()));
-        }
+        // Always re-position the keypad on resume.
+        //
+        // The keypad is a LinearLayout of digit Buttons (R.id.keypadLayout)
+        // overlaid on the reader_background drawable. The bitmap is a portrait
+        // reader silhouette with the LED indicator and ELATEC/Allegion logos
+        // baked in across roughly the upper third; the lower portion is left
+        // blank so the keypad LinearLayout can render real buttons inside the
+        // reader's keypad area. positionKeypad() sets the keypad's pixel
+        // coordinates as 36%–94% of the reader image's measured height, which
+        // assumes the image and the root view have the dimensions they had at
+        // the moment positionKeypad() ran.
+        //
+        // When the user navigates to Aliro Config and back, the fragment may
+        // either be recreated (in which case keypadPositioned starts false) or
+        // retained (in which case it's still true from the previous session).
+        // In the retained case, the previously-computed margins may no longer
+        // match the current layout — the container can re-measure to a
+        // different size after navigation (toolbar inset re-application on
+        // Android 16, soft-keyboard dismiss, configuration changes), leaving
+        // the keypad anchored at stale coordinates. Symptom: the digit "1"
+        // button renders near the top of the bitmap at the same vertical
+        // position as the bitmap's baked-in LED indicator, and the rest of the
+        // keypad is compressed upward into the logo area.
+        //
+        // Resetting the flag and unconditionally requesting a reposition
+        // ensures a fresh measurement pass every time the fragment becomes
+        // active. requestKeypadReposition() installs a one-shot global-layout
+        // listener that retries until the image and root both have non-zero
+        // height, so this is safe even if measurement isn't ready yet.
+        keypadPositioned = false;
+        requestKeypadReposition();
 
         nfcAdapter = NfcAdapter.getDefaultAdapter(requireContext());
         if (nfcAdapter == null)
@@ -926,9 +1013,16 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                 nfcAdvertisingStatusView.setVisibility(View.VISIBLE);
                 bleAdvertisingStatusView.setVisibility(View.VISIBLE);
             }
-            readerImageView.setVisibility(View.VISIBLE);
-            keypadLayout.setVisibility(View.VISIBLE);
+            setKeypadVisibility(View.VISIBLE);
             pinDisplay.setText("");
+
+            // Re-position the keypad over the reader image. After a credential
+            // read the views have been hidden and re-shown, and on some devices
+            // the original positioning may not have completed if the layout
+            // listener fired before the image was measured. Without this call
+            // the keypad can render at its default full-parent constraints and
+            // overlap the title bar at the top of the screen.
+            requestKeypadReposition();
 
             // Reset font in case diagnostic mode changed it to monospace
             textView.setTextSize(16);
@@ -940,8 +1034,7 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
 
     private void showRdrDetails()
     {
-        readerImageView.setVisibility(View.GONE);
-        keypadLayout.setVisibility(View.GONE);
+        setKeypadVisibility(View.GONE);
         readerLocationUUIDView.setVisibility(View.VISIBLE);
         readerSiteUUIDView.setVisibility(View.VISIBLE);
         sitePublicKeyView.setVisibility(View.VISIBLE);
@@ -958,10 +1051,73 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
         sitePublicKeyView.setVisibility(View.GONE);
         nfcAdvertisingStatusView.setVisibility(View.GONE);
         bleAdvertisingStatusView.setVisibility(View.GONE);
-        readerImageView.setVisibility(View.VISIBLE);
-        keypadLayout.setVisibility(View.VISIBLE);
+        setKeypadVisibility(View.VISIBLE);
+        requestKeypadReposition();
         rdrButton.setText(R.string.show_reader_details);
         rdrButton.setOnClickListener(v -> showRdrDetails());
+    }
+
+    /**
+     * Toggle keypad + reader-image visibility AND adjust the ScrollView's
+     * bottom anchor in a single call. The two changes need to stay in sync:
+     * when the keypad is visible the ScrollView's bottom is clamped to
+     * guidelineKeypadTop (55%) so it can never overlap the keypad's first
+     * row; when the keypad is hidden during a result display the ScrollView
+     * stretches to the full screen so long Aliro multi-element results
+     * aren't truncated. All callers should use this helper rather than
+     * calling {@code keypadLayout.setVisibility()} directly.
+     *
+     * <p>Note: the readerImageView and keypadLayout always toggle together
+     * in this fragment — every existing call site sets them to the same
+     * visibility — so we handle both here.
+     */
+    private void setKeypadVisibility(int visibility)
+    {
+        if (readerImageView != null) readerImageView.setVisibility(visibility);
+        if (keypadLayout != null) keypadLayout.setVisibility(visibility);
+        applyScrollViewBottomConstraint();
+    }
+
+    /**
+     * Update the ScrollView's bottom constraint to match the current keypad
+     * visibility. Called from {@link #setKeypadVisibility(int)} and once at
+     * fragment startup to apply the initial state. Idempotent — safe to call
+     * even if no change is needed.
+     */
+    private void applyScrollViewBottomConstraint()
+    {
+        if (scrollViewForResultArea == null || keypadLayout == null) return;
+        try
+        {
+            androidx.constraintlayout.widget.ConstraintLayout.LayoutParams lp =
+                    (androidx.constraintlayout.widget.ConstraintLayout.LayoutParams)
+                            scrollViewForResultArea.getLayoutParams();
+            if (keypadLayout.getVisibility() == View.VISIBLE)
+            {
+                // Clamp ScrollView bottom to the keypad-top guideline so the
+                // protocol toggle + buttons cannot bleed into the keypad.
+                lp.bottomToTop    = R.id.guidelineKeypadTop;
+                lp.bottomToBottom = androidx.constraintlayout.widget.ConstraintLayout
+                        .LayoutParams.UNSET;
+            }
+            else
+            {
+                // Keypad hidden — ScrollView gets the full screen height for
+                // long result text (Aliro multi-element verification, public
+                // key bit-length breakdown, etc.).
+                lp.bottomToTop    = androidx.constraintlayout.widget.ConstraintLayout
+                        .LayoutParams.UNSET;
+                lp.bottomToBottom = androidx.constraintlayout.widget.ConstraintLayout
+                        .LayoutParams.PARENT_ID;
+            }
+            scrollViewForResultArea.setLayoutParams(lp);
+        }
+        catch (ClassCastException e)
+        {
+            // Layout file changed and ScrollView is no longer in a
+            // ConstraintLayout — ignore, the fixed XML constraints will apply.
+            Log.w(TAG, "applyScrollViewBottomConstraint: " + e.getMessage());
+        }
     }
 
     /**
@@ -971,15 +1127,33 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
      * the reader graphic.  Safe to call multiple times — skips the
      * work when the image has not been laid out yet (height == 0).
      */
-    private void positionKeypad(View readerImage, View rootView) {
-        if (readerImage == null || keypadLayout == null || rootView == null) return;
+    private boolean positionKeypad(View readerImage, View rootView) {
+        if (readerImage == null || keypadLayout == null || rootView == null) return false;
 
         int imageTop = readerImage.getTop();
         int imageHeight = readerImage.getHeight();
         int screenHeight = rootView.getHeight();
 
-        // Guard: if layout hasn't happened yet, don't set bogus margins
-        if (imageHeight == 0 || screenHeight == 0) return;
+        // Guard: if layout hasn't happened yet, don't set bogus margins.
+        // Returning false signals to the caller (the OnGlobalLayoutListener)
+        // that it should NOT remove itself yet — we need another layout pass.
+        // Without this, a layout pass that fires before the image is measured
+        // would silently fail and leave the keypad at its default constraints
+        // (full-parent), causing it to overlap the title bar after the user
+        // returns from a credential read.
+        if (imageHeight == 0 || screenHeight == 0) return false;
+
+        // Stronger guard: also reject INTERMEDIATE measurement passes where
+        // readerImageView reports a partial height because the FragmentContainer
+        // is still expanding to fill its parent. After returning from Aliro
+        // Config, the global-layout listener fires multiple times — the first
+        // few passes report imageHeight ≈ 56% of final (e.g. 967 instead of
+        // 1735 on Samsung S10). Anchoring the keypad to those stale dimensions
+        // pulls its top up by ~318px, overlapping the radio buttons. The image
+        // is constrained top=parent / bottom=parent so its final height equals
+        // screenHeight; require the measured value to be within 5% of that
+        // before trusting it.
+        if (imageHeight < screenHeight - (screenHeight / 20)) return false;
 
         // LED indicators sit at ~18% down the reader image
         // Keypad starts just below them at ~36% into the image
@@ -1001,6 +1175,36 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
 
         keypadLayout.setLayoutParams(params);
         keypadPositioned = true;
+        return true;
+    }
+
+    /**
+     * Re-trigger keypad positioning. Use whenever the keypad/image visibility
+     * has just changed back to VISIBLE — for example, after a credential read
+     * completes and the result UI clears. Schedules a fresh positioning attempt
+     * once the next layout pass finishes, so even if the original positioning
+     * silently failed (e.g. listener fired before measurement was complete),
+     * we get another chance.
+     *
+     * Without this, the keypad can render at its default constraints
+     * (parent-top to parent-bottom) and overlap the title bar.
+     */
+    private void requestKeypadReposition() {
+        final View root = getView();
+        if (readerImageView == null || root == null) return;
+        readerImageView.getViewTreeObserver().addOnGlobalLayoutListener(
+                new android.view.ViewTreeObserver.OnGlobalLayoutListener() {
+                    @Override
+                    public void onGlobalLayout() {
+                        if (positionKeypad(readerImageView, root)) {
+                            readerImageView.getViewTreeObserver()
+                                    .removeOnGlobalLayoutListener(this);
+                        }
+                    }
+                });
+        // Also poke the view tree so the listener fires promptly even if
+        // nothing else is requesting layout.
+        readerImageView.requestLayout();
     }
 
     // Helper method to apply background, text color, font size, and bold attribute to a specific range of text
@@ -1520,8 +1724,7 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                     new Handler(Looper.getMainLooper()).post(() ->
                     {
                         // Hide reader image and keypad when showing BLE scan results
-                        readerImageView.setVisibility(View.GONE);
-                        keypadLayout.setVisibility(View.GONE);
+                        setKeypadVisibility(View.GONE);
 
                         String publicKeyHex = Hex.toHexString(pubKey).toUpperCase();
                         String connectionTypeText;
@@ -1615,8 +1818,7 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                     boolean finalSigValid = sigValid;
                     new Handler(Looper.getMainLooper()).post(() ->
                     {
-                        readerImageView.setVisibility(View.GONE);
-                        keypadLayout.setVisibility(View.GONE);
+                        setKeypadVisibility(View.GONE);
 
                         if (finalSigValid)
                         {
@@ -2124,8 +2326,7 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                 {
                     requireActivity().runOnUiThread(() ->
                     {
-                        readerImageView.setVisibility(View.GONE);
-                        keypadLayout.setVisibility(View.GONE);
+                        setKeypadVisibility(View.GONE);
                         String pk = Hex.toHexString(publicKey);
                         Log.d("NFC", "PKOC Public Key: " + pk);
                         displayPublicKeyInfo(pk, "PKOC NFC — Normal Flow");
@@ -2446,8 +2647,7 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                     requireActivity().runOnUiThread(() ->
                     {
                         if (!isAdded()) return;
-                        readerImageView.setVisibility(View.GONE);
-                        keypadLayout.setVisibility(View.GONE);
+                        setKeypadVisibility(View.GONE);
                         requireView().findViewById(R.id.protocolModeGroup).setVisibility(View.GONE);
 
                         Button rdrBtn = requireView().findViewById(R.id.rdrButton);
@@ -2731,8 +2931,7 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
             requireActivity().runOnUiThread(() ->
             {
                 if (!isAdded()) return;
-                readerImageView.setVisibility(View.GONE);
-                keypadLayout.setVisibility(View.GONE);
+                setKeypadVisibility(View.GONE);
 
                 // Build the connectionType string in the same style as Aliro results.
                 // The first line becomes the bold title; section headers are ALL-CAPS.
@@ -4509,8 +4708,7 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
             final String  finalStepUpResult = stepUpResult;
             requireActivity().runOnUiThread(() ->
             {
-                readerImageView.setVisibility(View.GONE);
-                keypadLayout.setVisibility(View.GONE);
+                setKeypadVisibility(View.GONE);
                 String pk = finalCredPubKey != null ? Hex.toHexString(finalCredPubKey) : "(FAST mode)";
                 Log.d(TAG, "Aliro credential public key: " + pk);
                 String connectionType = formatAliroConnectionType(
@@ -4918,6 +5116,241 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
 
     /** Show a toast error for Aliro failures */
     // -------------------------------------------------------------------------
+    // Multi-element Step-Up helpers (Aliro 1.0 §7.3 / §8.4.2)
+    //
+    // The Step-Up Element Identifier preference is a free-form string. Users
+    // may enter "floor1" for a single element or "floor1, floor2, pool_door"
+    // to request multiple elements in one Step-Up. parseElementIdList splits
+    // the CSV; sliceDeviceResponsePerDocument unpacks the multi-document
+    // DeviceResponse the credential returns into one DeviceResponse per
+    // document so the existing verifyDocument can verify each independently.
+    // -------------------------------------------------------------------------
+
+    /**
+     * Parse the Step-Up Element Identifier preference string into an ordered
+     * list of element IDs. Splits on commas, trims whitespace, drops empty
+     * tokens. Returns a single-element list ["access"] when the input is
+     * null or fully blank — matches the documented default in §7.2.5 / §7.7
+     * so the request always carries at least one identifier.
+     */
+    private static java.util.List<String> parseElementIdList(String csv)
+    {
+        java.util.List<String> out = new java.util.ArrayList<>();
+        if (csv != null)
+        {
+            for (String tok : csv.split(","))
+            {
+                String t = tok.trim();
+                if (!t.isEmpty()) out.add(t);
+            }
+        }
+        if (out.isEmpty()) out.add("access");
+        return out;
+    }
+
+    /**
+     * Slice a multi-document DeviceResponse into one DeviceResponse per
+     * document so the existing single-document verifier can verify each one.
+     * Each slice keeps the version (key "1") and status (key "3") fields and
+     * carries exactly one document under the documents array (key "2").
+     *
+     * <p>Returns an empty list when the input is unparseable or carries no
+     * documents — callers fall back to verifying the original bytes whole.
+     */
+    private static java.util.List<byte[]> sliceDeviceResponsePerDocument(byte[] deviceResponseBytes)
+    {
+        java.util.List<byte[]> out = new java.util.ArrayList<>();
+        try
+        {
+            com.upokecenter.cbor.CBORObject deviceResponse =
+                    com.upokecenter.cbor.CBORObject.DecodeFromBytes(deviceResponseBytes);
+            com.upokecenter.cbor.CBORObject docs =
+                    deviceResponse.get(com.upokecenter.cbor.CBORObject.FromObject("2"));
+            if (docs == null || docs.size() == 0) return out;
+
+            com.upokecenter.cbor.CBORObject version =
+                    deviceResponse.get(com.upokecenter.cbor.CBORObject.FromObject("1"));
+            com.upokecenter.cbor.CBORObject status  =
+                    deviceResponse.get(com.upokecenter.cbor.CBORObject.FromObject("3"));
+
+            for (int i = 0; i < docs.size(); i++)
+            {
+                com.upokecenter.cbor.CBORObject one = com.upokecenter.cbor.CBORObject.NewOrderedMap();
+                if (version != null)
+                    one.Add(com.upokecenter.cbor.CBORObject.FromObject("1"), version);
+                com.upokecenter.cbor.CBORObject arr = com.upokecenter.cbor.CBORObject.NewArray();
+                arr.Add(docs.get(i));
+                one.Add(com.upokecenter.cbor.CBORObject.FromObject("2"), arr);
+                if (status != null)
+                    one.Add(com.upokecenter.cbor.CBORObject.FromObject("3"), status);
+                out.add(one.EncodeToBytes());
+            }
+        }
+        catch (Exception e)
+        {
+            Log.w(TAG, "sliceDeviceResponsePerDocument failed: " + e.getMessage());
+        }
+        return out;
+    }
+
+    /**
+     * Parse the Step-Up Issuer Public Key preference into a list of trusted
+     * 65-byte uncompressed EC public keys. Accepts a single hex value or a
+     * comma-separated list (Aliro 1.0 §7.7) — multiple stored documents on
+     * the credential side may carry different issuers, and the reader can
+     * trust any/all of them by listing their public keys here.
+     *
+     * <p>Returns an empty list when the input is null/blank or no token
+     * decodes cleanly to 65 bytes; in that case downstream code skips
+     * COSE_Sign1 verification ("(sig not verified)").
+     */
+    private static java.util.List<byte[]> parseIssuerPubKeyList(String csv)
+    {
+        java.util.List<byte[]> out = new java.util.ArrayList<>();
+        if (csv == null) return out;
+        for (String tok : csv.split(","))
+        {
+            String hex = tok.trim();
+            if (hex.isEmpty()) continue;
+            try
+            {
+                byte[] bytes = org.bouncycastle.util.encoders.Hex.decode(hex);
+                if (bytes.length == 65 && bytes[0] == 0x04)
+                {
+                    out.add(bytes);
+                }
+                else
+                {
+                    Log.w(TAG, "parseIssuerPubKeyList: skipping malformed entry (length="
+                            + bytes.length + ")");
+                }
+            }
+            catch (Exception e)
+            {
+                Log.w(TAG, "parseIssuerPubKeyList: hex decode failed for '" + hex + "'");
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Pick the trusted issuer key whose kid matches the IssuerAuth in the
+     * given DeviceResponse slice. The kid is derived from each candidate
+     * key as {@code SHA-256("key-identifier" || pubKey)[0:8]} per Aliro
+     * 1.0 §7.2.1, then matched against the kid byte string in the slice's
+     * COSE_Sign1 protected header.
+     *
+     * <p>If the slice carries no kid (e.g. x5chain-based docs) or no key
+     * matches, returns the first key in the list as a best-effort fallback
+     * — the verifier will then either accept it (single-issuer case where
+     * everything happens to share one kid) or fail signature verification
+     * cleanly. Returns null only when the candidate list itself is empty.
+     */
+    private static byte[] pickIssuerKeyForKid(byte[] sliceBytes,
+                                                java.util.List<byte[]> trustedKeys)
+    {
+        if (trustedKeys == null || trustedKeys.isEmpty()) return null;
+        if (trustedKeys.size() == 1) return trustedKeys.get(0);
+
+        byte[] kid = extractKidFromSlice(sliceBytes);
+        if (kid == null)
+        {
+            Log.d(TAG, "pickIssuerKeyForKid: no kid in slice, defaulting to first key");
+            return trustedKeys.get(0);
+        }
+
+        for (byte[] candidate : trustedKeys)
+        {
+            try
+            {
+                java.security.MessageDigest sha =
+                        java.security.MessageDigest.getInstance("SHA-256");
+                sha.update("key-identifier".getBytes("US-ASCII"));
+                sha.update(candidate);
+                byte[] expectedKid = java.util.Arrays.copyOfRange(sha.digest(), 0, 8);
+                if (java.util.Arrays.equals(expectedKid, kid))
+                {
+                    Log.d(TAG, "pickIssuerKeyForKid: matched kid="
+                            + org.bouncycastle.util.encoders.Hex.toHexString(kid));
+                    return candidate;
+                }
+            }
+            catch (Exception e)
+            {
+                Log.w(TAG, "pickIssuerKeyForKid: kid compute failed", e);
+            }
+        }
+        Log.w(TAG, "pickIssuerKeyForKid: no trusted key matches kid="
+                + org.bouncycastle.util.encoders.Hex.toHexString(kid)
+                + " — falling back to first key (verification will likely fail)");
+        return trustedKeys.get(0);
+    }
+
+    /**
+     * Extract the {@code kid} byte string from a DeviceResponse slice's
+     * IssuerAuth COSE_Sign1 header. Returns null if absent or if the response
+     * can't be parsed.
+     *
+     * <p>Per RFC 9052 §3 a COSE_Sign1 is {@code [protected, unprotected,
+     * payload, signature]}. Header parameters MAY appear in either header
+     * bucket, so we check both — protected first per RFC convention, then
+     * unprotected. The Aliro credential build path (AliroAccessDocument.java
+     * {@code buildCoseSign1}) puts kid in the unprotected header, and the
+     * reader's verifier (AliroAccessDocumentVerifier Step 1) reads from
+     * either — this helper mirrors that policy so {@code pickIssuerKeyForKid}
+     * sees the same kid value Step 2 will validate against.
+     */
+    private static byte[] extractKidFromSlice(byte[] sliceBytes)
+    {
+        try
+        {
+            com.upokecenter.cbor.CBORObject deviceResponse =
+                    com.upokecenter.cbor.CBORObject.DecodeFromBytes(sliceBytes);
+            com.upokecenter.cbor.CBORObject docs =
+                    deviceResponse.get(com.upokecenter.cbor.CBORObject.FromObject("2"));
+            if (docs == null || docs.size() == 0) return null;
+            com.upokecenter.cbor.CBORObject doc      = docs.get(0);
+            com.upokecenter.cbor.CBORObject iSigned  =
+                    doc.get(com.upokecenter.cbor.CBORObject.FromObject("1"));
+            if (iSigned == null) return null;
+            com.upokecenter.cbor.CBORObject iAuth    =
+                    iSigned.get(com.upokecenter.cbor.CBORObject.FromObject("2"));
+            if (iAuth == null || iAuth.size() < 2) return null;
+
+            // Try protected header first (RFC 9052 convention)
+            byte[] protectedHeaderBytes = iAuth.get(0).GetByteString();
+            if (protectedHeaderBytes != null && protectedHeaderBytes.length > 0)
+            {
+                try
+                {
+                    com.upokecenter.cbor.CBORObject protectedHeader =
+                            com.upokecenter.cbor.CBORObject.DecodeFromBytes(protectedHeaderBytes);
+                    com.upokecenter.cbor.CBORObject kidObj =
+                            protectedHeader.get(com.upokecenter.cbor.CBORObject.FromObject(4));
+                    if (kidObj != null) return kidObj.GetByteString();
+                }
+                catch (Exception ignored) { /* fall through to unprotected */ }
+            }
+
+            // Fall back to unprotected header (where the credential actually puts kid)
+            com.upokecenter.cbor.CBORObject unprotectedHeader = iAuth.get(1);
+            if (unprotectedHeader != null)
+            {
+                com.upokecenter.cbor.CBORObject kidObj =
+                        unprotectedHeader.get(com.upokecenter.cbor.CBORObject.FromObject(4));
+                if (kidObj != null) return kidObj.GetByteString();
+            }
+
+            return null;
+        }
+        catch (Exception e)
+        {
+            Log.d(TAG, "extractKidFromSlice: " + e.getMessage());
+            return null;
+        }
+    }
+
+    // -------------------------------------------------------------------------
     // Aliro Step-Up phase — ENVELOPE/GET RESPONSE + DeviceResponse processing
     // Per Aliro §8.4: transfers Access Document from credential to reader.
     // Returns a short summary string for display, or null if nothing useful returned.
@@ -4956,11 +5389,22 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
             //
             // ItemsRequest keys per items_request.py:
             //   "5" = docType (e.g. "aliro-a" or "aliro-r" per §7.7)
-            //   "1" = nameSpaces: { <docType>: { <elementId>: false } }
+            //   "1" = nameSpaces: { <docType>: { <elementId>: false, ... } }
+            //
+            // Multi-element support (Aliro 1.0 §7.3 / §8.4.2):
+            //   The Step-Up Element Identifier preference accepts a single value
+            //   ("floor1") or a comma-separated list ("floor1, floor2, pool_door")
+            //   to request multiple elements in a single Step-Up. Each element
+            //   gets its own entry in the inner element map; the credential
+            //   returns one document per matching element under documents[].
+            java.util.List<String> requestElementIds = parseElementIdList(elementId);
             com.upokecenter.cbor.CBORObject nameSpaceMap = com.upokecenter.cbor.CBORObject.NewOrderedMap();
             com.upokecenter.cbor.CBORObject elemMap      = com.upokecenter.cbor.CBORObject.NewOrderedMap();
-            elemMap.Add(com.upokecenter.cbor.CBORObject.FromObject(elementId),
-                        com.upokecenter.cbor.CBORObject.False);
+            for (String eid : requestElementIds)
+            {
+                elemMap.Add(com.upokecenter.cbor.CBORObject.FromObject(eid),
+                            com.upokecenter.cbor.CBORObject.False);
+            }
             nameSpaceMap.Add(com.upokecenter.cbor.CBORObject.FromObject(docType), elemMap);
 
             com.upokecenter.cbor.CBORObject itemsRequest = com.upokecenter.cbor.CBORObject.NewOrderedMap();
@@ -5107,20 +5551,80 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                     + org.bouncycastle.util.encoders.Hex.toHexString(deviceResponseBytes));
 
             // 7. Full Access Document / Revocation Document verification per §7.4 + §7.5
-            // Load credential issuer public key from preferences for kid-based signature verification
+            // Load credential issuer public key(s) from preferences for kid-based
+            // signature verification. The Step-Up Issuer Public Key field accepts
+            // a single hex value or a comma-separated list (Aliro 1.0 §7.7) —
+            // each stored credential document may have its own issuer keypair
+            // and own kid, and the reader trusts any/all of them by listing
+            // their public keys here.
             String issuerKeyHex = prefs.getString(AliroPreferences.STEP_UP_ISSUER_PUB_KEY, "");
-            byte[] issuerPubKey = issuerKeyHex.isEmpty() ? null : Hex.decode(issuerKeyHex);
-            Log.d(TAG, "Step-Up: issuerPubKey=" + (issuerPubKey != null ? Hex.toHexString(issuerPubKey) : "(none)"));
+            java.util.List<byte[]> trustedIssuerKeys = parseIssuerPubKeyList(issuerKeyHex);
+            Log.d(TAG, "Step-Up: configured " + trustedIssuerKeys.size()
+                    + " trusted issuer key(s)");
 
-            AliroAccessDocumentVerifier.VerificationResult verifyResult =
-                    AliroAccessDocumentVerifier.verifyDocument(
-                            deviceResponseBytes, docType, credentialPubKey, elementId, issuerPubKey);
+            // Multi-element verification: when the request asked for multiple
+            // elements, the response carries multiple documents under "2".
+            // Slice into one DeviceResponse per document and verify each
+            // independently, concatenating the results for display. The last
+            // VerificationResult wins for downstream status flags — any failure
+            // among the slices surfaces in lastDocVerifyResult.
+            java.util.List<byte[]> slices = sliceDeviceResponsePerDocument(deviceResponseBytes);
+            if (slices.isEmpty())
+            {
+                // Fall back to the original single-doc path so callers still
+                // see a meaningful result on a malformed/empty response.
+                byte[] fallbackKey = trustedIssuerKeys.isEmpty() ? null : trustedIssuerKeys.get(0);
+                AliroAccessDocumentVerifier.VerificationResult verifyResult =
+                        AliroAccessDocumentVerifier.verifyDocument(
+                                deviceResponseBytes, docType, credentialPubKey,
+                                requestElementIds.get(0), fallbackKey);
+                lastDocVerifyResult = verifyResult;
+                Log.d(TAG, "Step-Up: verification result (single fallback): " + verifyResult);
+                return verifyResult.stepUpResultText;
+            }
 
-            // Store for post-step-up EXCHANGE status
-            lastDocVerifyResult = verifyResult;
-            Log.d(TAG, "Step-Up: verification result: " + verifyResult);
+            StringBuilder combinedText = new StringBuilder();
+            AliroAccessDocumentVerifier.VerificationResult lastResult = null;
+            int sliceIndex = 0;
+            for (byte[] slice : slices)
+            {
+                // Pick the requested element ID for this slice. When we
+                // requested N elements, slices arrive in the same order the
+                // credential matched them, which mirrors the request order
+                // in normal operation. If counts diverge (e.g. credential
+                // dropped one as expired), we still verify each slice but
+                // pass the i-th request ID where available.
+                String sliceElementId = (sliceIndex < requestElementIds.size())
+                        ? requestElementIds.get(sliceIndex)
+                        : requestElementIds.get(requestElementIds.size() - 1);
 
-            return verifyResult.stepUpResultText;
+                // Multi-issuer support (§7.7): pick the trusted key whose kid
+                // matches THIS slice's IssuerAuth. With one trusted key
+                // configured this is a no-op (returns it unchanged); with
+                // multiple keys configured this picks the right one per slice.
+                byte[] sliceIssuerKey = trustedIssuerKeys.isEmpty()
+                        ? null
+                        : pickIssuerKeyForKid(slice, trustedIssuerKeys);
+
+                AliroAccessDocumentVerifier.VerificationResult vr =
+                        AliroAccessDocumentVerifier.verifyDocument(
+                                slice, docType, credentialPubKey, sliceElementId, sliceIssuerKey);
+                lastResult = vr;
+                if (vr.stepUpResultText != null && !vr.stepUpResultText.isEmpty())
+                {
+                    if (combinedText.length() > 0) combinedText.append("\n\n");
+                    combinedText.append(vr.stepUpResultText);
+                }
+                sliceIndex++;
+            }
+
+            lastDocVerifyResult = lastResult;
+            Log.d(TAG, "Step-Up: verified " + slices.size() + " document(s); "
+                    + "lastResult=" + lastResult);
+
+            return (combinedText.length() > 0)
+                    ? combinedText.toString()
+                    : (lastResult != null ? lastResult.stepUpResultText : null);
         }
         finally
         {
@@ -5143,11 +5647,16 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
         {
             SharedPreferences prefs = requireActivity().getPreferences(Context.MODE_PRIVATE);
             String issuerKeyHex = prefs.getString(AliroPreferences.STEP_UP_ISSUER_PUB_KEY, "");
+            // Multi-issuer support (Aliro 1.0 §7.7) — the field accepts a
+            // single hex value or a CSV list. Picking happens per slice
+            // below, matched by kid.
+            java.util.List<byte[]> trustedIssuerKeys = parseIssuerPubKeyList(issuerKeyHex);
 
             com.upokecenter.cbor.CBORObject deviceResponse =
                     com.upokecenter.cbor.CBORObject.DecodeFromBytes(deviceResponseBytes);
 
-            // Key "2" = documents array (Aliro Table 8-22)
+            // Key "2" = documents array (Aliro Table 8-22). Multi-element
+            // Step-Up returns one document per matching element, so iterate.
             com.upokecenter.cbor.CBORObject docs = deviceResponse.get(
                     com.upokecenter.cbor.CBORObject.FromObject("2"));
             if (docs == null || docs.size() == 0)
@@ -5156,35 +5665,77 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                 return null;
             }
 
-            com.upokecenter.cbor.CBORObject firstDoc = docs.get(0);
-            com.upokecenter.cbor.CBORObject iSigned  = firstDoc.get(
-                    com.upokecenter.cbor.CBORObject.FromObject("1"));
-            if (iSigned == null) return null;
+            // Resolve which element ID to anchor each summary on. When the
+            // request carried a CSV ("floor1, floor2"), match each doc to
+            // its corresponding requested ID by document order; this matches
+            // how the credential composes the response (per-element slices
+            // appended in request order).
+            java.util.List<String> requestedIds = parseElementIdList(elementId);
 
-            com.upokecenter.cbor.CBORObject iAuth      = iSigned.get(
-                    com.upokecenter.cbor.CBORObject.FromObject("2"));
-            com.upokecenter.cbor.CBORObject nameSpaces = iSigned.get(
-                    com.upokecenter.cbor.CBORObject.FromObject("1"));
+            // Verify COSE_Sign1 once per IssuerAuth. With multi-doc each
+            // doc may carry its own IssuerAuth signed by a different
+            // issuer key (§7.7); allDocsVerified stays true only if every
+            // doc verifies against some configured trusted key. We slice
+            // each document into its own DeviceResponse to extract the
+            // kid byte string for matching.
+            boolean sawAnyVerification = false;
+            boolean allDocsVerified    = true;
 
-            // Verify COSE_Sign1 if issuer key configured
-            boolean docVerified = false;
-            if (!issuerKeyHex.isEmpty() && iAuth != null)
+            // Re-slice once for kid extraction (extractKidFromSlice expects
+            // a full single-doc DeviceResponse).
+            java.util.List<byte[]> docSlices = sliceDeviceResponsePerDocument(deviceResponseBytes);
+
+            StringBuilder all = new StringBuilder();
+            for (int d = 0; d < docs.size(); d++)
             {
-                docVerified = verifyCoseSign1(iAuth, issuerKeyHex);
-                Log.d(TAG, "BLE Step-Up: COSE_Sign1 verification = " + docVerified);
-            }
-            else
-            {
-                Log.d(TAG, "BLE Step-Up: no issuer key configured, skipping sig verification");
+                com.upokecenter.cbor.CBORObject doc      = docs.get(d);
+                com.upokecenter.cbor.CBORObject iSigned  = doc.get(
+                        com.upokecenter.cbor.CBORObject.FromObject("1"));
+                if (iSigned == null) continue;
+
+                com.upokecenter.cbor.CBORObject iAuth      = iSigned.get(
+                        com.upokecenter.cbor.CBORObject.FromObject("2"));
+                com.upokecenter.cbor.CBORObject nameSpaces = iSigned.get(
+                        com.upokecenter.cbor.CBORObject.FromObject("1"));
+
+                if (!trustedIssuerKeys.isEmpty() && iAuth != null)
+                {
+                    byte[] sliceForKid = (d < docSlices.size()) ? docSlices.get(d) : null;
+                    byte[] picked = (sliceForKid != null)
+                            ? pickIssuerKeyForKid(sliceForKid, trustedIssuerKeys)
+                            : trustedIssuerKeys.get(0);
+                    String pickedHex = (picked != null)
+                            ? org.bouncycastle.util.encoders.Hex.toHexString(picked)
+                            : "";
+                    boolean docVerified = !pickedHex.isEmpty()
+                            && verifyCoseSign1(iAuth, pickedHex);
+                    sawAnyVerification = true;
+                    if (!docVerified) allDocsVerified = false;
+                    Log.d(TAG, "BLE Step-Up: doc[" + d + "] COSE_Sign1 = " + docVerified
+                            + " (key=" + (picked != null ? pickedHex.substring(0, 16) + "..." : "(none)") + ")");
+                }
+
+                String elemForSummary = (d < requestedIds.size())
+                        ? requestedIds.get(d)
+                        : (requestedIds.isEmpty() ? "access" : requestedIds.get(0));
+                String accessSummary = extractAccessDataSummary(nameSpaces, elemForSummary);
+                if (accessSummary != null && !accessSummary.isEmpty())
+                {
+                    if (all.length() > 0) all.append("\n\n");
+                    all.append(accessSummary);
+                }
             }
 
-            String accessSummary = extractAccessDataSummary(nameSpaces, elementId);
+            String sigStatus;
+            if (issuerKeyHex.isEmpty())            sigStatus = "(sig not verified)";
+            else if (!sawAnyVerification)          sigStatus = "(sig not verified)";
+            else                                   sigStatus = allDocsVerified
+                                                         ? "Signature Valid"
+                                                         : "Signature INVALID";
 
-            String sigStatus = (issuerKeyHex.isEmpty() ? "(sig not verified)"
-                    : (docVerified ? "Signature Valid" : "Signature INVALID"));
             StringBuilder result = new StringBuilder(sigStatus);
-            if (accessSummary != null)
-                result.append("\n").append(accessSummary);
+            if (all.length() > 0)
+                result.append("\n").append(all);
             return result.toString();
         }
         catch (Exception e)

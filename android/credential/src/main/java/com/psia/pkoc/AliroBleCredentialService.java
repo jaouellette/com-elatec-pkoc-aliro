@@ -146,6 +146,14 @@ public class AliroBleCredentialService extends Service
     private boolean mailboxAtomicActive  = false;
     private byte[]  mailboxPendingWrites = null;
 
+    // Per Aliro 1.0 §8.3.3.5: "After an EXCHANGE command containing 0x97,
+    // no further EXCHANGE commands can be sent." This flag tracks whether
+    // the current transaction has already received a terminal EXCHANGE
+    // (i.e. one carrying tag 0x97). Any subsequent EXCHANGE that arrives
+    // while this is true MUST trigger the failure process per §8.3.3.1.
+    // Cleared by resetState() at the start of each transaction.
+    private boolean terminalExchangeReceived = false;
+
     // Selected version to write to reader GATT
     private final byte[] SELECTED_VERSION = { 0x01, 0x00 };
     private final byte[] SELECTED_VERSION_WRITE = { 0x01, 0x00, 0x01, 0x00 }; // version + featLen + features
@@ -1034,13 +1042,33 @@ public class AliroBleCredentialService extends Service
 
             // Build signaling_bitmap (tag 0x5E, 2 bytes big-endian) per Table 8-11.
             // Bit0=1: Access Document available → reader SHALL send ENVELOPE.
-            // Bit2: NFC-ONLY — SHALL NOT be set over BLE per §11.1.1.
-            byte[] storedDoc = AliroAccessDocument.getDocumentBytes(this);
-            boolean hasAccessDoc = (storedDoc != null && storedDoc.length > 0);
-            signalingBits = hasAccessDoc ? 0x0001 : 0x0000;
-            // CRITICAL: Over BLE, Bit2 MUST NOT be set (NFC-only per Table 8-11)
+            // Bit1=1: Revocation Document available.
+            // Bit2: step-up AID select required. Per Table 8-11, this bit is
+            // "only applicable when the transaction is performed using NFC
+            // transport. When using other transport mechanisms, this bit
+            // SHALL be ignored by the Reader and SHALL not be set by the
+            // User Device." We are on BLE here, so Bit2 stays unset.
+            // (Aliro 1.0 Table 8-11. Mailbox availability is signaled by
+            // Bits 3/4/5/10, not Bit2 — see §8.3.1.15.)
+            // Walk the multi-doc set (per §8.4.2 RECOMMENDED multi-element
+            // behavior) so we report availability accurately when zero/one/
+            // many documents are stored. Mirrors the NFC service's logic.
+            java.util.List<AliroAccessDocument.StoredDocument> allDocs =
+                    AliroAccessDocument.getAllDocuments(this);
+            boolean hasAccessDoc = false;
+            boolean hasRevocDoc  = false;
+            for (AliroAccessDocument.StoredDocument sd : allDocs)
+            {
+                if (sd.accessDocBytes     != null && sd.accessDocBytes.length     > 0) hasAccessDoc = true;
+                if (sd.revocationDocBytes != null && sd.revocationDocBytes.length > 0) hasRevocDoc  = true;
+            }
+            signalingBits = 0;
+            if (hasAccessDoc) signalingBits |= 0x0001; // bit 0: access doc present
+            if (hasRevocDoc)  signalingBits |= 0x0002; // bit 1: revocation doc present
+            // Bit 2 (step-up AID select required) is NFC-only per Table 8-11
+            // and SHALL NOT be set on BLE. Mailbox bits (3/4/5/10) per §8.3.1.15.
             Log.d(TAG, "AUTH1: signaling_bitmap=0x" + String.format("%04X", signalingBits)
-                    + " (hasAccessDoc=" + hasAccessDoc + ")");
+                    + " (hasAccessDoc=" + hasAccessDoc + ", hasRevocDoc=" + hasRevocDoc + ")");
 
             // Build AUTH1 response plaintext (137 bytes):
             //   5A 41 <cred pub key 65>       — credential public key
@@ -1079,12 +1107,52 @@ public class AliroBleCredentialService extends Service
     }
 
     /**
-     * Handle EXCHANGE APDU — counter-aware GCM + mailbox tag processing
+     * Handle EXCHANGE APDU over BLE.
+     *
+     * <p>Performs counter-aware GCM decryption, enforces the BLE-specific
+     * rules on tag 0x97 from Aliro 1.0 §8.3.3.5 and Table 8-15, runs the
+     * §8.3.1.15 mailbox tag processing pipeline, and returns the encrypted
+     * EXCHANGE response.
+     *
+     * <p>BLE-specific rules enforced here (per Aliro 1.0 §8.3.3.5 and
+     * Table 8-15):
+     * <ul>
+     *   <li>Tag 0x97 over BLE is allowed only when its first byte is 0x00
+     *       (failure indication). A tag 0x97 with first byte 0x01 (success)
+     *       SHALL NOT be sent or received on BLE — receiving one triggers
+     *       the failure process per §8.3.3.1.
+     *   <li>"After an EXCHANGE command containing 0x97, no further
+     *       EXCHANGE commands can be sent." A subsequent EXCHANGE arriving
+     *       after a terminal one triggers the failure process.
+     * </ul>
+     *
+     * <p>Mailbox handling (per Aliro 1.0 §8.3.1.15):
+     * <ul>
+     *   <li>"The User Device SHALL support the mailbox mechanism." The
+     *       spec applies this requirement unconditionally — there is no
+     *       transport restriction. Mailbox 0xBA TLVs and inner read/write/
+     *       set/atomic-session operations are processed identically over
+     *       NFC and BLE in the expedited phase.
+     *   <li>The only spec-defined restriction is "The mailbox SHALL NOT
+     *       be used when in the step-up phase" (§8.3.1.15). This handler
+     *       is the expedited-phase EXCHANGE handler; step-up EXCHANGE is
+     *       handled separately.
+     * </ul>
      */
     private byte[] handleExchangeBle(byte[] apdu)
     {
         try
         {
+            // Terminal-EXCHANGE rule per §8.3.3.5: once an EXCHANGE has
+            // arrived carrying tag 0x97, the spec forbids the Reader from
+            // sending any further EXCHANGEs. If we still receive one, the
+            // peer is misbehaving — enter failure process per §8.3.3.1.
+            if (terminalExchangeReceived)
+            {
+                return enterFailureProcess(
+                        "EXCHANGE received after a terminal (0x97-bearing) EXCHANGE — §8.3.3.5");
+            }
+
             int dataOffset = 5;
             int dataLen = apdu[4] & 0xFF;
             if (dataOffset + dataLen > apdu.length) return null;
@@ -1098,19 +1166,61 @@ public class AliroBleCredentialService extends Service
             }
             Log.d(TAG, "EXCHANGE decrypted: " + Hex.toHexString(decrypted));
 
-            // Parse tag 97 for access decision
+            // Parse tag 0x97 (Reader Status, Table 8-18) and enforce
+            // BLE-specific rules per §8.3.3.5 and Table 8-15.
+            //
+            // §8.3.3.5: "When using BLE for transaction protocol, tag 0x97
+            // is present in the EXCHANGE command sent by Reader only if
+            // the transaction failure occurs."
+            // Table 8-15: "This tag SHALL be accepted by the User Device
+            // on the BLE interface only if the first byte is set to 0x00.
+            // Otherwise, this tag SHALL NOT be sent and received on the
+            // BLE interface."
+            //
+            // So on BLE:
+            //   - tag 0x97 absent       → success (no terminal indication)
+            //   - tag 0x97 first byte 0x00 → failure (terminal, per Table 8-18)
+            //   - tag 0x97 first byte 0x01 → SPEC VIOLATION (rejected here)
+            boolean exchangeWasTerminal = false;
             for (int j = 0; j < decrypted.length - 1; j++)
             {
                 if (decrypted[j] == (byte)0x97 && decrypted[j + 1] == 0x02 && j + 3 < decrypted.length)
                 {
-                    boolean granted = (decrypted[j + 2] == 0x01);
-                    Log.d(TAG, "EXCHANGE: access granted=" + granted);
+                    int firstByte = decrypted[j + 2] & 0xFF;
+                    if (firstByte == 0x01)
+                    {
+                        // Forbidden on BLE per Table 8-15 — enter failure
+                        // process. Session keys are destroyed; SW=6F00 is
+                        // returned with no encrypted payload.
+                        return enterFailureProcess(
+                                "tag 0x97 with first byte 0x01 received on BLE — Table 8-15 SHALL NOT");
+                    }
+                    if (firstByte == 0x00)
+                    {
+                        // Spec-correct BLE failure indication.
+                        exchangeWasTerminal = true;
+                        Log.d(TAG, "EXCHANGE: tag 0x97 first byte 0x00 → terminal failure");
+                    }
+                    else
+                    {
+                        // First byte is something other than 0x00 or 0x01
+                        // (e.g. RFU). Table 8-15 only blesses 0x00 for BLE,
+                        // so any other value is also forbidden.
+                        return enterFailureProcess(
+                                "tag 0x97 first byte 0x"
+                                        + String.format("%02X", firstByte)
+                                        + " not permitted on BLE — Table 8-15");
+                    }
                     break;
                 }
             }
 
-            // Process mailbox operations from decrypted payload
-            // Tags: 0x8C (atomic session), 0x87 (read), 0x8A (write), 0x95 (set)
+            // Process mailbox operations from the decrypted payload per
+            // Aliro 1.0 §8.3.1.15. The §8.3.1.15 requirement is that "The
+            // User Device SHALL support the mailbox mechanism" — applied
+            // unconditionally on transport. The only spec restriction is
+            // that mailbox SHALL NOT be used during step-up; this is the
+            // expedited-phase handler, so mailbox operations are processed.
             byte[] mailboxReadData = processMailboxTags(decrypted);
 
             // Build EXCHANGE response: [mailboxReadData] || 0x0002||0x00||0x00
@@ -1131,6 +1241,17 @@ public class AliroBleCredentialService extends Service
             System.arraycopy(encResponse, 0, response, 0, encResponse.length);
             response[encResponse.length]     = (byte)0x90;
             response[encResponse.length + 1] = 0x00;
+
+            // Per §8.3.3.5 terminal-EXCHANGE rule: only set the flag
+            // AFTER the response has been generated, so the response to
+            // the terminal EXCHANGE itself goes out normally; subsequent
+            // EXCHANGEs (if the reader misbehaves) are rejected at the
+            // top of this handler on the next call.
+            if (exchangeWasTerminal)
+            {
+                terminalExchangeReceived = true;
+                Log.d(TAG, "EXCHANGE: terminal flag set — subsequent EXCHANGEs will fail per §8.3.3.5");
+            }
             return response;
         }
         catch (Exception e)
@@ -1442,7 +1563,27 @@ public class AliroBleCredentialService extends Service
     }
 
     /**
-     * Build DeviceResponse from stored Access Document, matching Aliro_HostApduService logic.
+     * Build DeviceResponse from the stored Access/Revocation Document set,
+     * matching the NFC service's logic (Aliro 1.0 §8.4.2 multi-element /
+     * §7.3 multi-element / §8.4.2 §7.4-Step-5 validity gating).
+     *
+     * <p>Walks the reader's DeviceRequest to extract, per docType, the
+     * ordered list of element identifiers being requested. Then for each
+     * requested element (in the order the reader listed it) finds the
+     * stored document that carries that element and appends a slice for
+     * it. Per-doctype iteration order is preserved (LinkedHashMap), and
+     * within a doctype the emit order tracks request order (List, not Set).
+     *
+     * <p>Why request-order matters: the reader's slicer
+     * (sliceDeviceResponsePerDocument) is positional. If we emit out of
+     * order, slice N gets verified against request[N]'s element id and
+     * the per-slice display attributes element data to the wrong slot.
+     * Emitting in request order makes slice positions == request positions.
+     *
+     * <p>This is the same code path as
+     * {@code Aliro_HostApduService.buildDeviceResponse}; keeping them in
+     * sync ensures NFC and BLE taps return byte-comparable responses for
+     * the same DeviceRequest.
      */
     private byte[] buildDeviceResponse(byte[] deviceRequest)
     {
@@ -1455,60 +1596,304 @@ public class AliroBleCredentialService extends Service
             0x00
         };
 
+        // Load every stored Access/Revocation document pair from the multi-doc
+        // collection. Each entry is keyed by elementId (e.g. "floor1",
+        // "pool_door"); the reader picks which one(s) it wants via DeviceRequest.
+        java.util.List<AliroAccessDocument.StoredDocument> storedDocs =
+                AliroAccessDocument.getAllDocuments(this);
+        Log.d(TAG, "buildDeviceResponse: stored docs=" + storedDocs.size());
+
         try
         {
-            byte[] storedDoc = AliroAccessDocument.getDocumentBytes(this);
-            if (storedDoc == null || storedDoc.length == 0)
-            {
-                Log.d(TAG, "buildDeviceResponse: no Access Document — returning empty");
-                return EMPTY_RESPONSE;
-            }
-            String storedElementId = AliroAccessDocument.getElementIdentifier(this);
-            Log.d(TAG, "buildDeviceResponse: stored element=" + storedElementId
-                    + ", doc bytes=" + storedDoc.length);
+            // ---- Parse DeviceRequest ----
+            // Collect, per docType requested, the LIST of element identifiers
+            // the reader is asking for, in the order the reader specified them.
+            // If the reader doesn't list specific elements for a docType, treat
+            // that as "any element of this docType".
+            //   requestedElements: Map< docType, List<elementId> >  (order-preserving)
+            //   docTypesAnyElement: Set<docType> where the reader wants any/all elements
+            java.util.Map<String, java.util.List<String>> requestedElements =
+                    new java.util.LinkedHashMap<>();
+            java.util.Set<String> docTypesAnyElement = new java.util.LinkedHashSet<>();
+            boolean parseOk = false;
 
-            boolean elementRequested = false;
             try
             {
                 CBORObject req = CBORObject.DecodeFromBytes(deviceRequest);
-                CBORObject docRequests = req.get(CBORObject.FromObject("2"));
-                if (docRequests != null && docRequests.getType() == com.upokecenter.cbor.CBORType.Array)
+                CBORObject docRequestsArr = req.get(CBORObject.FromObject("2"));
+                if (docRequestsArr != null
+                        && docRequestsArr.getType() == com.upokecenter.cbor.CBORType.Array)
                 {
-                    for (int i = 0; i < docRequests.size(); i++)
+                    for (int i = 0; i < docRequestsArr.size(); i++)
                     {
-                        CBORObject docReq = docRequests.get(i);
-                        CBORObject itemsReq = docReq.get(CBORObject.FromObject("1"));
-                        if (itemsReq == null) continue;
-                        CBORObject nameSpaces = itemsReq.get(CBORObject.FromObject("1"));
-                        if (nameSpaces == null) continue;
-                        CBORObject nsMap = nameSpaces.get(CBORObject.FromObject("aliro-a"));
-                        if (nsMap == null) continue;
-                        for (CBORObject key : nsMap.getKeys())
+                        CBORObject docReq = docRequestsArr.get(i);
+
+                        // itemsRequest may be a plain map or wrapped in tag 24.
+                        CBORObject itemsReqRaw = docReq.get(CBORObject.FromObject("1"));
+                        if (itemsReqRaw == null) continue;
+
+                        CBORObject itemsReq;
+                        if (itemsReqRaw.getType() == com.upokecenter.cbor.CBORType.ByteString
+                                || itemsReqRaw.isTagged())
                         {
-                            String requestedId = key.AsString();
-                            Log.d(TAG, "buildDeviceResponse: reader requests element=" + requestedId);
-                            if (requestedId.equals(storedElementId))
+                            try
                             {
-                                elementRequested = true;
+                                byte[] innerBytes = itemsReqRaw.GetByteString();
+                                itemsReq = CBORObject.DecodeFromBytes(innerBytes);
+                            }
+                            catch (Exception unwrapEx) { itemsReq = itemsReqRaw; }
+                        }
+                        else
+                        {
+                            itemsReq = itemsReqRaw;
+                        }
+
+                        // Pull docType (key "5") — fallback to outer docReq if absent.
+                        String docType = null;
+                        CBORObject docTypeObj = itemsReq.get(CBORObject.FromObject("5"));
+                        if (docTypeObj != null)
+                        {
+                            try { docType = docTypeObj.AsString(); } catch (Exception ignored) {}
+                        }
+                        if (docType == null)
+                        {
+                            CBORObject outerDocType = docReq.get(CBORObject.FromObject("5"));
+                            if (outerDocType != null)
+                            {
+                                try { docType = outerDocType.AsString(); } catch (Exception ignored) {}
                             }
                         }
+                        if (docType == null) continue;
+
+                        Log.d(TAG, "buildDeviceResponse: reader requests docType=" + docType);
+
+                        // Pull namespaces (key "1" inside itemsRequest):
+                        //   { "<namespace>": { "<elementId>": <bool>, ... }, ... }
+                        // Collect element identifiers across all namespaces under
+                        // this docType, preserving the order the reader listed them.
+                        CBORObject namespaces = itemsReq.get(CBORObject.FromObject("1"));
+                        java.util.List<String> elementList = requestedElements.get(docType);
+                        if (elementList == null)
+                        {
+                            elementList = new java.util.ArrayList<>();
+                            requestedElements.put(docType, elementList);
+                        }
+
+                        boolean foundElements = false;
+                        if (namespaces != null
+                                && namespaces.getType() == com.upokecenter.cbor.CBORType.Map)
+                        {
+                            for (CBORObject nsKey : namespaces.getKeys())
+                            {
+                                String ns;
+                                try { ns = nsKey.AsString(); }
+                                catch (Exception ignored) { continue; }
+                                CBORObject nsMap = namespaces.get(nsKey);
+                                if (nsMap == null
+                                        || nsMap.getType() != com.upokecenter.cbor.CBORType.Map)
+                                    continue;
+                                for (CBORObject elemKey : nsMap.getKeys())
+                                {
+                                    try
+                                    {
+                                        String elemId = elemKey.AsString();
+                                        if (!elementList.contains(elemId))
+                                        {
+                                            elementList.add(elemId);
+                                        }
+                                        foundElements = true;
+                                        Log.d(TAG, "buildDeviceResponse:   namespace=" + ns
+                                                + " element=" + elemId);
+                                    }
+                                    catch (Exception ignored) {}
+                                }
+                            }
+                        }
+
+                        if (!foundElements)
+                        {
+                            // Reader requested a docType but didn't enumerate elements
+                            // (or we couldn't parse them). Treat as "any element".
+                            docTypesAnyElement.add(docType);
+                            Log.d(TAG, "buildDeviceResponse:   docType=" + docType
+                                    + " requested with no specific elements");
+                        }
                     }
+                    parseOk = true;
                 }
             }
             catch (Exception parseEx)
             {
-                Log.w(TAG, "buildDeviceResponse: could not parse DeviceRequest, returning full doc", parseEx);
-                elementRequested = true;
+                Log.w(TAG, "buildDeviceResponse: could not parse DeviceRequest", parseEx);
             }
 
-            if (!elementRequested)
+            // ---- Fallback: parse failed or no docTypes found ----
+            // Mirrors the NFC path: fall back to returning the FIRST stored
+            // Access Document if available, else empty. Provides graceful
+            // behavior with malformed/legacy reader requests.
+            if (!parseOk || (requestedElements.isEmpty() && docTypesAnyElement.isEmpty()))
             {
-                Log.d(TAG, "buildDeviceResponse: requested element not in stored doc — returning empty");
+                for (AliroAccessDocument.StoredDocument sd : storedDocs)
+                {
+                    if (sd.accessDocBytes != null && sd.accessDocBytes.length > 0)
+                    {
+                        Log.d(TAG, "buildDeviceResponse: fallback — returning first stored Access Document ("
+                                + sd.accessDocBytes.length + " bytes)");
+                        return sd.accessDocBytes;
+                    }
+                }
+                Log.d(TAG, "buildDeviceResponse: no document provisioned — returning empty DeviceResponse");
                 return EMPTY_RESPONSE;
             }
 
-            Log.d(TAG, "buildDeviceResponse: returning stored DeviceResponse (" + storedDoc.length + " bytes)");
-            return storedDoc;
+            // ---- Emit matching documents in REQUEST ORDER ----
+            // Outer loop: requested element list (in order). Inner: find the
+            // stored doc that carries that element. This makes slice positions
+            // line up with request positions for the reader's positional slicer.
+            java.util.List<CBORObject> matchedDocs = new java.util.ArrayList<>();
+
+            // Access Documents (aliro-a)
+            java.util.List<String> requestedAccessElementsList =
+                    requestedElements.get(AliroAccessDocument.DOCTYPE_ACCESS);
+            boolean accessAny = docTypesAnyElement.contains(AliroAccessDocument.DOCTYPE_ACCESS);
+            if (accessAny)
+            {
+                for (AliroAccessDocument.StoredDocument sd : storedDocs)
+                {
+                    if (sd.accessDocBytes == null) continue;
+                    // §8.4.2: SHOULD NOT return data elements when IssuerAuth
+                    // Validity is not current.
+                    if (!AliroAccessDocument.isValidityCurrent(sd.accessDocBytes))
+                    {
+                        Log.d(TAG, "buildDeviceResponse: skipping elementId=" + sd.elementId
+                                + " — IssuerAuth Validity not current");
+                        continue;
+                    }
+                    CBORObject inner = extractInnerDocument(sd.accessDocBytes);
+                    if (inner != null)
+                    {
+                        matchedDocs.add(inner);
+                        Log.d(TAG, "buildDeviceResponse: matched Access Document elementId="
+                                + sd.elementId + " (any-element mode)");
+                    }
+                }
+            }
+            else if (requestedAccessElementsList != null)
+            {
+                for (String requestedElemId : requestedAccessElementsList)
+                {
+                    AliroAccessDocument.StoredDocument matchSd = null;
+                    for (AliroAccessDocument.StoredDocument sd : storedDocs)
+                    {
+                        if (sd.accessDocBytes == null) continue;
+                        if (requestedElemId.equals(sd.elementId))
+                        {
+                            matchSd = sd;
+                            break;
+                        }
+                    }
+                    if (matchSd == null)
+                    {
+                        Log.d(TAG, "buildDeviceResponse: requested elementId="
+                                + requestedElemId + " not present — skipping");
+                        continue;
+                    }
+                    if (!AliroAccessDocument.isValidityCurrent(matchSd.accessDocBytes))
+                    {
+                        Log.d(TAG, "buildDeviceResponse: skipping elementId=" + matchSd.elementId
+                                + " — IssuerAuth Validity not current");
+                        continue;
+                    }
+                    CBORObject inner = extractInnerDocument(matchSd.accessDocBytes);
+                    if (inner != null)
+                    {
+                        matchedDocs.add(inner);
+                        Log.d(TAG, "buildDeviceResponse: matched Access Document elementId="
+                                + matchSd.elementId + " (request-order position "
+                                + (matchedDocs.size() - 1) + ")");
+                    }
+                }
+            }
+
+            // Revocation Documents (aliro-r)
+            java.util.List<String> requestedRevocElementsList =
+                    requestedElements.get(AliroAccessDocument.DOCTYPE_REVOCATION);
+            boolean revocAny = docTypesAnyElement.contains(AliroAccessDocument.DOCTYPE_REVOCATION);
+            if (revocAny)
+            {
+                for (AliroAccessDocument.StoredDocument sd : storedDocs)
+                {
+                    if (sd.revocationDocBytes == null) continue;
+                    if (!AliroAccessDocument.isValidityCurrent(sd.revocationDocBytes))
+                    {
+                        Log.d(TAG, "buildDeviceResponse: skipping revoc elementId="
+                                + sd.elementId + " — IssuerAuth Validity not current");
+                        continue;
+                    }
+                    CBORObject inner = extractInnerDocument(sd.revocationDocBytes);
+                    if (inner != null)
+                    {
+                        matchedDocs.add(inner);
+                        Log.d(TAG, "buildDeviceResponse: matched Revocation Document elementId="
+                                + sd.elementId + " (any-element mode)");
+                    }
+                }
+            }
+            else if (requestedRevocElementsList != null)
+            {
+                for (String requestedElemId : requestedRevocElementsList)
+                {
+                    AliroAccessDocument.StoredDocument matchSd = null;
+                    for (AliroAccessDocument.StoredDocument sd : storedDocs)
+                    {
+                        if (sd.revocationDocBytes == null) continue;
+                        if (requestedElemId.equals(sd.elementId))
+                        {
+                            matchSd = sd;
+                            break;
+                        }
+                    }
+                    if (matchSd == null)
+                    {
+                        Log.d(TAG, "buildDeviceResponse: requested revoc elementId="
+                                + requestedElemId + " not present — skipping");
+                        continue;
+                    }
+                    if (!AliroAccessDocument.isValidityCurrent(matchSd.revocationDocBytes))
+                    {
+                        Log.d(TAG, "buildDeviceResponse: skipping revoc elementId="
+                                + matchSd.elementId + " — IssuerAuth Validity not current");
+                        continue;
+                    }
+                    CBORObject inner = extractInnerDocument(matchSd.revocationDocBytes);
+                    if (inner != null)
+                    {
+                        matchedDocs.add(inner);
+                        Log.d(TAG, "buildDeviceResponse: matched Revocation Document elementId="
+                                + matchSd.elementId + " (request-order position "
+                                + (matchedDocs.size() - 1) + ")");
+                    }
+                }
+            }
+
+            if (matchedDocs.isEmpty())
+            {
+                Log.d(TAG, "buildDeviceResponse: no matching documents — returning empty DeviceResponse");
+                return EMPTY_RESPONSE;
+            }
+
+            // Assemble new DeviceResponse: { "1": "1.0", "2": [doc1, doc2, ...], "3": 0 }
+            CBORObject newResponse = CBORObject.NewOrderedMap();
+            newResponse.Add(CBORObject.FromObject("1"), CBORObject.FromObject("1.0"));
+            CBORObject newDocsArray = CBORObject.NewArray();
+            for (CBORObject d : matchedDocs) newDocsArray.Add(d);
+            newResponse.Add(CBORObject.FromObject("2"), newDocsArray);
+            newResponse.Add(CBORObject.FromObject("3"), CBORObject.FromObject(0));
+
+            byte[] responseBytes = newResponse.EncodeToBytes();
+            Log.d(TAG, "buildDeviceResponse: built DeviceResponse with " + matchedDocs.size()
+                    + " document(s) (" + responseBytes.length + " bytes)");
+            return responseBytes;
         }
         catch (Exception e)
         {
@@ -1516,6 +1901,30 @@ public class AliroBleCredentialService extends Service
             return EMPTY_RESPONSE;
         }
     }
+
+    /**
+     * Extract the single inner Document object from a stored DeviceResponse's
+     * top-level "2" array (where the credential persists each Access/Revocation
+     * Document as a one-element DeviceResponse). Returns null on any failure.
+     */
+    private CBORObject extractInnerDocument(byte[] storedDocResponseBytes)
+    {
+        try
+        {
+            CBORObject storedResponse = CBORObject.DecodeFromBytes(storedDocResponseBytes);
+            CBORObject docsArray = storedResponse.get(CBORObject.FromObject("2"));
+            if (docsArray != null && docsArray.size() > 0)
+            {
+                return docsArray.get(0);
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.w(TAG, "extractInnerDocument failed", ex);
+        }
+        return null;
+    }
+
 
     // -------------------------------------------------------------------------
     // L2CAP message I/O
@@ -1608,6 +2017,42 @@ public class AliroBleCredentialService extends Service
     // Helpers
     // -------------------------------------------------------------------------
 
+    /**
+     * Failure process per Aliro 1.0 §8.3.3.1.
+     *
+     * <p>When a User Device failure state is reached, §8.3.3.1 requires:
+     * <ul>
+     *   <li>Return an empty response data field
+     *   <li>Return an error code as defined in §8.3.2.3 (recommended from
+     *       ISO 7816-4 — we use 0x6F00 "no precise diagnosis")
+     *   <li>Destroy all session-bound keys and data
+     *   <li>Terminate the transaction
+     * </ul>
+     *
+     * <p>This helper performs steps 3 and 4 (key destruction, transaction
+     * teardown) and returns the bytes the caller should send back to the
+     * Reader (steps 1 and 2 — an empty data field followed by SW=6F00).
+     *
+     * @param reason short description for logging.
+     * @return APDU response: empty data field + SW=6F00.
+     */
+    private byte[] enterFailureProcess(String reason)
+    {
+        Log.w(TAG, "Failure process (§8.3.3.1): " + reason);
+        // §8.3.3.1 step 3: destroy session-bound keys and data.
+        if (skReader != null)  { Arrays.fill(skReader, (byte)0);  skReader = null; }
+        if (skDevice != null)  { Arrays.fill(skDevice, (byte)0);  skDevice = null; }
+        if (bleSK != null)     { Arrays.fill(bleSK, (byte)0);     bleSK = null; }
+        if (stepUpSK != null)  { Arrays.fill(stepUpSK, (byte)0);  stepUpSK = null; }
+        // §8.3.3.1 step 4: terminate the transaction. The flow loop in
+        // runCredentialFlow checks flowActive and exits when it goes false.
+        flowActive = false;
+        // §8.3.3.1 step 1+2: empty data field, error code from §8.3.2.3.
+        // ISO 7816-4 0x6F00 "no precise diagnosis" matches the spec's
+        // "recommended to use an error code defined in [7]" guidance.
+        return new byte[]{ (byte)0x6F, 0x00 };
+    }
+
     private void resetState()
     {
         udEphKP = null;
@@ -1627,6 +2072,7 @@ public class AliroBleCredentialService extends Service
         signalingBits = 0;
         mailboxAtomicActive  = false;
         mailboxPendingWrites = null;
+        terminalExchangeReceived = false;
         connectedDeviceAddress = "";
         connectedDeviceName    = "";
         connectedDeviceRssi    = 0;

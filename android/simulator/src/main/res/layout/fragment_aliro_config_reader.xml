@@ -254,17 +254,25 @@
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="Step-Up Issuer Public Key (65 bytes / 130 hex chars)"
+            android:text="Step-Up Issuer Public Key(s) (65 bytes / 130 hex chars each)"
             android:textSize="14sp"
             android:textStyle="bold"
             android:textColor="@color/colorTextPrimary"
+            android:layout_marginBottom="4dp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Issuer public key the reader trusts for COSE_Sign1 verification. Enter a single 130-char hex value, or a comma-separated list to trust multiple issuers (Aliro 1.0 §7.7) — for each received document the reader will compute the kid and pick the matching key. Leave blank to skip signature verification entirely."
+            android:textSize="12sp"
+            android:textColor="@color/colorTextSecondary"
             android:layout_marginBottom="4dp" />
 
         <EditText
             android:id="@+id/editStepUpIssuerPubKey"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:hint="04... (leave blank to skip COSE_Sign1 verification)"
+            android:hint="04..., 04... (one per stored document)"
             android:inputType="textNoSuggestions"
             android:fontFamily="monospace"
             android:textSize="13sp"

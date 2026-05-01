@@ -173,6 +173,8 @@ public class Aliro_HostApduService extends HostApduService
     private static final byte[] SW_SECURITY      = { 0x69, (byte)0x82 }; // Security status not satisfied
     private static final byte[] SW_WRONG_LENGTH  = { 0x67, 0x00 };        // Wrong length
     private static final byte[] SW_WRONG_PARAMS  = { 0x6A, (byte)0x86 }; // Incorrect P1/P2
+    private static final byte[] SW_FAILURE       = { 0x6F, 0x00 };        // No precise diagnosis (ISO 7816-4)
+                                                                          // — used for §8.3.3.1 failure process.
     // 61 xx = response bytes still available (GET RESPONSE)
     // 90 00 = success
 
@@ -228,6 +230,14 @@ public class Aliro_HostApduService extends HostApduService
 
     // Step-Up phase state
     private boolean inStepUpPhase         = false;  // true after successful ENVELOPE exchange
+
+    // Per Aliro 1.0 §8.3.3.5: "After an EXCHANGE command containing 0x97,
+    // no further EXCHANGE commands can be sent." This flag tracks whether
+    // the current transaction has already received a terminal EXCHANGE
+    // (i.e. one carrying tag 0x97). Any subsequent EXCHANGE that arrives
+    // while this is true MUST trigger the failure process per §8.3.3.1.
+    // Cleared by resetState() at the start of each transaction.
+    private boolean terminalExchangeReceived = false;
     private byte[]  stepUpSKReader        = null;   // StepUpSKReader (for decrypting EXCHANGE in step-up phase)
     private byte[]  stepUpSKDevice        = null;   // StepUpSKDevice (for encrypting EXCHANGE in step-up phase)
     private int     stepUpReaderCounter   = 1;      // reader_counter for step-up phase EXCHANGE
@@ -1280,9 +1290,17 @@ public class Aliro_HostApduService extends HostApduService
             // Bit5: Mailbox can be WRITTEN
             // Bit6: Sending data to backend supported
             // Bit7: Sending data to bound app supported
-            byte[] storedDoc = AliroAccessDocument.getDocumentBytes(this);
-            boolean hasAccessDoc = (storedDoc != null && storedDoc.length > 0);
-            boolean hasRevocDoc  = AliroAccessDocument.hasRevocationDocument(this);
+            // We use the multi-doc API so that signaling_bitmap reflects the
+            // full collection rather than just the legacy single-doc mirror.
+            java.util.List<AliroAccessDocument.StoredDocument> storedDocs =
+                    AliroAccessDocument.getAllDocuments(this);
+            boolean hasAccessDoc = false;
+            boolean hasRevocDoc  = false;
+            for (AliroAccessDocument.StoredDocument sd : storedDocs)
+            {
+                if (sd.accessDocBytes      != null && sd.accessDocBytes.length      > 0) hasAccessDoc = true;
+                if (sd.revocationDocBytes  != null && sd.revocationDocBytes.length  > 0) hasRevocDoc  = true;
+            }
             int signalingBits = 0;
             if (hasAccessDoc) signalingBits |= 0x0001; // bit 0: access doc present
             if (hasRevocDoc)  signalingBits |= 0x0002; // bit 1: revocation doc present
@@ -1495,6 +1513,17 @@ public class Aliro_HostApduService extends HostApduService
             return SW_CONDITIONS;
         }
 
+        // Terminal-EXCHANGE rule per §8.3.3.5: once an EXCHANGE has arrived
+        // carrying tag 0x97, the spec forbids the Reader from sending any
+        // further EXCHANGEs ("After an EXCHANGE command containing 0x97,
+        // no further EXCHANGE commands can be sent."). If we still receive
+        // one, the peer is misbehaving — enter failure process per §8.3.3.1.
+        if (terminalExchangeReceived)
+        {
+            return enterFailureProcess(
+                    "EXCHANGE received after a terminal (0x97-bearing) EXCHANGE — §8.3.3.5");
+        }
+
         try
         {
             int dataOffset = getDataOffset(apdu);
@@ -1524,14 +1553,25 @@ public class Aliro_HostApduService extends HostApduService
             Log.d(TAG, "EXCHANGE decrypted: " + Hex.toHexString(decrypted));
 
             // Parse tag 97 (reader status): 97 02 <success> <state>
+            // Per §8.3.3.5, on NFC the EXCHANGE command "is used by the reader
+            // to indicate the end of the transaction and the final Reader state
+            // using tag 0x97." On NFC every value of the first byte is allowed
+            // (see Table 8-15) — the BLE-only restriction does not apply.
             boolean accessGranted = false;
+            int     readerStatus  = -1;  // raw success byte (0x00 or 0x01) — -1 if tag missing
+            int     readerState   = -1;  // raw state byte
+            boolean exchangeWasTerminal = false;
             for (int i = 0; i < decrypted.length - 1; i++)
             {
                 if (decrypted[i] == (byte)0x97 && decrypted[i + 1] == 0x02 && i + 3 < decrypted.length)
                 {
-                    accessGranted = (decrypted[i + 2] == 0x01);
-                    Log.d(TAG, "Reader status: success=" + decrypted[i + 2]
-                            + " state=" + String.format("%02X", decrypted[i + 3]));
+                    readerStatus  = decrypted[i + 2] & 0xFF;
+                    readerState   = decrypted[i + 3] & 0xFF;
+                    accessGranted = (readerStatus == 0x01);
+                    exchangeWasTerminal = true;
+                    Log.d(TAG, "Reader status: success=" + String.format("%02X", readerStatus)
+                            + " state=" + String.format("%02X", readerState)
+                            + " granted=" + accessGranted);
                     break;
                 }
             }
@@ -1555,11 +1595,19 @@ public class Aliro_HostApduService extends HostApduService
                 byte[] errEnc = inStepUpPhase
                         ? AliroCryptoProvider.encryptDeviceGcm(stepUpSKDevice, errPlaintext, stepUpDeviceCounter++)
                         : AliroCryptoProvider.encryptDeviceGcm(skDevice, errPlaintext, deviceCounter++);
-                if (errEnc == null) return SW_ERROR;
+                if (errEnc == null)
+                {
+                    zeroSessionKeys();
+                    return SW_ERROR;
+                }
                 byte[] errResp = new byte[errEnc.length + 2];
                 System.arraycopy(errEnc, 0, errResp, 0, errEnc.length);
                 errResp[errEnc.length]     = (byte)0x90;
                 errResp[errEnc.length + 1] = 0x00;
+                // Per §8.3.3.5.5: "The User Device SHALL destroy all session-bound
+                // keys and data after a sequence 0x0002||B1||B2 indicating an error
+                // is returned in the secure channel."
+                zeroSessionKeys();
                 return errResp;
             }
 
@@ -1569,6 +1617,8 @@ public class Aliro_HostApduService extends HostApduService
             Intent intent = new Intent("com.psia.pkoc.ALIRO_CREDENTIAL_SENT");
             intent.setPackage(getPackageName());
             intent.putExtra("accessGranted", accessGranted);
+            intent.putExtra("readerStatus",  readerStatus);
+            intent.putExtra("readerState",   readerState);
             sendBroadcast(intent);
 
             state = State.EXCHANGE_DONE;
@@ -1607,6 +1657,25 @@ public class Aliro_HostApduService extends HostApduService
             System.arraycopy(encryptedResponse, 0, response, 0, encryptedResponse.length);
             response[encryptedResponse.length]     = (byte)0x90;
             response[encryptedResponse.length + 1] = 0x00;
+
+            // Per §8.3.3.5.5: "The User Device SHALL destroy all session-bound
+            // keys and data after a sequence 0x0002||B1||B2 indicating an error
+            // is returned in the secure channel." (mailboxError path only.)
+            if (mailboxError)
+            {
+                zeroSessionKeys();
+            }
+
+            // Per §8.3.3.5 terminal-EXCHANGE rule: only set the flag AFTER
+            // the response has been generated, so the response to the
+            // terminal EXCHANGE itself goes out normally; subsequent
+            // EXCHANGEs (if the reader misbehaves) are rejected at the top
+            // of this handler on the next call.
+            if (exchangeWasTerminal)
+            {
+                terminalExchangeReceived = true;
+                Log.d(TAG, "EXCHANGE: terminal flag set — subsequent EXCHANGEs will fail per §8.3.3.5");
+            }
             return response;
         }
         catch (Exception e)
@@ -2058,7 +2127,8 @@ public class Aliro_HostApduService extends HostApduService
                 CBORObject dataIn = sdIn.get(CBORObject.FromObject("data"));
                 if (dataIn == null)
                 {
-                    Log.e(TAG, "ENVELOPE: SessionData missing 'data' field");
+                    Log.e(TAG, "ENVELOPE: SessionData missing 'data' field — failure process");
+                    zeroSessionKeys();
                     return SW_ERROR;
                 }
                 byte[] encryptedRequest = dataIn.GetByteString();
@@ -2067,7 +2137,8 @@ public class Aliro_HostApduService extends HostApduService
                         .decryptReaderGcm(suSKReader, encryptedRequest);
                 if (deviceRequest == null)
                 {
-                    Log.e(TAG, "ENVELOPE: DeviceRequest AES-GCM authentication failed");
+                    Log.e(TAG, "ENVELOPE: DeviceRequest AES-GCM authentication failed — failure process");
+                    zeroSessionKeys();
                     return SW_ERROR;
                 }
                 Log.d(TAG, "ENVELOPE: DeviceRequest (" + deviceRequest.length + " bytes)");
@@ -2077,7 +2148,8 @@ public class Aliro_HostApduService extends HostApduService
                 byte[] deviceResponse = buildDeviceResponse(deviceRequest);
                 if (deviceResponse == null)
                 {
-                    Log.e(TAG, "ENVELOPE: failed to build DeviceResponse");
+                    Log.e(TAG, "ENVELOPE: failed to build DeviceResponse — failure process");
+                    zeroSessionKeys();
                     return SW_ERROR;
                 }
 
@@ -2087,7 +2159,8 @@ public class Aliro_HostApduService extends HostApduService
                         .encryptDeviceGcm(suSKDevice, deviceResponse);
                 if (encryptedResponse == null)
                 {
-                    Log.e(TAG, "ENVELOPE: DeviceResponse encryption failed");
+                    Log.e(TAG, "ENVELOPE: DeviceResponse encryption failed — failure process");
+                    zeroSessionKeys();
                     return SW_ERROR;
                 }
                 CBORObject sdOut = CBORObject.NewOrderedMap();
@@ -2152,8 +2225,9 @@ public class Aliro_HostApduService extends HostApduService
         }
         catch (Exception e)
         {
-            Log.e(TAG, "ENVELOPE error", e);
+            Log.e(TAG, "ENVELOPE error — failure process", e);
             envelopeBuffer = null;
+            zeroSessionKeys();
             return SW_ERROR;
         }
     }
@@ -2248,24 +2322,37 @@ public class Aliro_HostApduService extends HostApduService
             0x00
         };
 
-        // Load stored documents upfront
-        byte[] accessDocBytes = AliroAccessDocument.getDocumentBytes(this);
-        byte[] revocDocBytes  = AliroAccessDocument.getRevocationDocumentBytes(this);
-        String storedElementId = AliroAccessDocument.getElementIdentifier(this);
-        String storedRevocElementId = AliroAccessDocument.getRevocationElementIdentifier(this);
+        // Load every stored Access/Revocation document pair from the multi-doc
+        // collection. Each entry is keyed by elementId (e.g. "floor1", "floor5",
+        // "pool_door"); the reader picks which one(s) it wants via DeviceRequest.
+        java.util.List<AliroAccessDocument.StoredDocument> storedDocs =
+                AliroAccessDocument.getAllDocuments(this);
+        Log.d(TAG, "buildDeviceResponse: stored docs=" + storedDocs.size());
 
         try
         {
-            // ---- Parse DeviceRequest to find requested docTypes ----
-            // We collect the set of docTypes the reader is asking for.
-            // If parsing fails, fall back to legacy behavior (return Access Document if present).
-            java.util.List<String> requestedDocTypes = new java.util.ArrayList<>();
+            // ---- Parse DeviceRequest ----
+            // We collect, per docType requested, the LIST of element identifiers
+            // the reader is asking for, in the order the reader specified them.
+            // If the reader doesn't list specific elements, we treat that as
+            // "any element of this docType".
+            //   requestedElements: Map< docType, List<elementId> >  (order-preserving)
+            //   docTypesAnyElement: Set<docType> where the reader wants any/all elements
+            //
+            // Order matters because the reader's slicer (sliceDeviceResponsePerDocument)
+            // is positional — slice N gets verified against the Nth element from
+            // the reader's request list. If we emit out of order, the reader's
+            // result-screen labels each slice with the wrong requested-element id
+            // (Aliro 1.0 §8.4.2 doesn't mandate response order, but matching
+            //  request order makes the per-slice display intelligible).
+            java.util.Map<String, java.util.List<String>> requestedElements =
+                    new java.util.LinkedHashMap<>();
+            java.util.Set<String> docTypesAnyElement = new java.util.LinkedHashSet<>();
             boolean parseOk = false;
 
             try
             {
                 CBORObject req = CBORObject.DecodeFromBytes(deviceRequest);
-                // Key "2" → docRequests array
                 CBORObject docRequestsArr = req.get(CBORObject.FromObject("2"));
                 if (docRequestsArr != null
                         && docRequestsArr.getType() == com.upokecenter.cbor.CBORType.Array)
@@ -2274,9 +2361,7 @@ public class Aliro_HostApduService extends HostApduService
                     {
                         CBORObject docReq = docRequestsArr.get(i);
 
-                        // Key "1" → itemsRequest, which may be:
-                        //   a) A plain CBOR map (itemsRequest directly), OR
-                        //   b) A CBOR bstr wrapped in tag 24 (#6.24(bstr(itemsRequest)))
+                        // itemsRequest may be a plain map or wrapped in tag 24.
                         CBORObject itemsReqRaw = docReq.get(CBORObject.FromObject("1"));
                         if (itemsReqRaw == null) continue;
 
@@ -2284,51 +2369,88 @@ public class Aliro_HostApduService extends HostApduService
                         if (itemsReqRaw.getType() == com.upokecenter.cbor.CBORType.ByteString
                                 || itemsReqRaw.isTagged())
                         {
-                            // Unwrap tag 24: get inner bstr and decode as CBOR
                             try
                             {
                                 byte[] innerBytes = itemsReqRaw.GetByteString();
                                 itemsReq = CBORObject.DecodeFromBytes(innerBytes);
                             }
-                            catch (Exception unwrapEx)
-                            {
-                                // Not a bstr or can't decode — use as-is
-                                itemsReq = itemsReqRaw;
-                            }
+                            catch (Exception unwrapEx) { itemsReq = itemsReqRaw; }
                         }
                         else
                         {
                             itemsReq = itemsReqRaw;
                         }
 
-                        // Key "5" → docType string
+                        // Pull docType (key "5") — fallback to outer docReq if absent.
+                        String docType = null;
                         CBORObject docTypeObj = itemsReq.get(CBORObject.FromObject("5"));
                         if (docTypeObj != null)
                         {
-                            try
-                            {
-                                String docType = docTypeObj.AsString();
-                                Log.d(TAG, "buildDeviceResponse: reader requests docType=" + docType);
-                                if (!requestedDocTypes.contains(docType))
-                                    requestedDocTypes.add(docType);
-                            }
-                            catch (Exception ignored) {}
+                            try { docType = docTypeObj.AsString(); } catch (Exception ignored) {}
                         }
-                        else
+                        if (docType == null)
                         {
-                            // Fallback: look for docType as key "5" in the outer docReq map
                             CBORObject outerDocType = docReq.get(CBORObject.FromObject("5"));
                             if (outerDocType != null)
                             {
-                                try
-                                {
-                                    String docType = outerDocType.AsString();
-                                    Log.d(TAG, "buildDeviceResponse: outer docType=" + docType);
-                                    if (!requestedDocTypes.contains(docType))
-                                        requestedDocTypes.add(docType);
-                                }
-                                catch (Exception ignored) {}
+                                try { docType = outerDocType.AsString(); } catch (Exception ignored) {}
                             }
+                        }
+                        if (docType == null) continue;
+
+                        Log.d(TAG, "buildDeviceResponse: reader requests docType=" + docType);
+
+                        // Pull namespaces (key "1" inside itemsRequest): map
+                        //   { "<namespace>": { "<elementId>": <bool>, ... }, ... }
+                        // Collect all element identifiers requested under the
+                        // matching docType namespace, preserving the order the
+                        // reader listed them.
+                        CBORObject namespaces = itemsReq.get(CBORObject.FromObject("1"));
+                        java.util.List<String> elementList = requestedElements.get(docType);
+                        if (elementList == null)
+                        {
+                            elementList = new java.util.ArrayList<>();
+                            requestedElements.put(docType, elementList);
+                        }
+
+                        boolean foundElements = false;
+                        if (namespaces != null
+                                && namespaces.getType() == com.upokecenter.cbor.CBORType.Map)
+                        {
+                            for (CBORObject nsKey : namespaces.getKeys())
+                            {
+                                String ns;
+                                try { ns = nsKey.AsString(); }
+                                catch (Exception ignored) { continue; }
+                                CBORObject nsMap = namespaces.get(nsKey);
+                                if (nsMap == null
+                                        || nsMap.getType() != com.upokecenter.cbor.CBORType.Map)
+                                    continue;
+                                for (CBORObject elemKey : nsMap.getKeys())
+                                {
+                                    try
+                                    {
+                                        String elemId = elemKey.AsString();
+                                        if (!elementList.contains(elemId))
+                                        {
+                                            elementList.add(elemId);
+                                        }
+                                        foundElements = true;
+                                        Log.d(TAG, "buildDeviceResponse:   namespace=" + ns
+                                                + " element=" + elemId);
+                                    }
+                                    catch (Exception ignored) {}
+                                }
+                            }
+                        }
+
+                        if (!foundElements)
+                        {
+                            // Reader requested a docType but didn't enumerate elements
+                            // (or we couldn't parse them). Treat as "any element".
+                            docTypesAnyElement.add(docType);
+                            Log.d(TAG, "buildDeviceResponse:   docType=" + docType
+                                    + " requested with no specific elements");
                         }
                     }
                     parseOk = true;
@@ -2336,87 +2458,154 @@ public class Aliro_HostApduService extends HostApduService
             }
             catch (Exception parseEx)
             {
-                // DeviceRequest couldn't be parsed — fall back to returning Access Document
-                Log.w(TAG, "buildDeviceResponse: could not parse DeviceRequest, returning Access Doc", parseEx);
+                Log.w(TAG, "buildDeviceResponse: could not parse DeviceRequest", parseEx);
             }
 
-            // ---- Fallback: if parse failed or no docTypes found, use Access Document ----
-            if (!parseOk || requestedDocTypes.isEmpty())
+            // ---- Fallback: parse failed or no docTypes found ----
+            // Return the first stored access document (legacy behavior).
+            if (!parseOk || (requestedElements.isEmpty() && docTypesAnyElement.isEmpty()))
             {
-                if (accessDocBytes != null && accessDocBytes.length > 0)
+                if (!storedDocs.isEmpty())
                 {
-                    Log.d(TAG, "buildDeviceResponse: fallback — returning stored Access Document ("
-                            + accessDocBytes.length + " bytes)");
-                    return accessDocBytes;
+                    byte[] firstAccess = storedDocs.get(0).accessDocBytes;
+                    Log.d(TAG, "buildDeviceResponse: fallback — returning first stored Access Document ("
+                            + firstAccess.length + " bytes)");
+                    return firstAccess;
                 }
-                else
-                {
-                    Log.d(TAG, "buildDeviceResponse: no document provisioned — returning empty DeviceResponse");
-                    return EMPTY_RESPONSE;
-                }
+                Log.d(TAG, "buildDeviceResponse: no document provisioned — returning empty DeviceResponse");
+                return EMPTY_RESPONSE;
             }
 
-            // ---- Build new DeviceResponse containing all matching documents ----
-            // Extract inner document objects from each stored DeviceResponse.
+            // ---- Build new DeviceResponse with matching documents ----
             java.util.List<CBORObject> matchedDocs = new java.util.ArrayList<>();
 
-            for (String docType : requestedDocTypes)
+            // For aliro-a (Access Document), match by element identifier.
+            // Iterate over the reader's REQUESTED ELEMENT LIST in order
+            // (not over storedDocs), so emit position == request position.
+            // For each requested element, find the stored doc that carries it.
+            // If no specific elements were requested (accessAny), emit every
+            // stored doc in storage order — there's no request order to honor.
+            java.util.List<String> requestedAccessElementsList =
+                    requestedElements.get(AliroAccessDocument.DOCTYPE_ACCESS);
+            boolean accessAny = docTypesAnyElement.contains(AliroAccessDocument.DOCTYPE_ACCESS);
+            if (accessAny)
             {
-                if (AliroAccessDocument.DOCTYPE_ACCESS.equals(docType))
+                for (AliroAccessDocument.StoredDocument sd : storedDocs)
                 {
-                    // Access Document requested
-                    if (accessDocBytes != null && accessDocBytes.length > 0)
+                    if (sd.accessDocBytes == null) continue;
+                    // §8.4.2: SHOULD NOT return data elements when IssuerAuth
+                    // Validity is not current. Drop expired or not-yet-valid docs.
+                    if (!AliroAccessDocument.isValidityCurrent(sd.accessDocBytes))
                     {
-                        try
-                        {
-                            CBORObject storedResponse = CBORObject.DecodeFromBytes(accessDocBytes);
-                            CBORObject docsArray = storedResponse.get(CBORObject.FromObject("2"));
-                            if (docsArray != null && docsArray.size() > 0)
-                            {
-                                CBORObject innerDoc = docsArray.get(0);
-                                matchedDocs.add(innerDoc);
-                                Log.d(TAG, "buildDeviceResponse: added aliro-a document");
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            Log.w(TAG, "buildDeviceResponse: failed to extract aliro-a inner doc", ex);
-                        }
+                        Log.d(TAG, "buildDeviceResponse: skipping elementId=" + sd.elementId
+                                + " — IssuerAuth Validity not current");
+                        continue;
                     }
-                    else
+                    CBORObject inner = extractInnerDocument(sd.accessDocBytes);
+                    if (inner != null)
                     {
-                        Log.d(TAG, "buildDeviceResponse: aliro-a requested but not stored — skipping");
+                        matchedDocs.add(inner);
+                        Log.d(TAG, "buildDeviceResponse: matched Access Document elementId="
+                                + sd.elementId + " (any-element mode)");
                     }
                 }
-                else if (AliroAccessDocument.DOCTYPE_REVOCATION.equals(docType))
+            }
+            else if (requestedAccessElementsList != null)
+            {
+                for (String requestedElemId : requestedAccessElementsList)
                 {
-                    // Revocation Document requested
-                    if (revocDocBytes != null && revocDocBytes.length > 0)
+                    AliroAccessDocument.StoredDocument matchSd = null;
+                    for (AliroAccessDocument.StoredDocument sd : storedDocs)
                     {
-                        try
+                        if (sd.accessDocBytes == null) continue;
+                        if (requestedElemId.equals(sd.elementId))
                         {
-                            CBORObject storedResponse = CBORObject.DecodeFromBytes(revocDocBytes);
-                            CBORObject docsArray = storedResponse.get(CBORObject.FromObject("2"));
-                            if (docsArray != null && docsArray.size() > 0)
-                            {
-                                CBORObject innerDoc = docsArray.get(0);
-                                matchedDocs.add(innerDoc);
-                                Log.d(TAG, "buildDeviceResponse: added aliro-r document");
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            Log.w(TAG, "buildDeviceResponse: failed to extract aliro-r inner doc", ex);
+                            matchSd = sd;
+                            break;
                         }
                     }
-                    else
+                    if (matchSd == null)
                     {
-                        Log.d(TAG, "buildDeviceResponse: aliro-r requested but not stored — skipping");
+                        Log.d(TAG, "buildDeviceResponse: requested elementId="
+                                + requestedElemId + " not present — skipping");
+                        continue;
+                    }
+                    if (!AliroAccessDocument.isValidityCurrent(matchSd.accessDocBytes))
+                    {
+                        Log.d(TAG, "buildDeviceResponse: skipping elementId=" + matchSd.elementId
+                                + " — IssuerAuth Validity not current");
+                        continue;
+                    }
+                    CBORObject inner = extractInnerDocument(matchSd.accessDocBytes);
+                    if (inner != null)
+                    {
+                        matchedDocs.add(inner);
+                        Log.d(TAG, "buildDeviceResponse: matched Access Document elementId="
+                                + matchSd.elementId + " (request-order position "
+                                + (matchedDocs.size() - 1) + ")");
                     }
                 }
-                else
+            }
+
+            // For aliro-r (Revocation Document), match by element identifier the
+            // same way — request order out, storage order only as a fallback.
+            java.util.List<String> requestedRevocElementsList =
+                    requestedElements.get(AliroAccessDocument.DOCTYPE_REVOCATION);
+            boolean revocAny = docTypesAnyElement.contains(AliroAccessDocument.DOCTYPE_REVOCATION);
+            if (revocAny)
+            {
+                for (AliroAccessDocument.StoredDocument sd : storedDocs)
                 {
-                    Log.d(TAG, "buildDeviceResponse: unknown docType=" + docType + " — skipping");
+                    if (sd.revocationDocBytes == null) continue;
+                    if (!AliroAccessDocument.isValidityCurrent(sd.revocationDocBytes))
+                    {
+                        Log.d(TAG, "buildDeviceResponse: skipping revoc elementId="
+                                + sd.elementId + " — IssuerAuth Validity not current");
+                        continue;
+                    }
+                    CBORObject inner = extractInnerDocument(sd.revocationDocBytes);
+                    if (inner != null)
+                    {
+                        matchedDocs.add(inner);
+                        Log.d(TAG, "buildDeviceResponse: matched Revocation Document elementId="
+                                + sd.elementId + " (any-element mode)");
+                    }
+                }
+            }
+            else if (requestedRevocElementsList != null)
+            {
+                for (String requestedElemId : requestedRevocElementsList)
+                {
+                    AliroAccessDocument.StoredDocument matchSd = null;
+                    for (AliroAccessDocument.StoredDocument sd : storedDocs)
+                    {
+                        if (sd.revocationDocBytes == null) continue;
+                        if (requestedElemId.equals(sd.elementId))
+                        {
+                            matchSd = sd;
+                            break;
+                        }
+                    }
+                    if (matchSd == null)
+                    {
+                        Log.d(TAG, "buildDeviceResponse: requested revoc elementId="
+                                + requestedElemId + " not present — skipping");
+                        continue;
+                    }
+                    if (!AliroAccessDocument.isValidityCurrent(matchSd.revocationDocBytes))
+                    {
+                        Log.d(TAG, "buildDeviceResponse: skipping revoc elementId="
+                                + matchSd.elementId + " — IssuerAuth Validity not current");
+                        continue;
+                    }
+                    CBORObject inner = extractInnerDocument(matchSd.revocationDocBytes);
+                    if (inner != null)
+                    {
+                        matchedDocs.add(inner);
+                        Log.d(TAG, "buildDeviceResponse: matched Revocation Document elementId="
+                                + matchSd.elementId + " (request-order position "
+                                + (matchedDocs.size() - 1) + ")");
+                    }
                 }
             }
 
@@ -2430,10 +2619,7 @@ public class Aliro_HostApduService extends HostApduService
             CBORObject newResponse = CBORObject.NewOrderedMap();
             newResponse.Add(CBORObject.FromObject("1"), CBORObject.FromObject("1.0"));
             CBORObject newDocsArray = CBORObject.NewArray();
-            for (CBORObject doc : matchedDocs)
-            {
-                newDocsArray.Add(doc);
-            }
+            for (CBORObject d : matchedDocs) newDocsArray.Add(d);
             newResponse.Add(CBORObject.FromObject("2"), newDocsArray);
             newResponse.Add(CBORObject.FromObject("3"), CBORObject.FromObject(0));
 
@@ -2446,11 +2632,32 @@ public class Aliro_HostApduService extends HostApduService
         catch (Exception e)
         {
             Log.e(TAG, "buildDeviceResponse failed", e);
-            // Last-resort fallback: return raw access doc bytes if available
-            if (accessDocBytes != null && accessDocBytes.length > 0)
-                return accessDocBytes;
+            // Last-resort fallback: return first stored access doc if available
+            if (!storedDocs.isEmpty()) return storedDocs.get(0).accessDocBytes;
             return EMPTY_RESPONSE;
         }
+    }
+
+    /**
+     * Unwrap a stored DeviceResponse blob ({"1":"1.0","2":[innerDoc],"3":0}) and
+     * return its first inner document, or null on failure.
+     */
+    private CBORObject extractInnerDocument(byte[] storedDocResponseBytes)
+    {
+        try
+        {
+            CBORObject storedResponse = CBORObject.DecodeFromBytes(storedDocResponseBytes);
+            CBORObject docsArray = storedResponse.get(CBORObject.FromObject("2"));
+            if (docsArray != null && docsArray.size() > 0)
+            {
+                return docsArray.get(0);
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.w(TAG, "extractInnerDocument failed", ex);
+        }
+        return null;
     }
 
     /**
@@ -2640,6 +2847,36 @@ public class Aliro_HostApduService extends HostApduService
         if (stepUpSKDevice != null) { Arrays.fill(stepUpSKDevice, (byte)0); stepUpSKDevice = null; }
     }
 
+    /**
+     * Failure process per Aliro 1.0 §8.3.3.1.
+     *
+     * <p>When a User Device failure state is reached, §8.3.3.1 requires:
+     * <ul>
+     *   <li>Return an empty response data field
+     *   <li>Return an error code as defined in §8.3.2.3 (recommended from
+     *       ISO 7816-4 — we use 0x6F00 "no precise diagnosis")
+     *   <li>Destroy all session-bound keys and data
+     *   <li>Terminate the transaction
+     * </ul>
+     *
+     * <p>This helper performs steps 3 and 4 (key destruction, transaction
+     * teardown) and returns the bytes the caller should send back to the
+     * Reader (steps 1 and 2 — empty data field + SW=6F00).
+     */
+    private byte[] enterFailureProcess(String reason)
+    {
+        Log.w(TAG, "Failure process (§8.3.3.1): " + reason);
+        // §8.3.3.1 step 3: destroy session-bound keys.
+        zeroSessionKeys();
+        if (stepUpSK != null) { Arrays.fill(stepUpSK, (byte)0); stepUpSK = null; }
+        // §8.3.3.1 step 4: terminate the transaction.
+        state = State.IDLE;
+        inStepUpPhase = false;
+        // §8.3.3.1 steps 1+2: empty data field, error code from §8.3.2.3.
+        return SW_FAILURE;
+    }
+
+
     private void resetState()
     {
         state             = State.IDLE;
@@ -2659,6 +2896,7 @@ public class Aliro_HostApduService extends HostApduService
         zeroSessionKeys();
         if (stepUpSK  != null) { Arrays.fill(stepUpSK,  (byte)0); stepUpSK  = null; }
         inStepUpPhase = false;
+        terminalExchangeReceived = false;
         // Reset per-message counters
         readerCounter = 1; // first EXCHANGE command uses 1
         deviceCounter = 1; // AUTH1 response uses 1, EXCHANGE responses start at 2

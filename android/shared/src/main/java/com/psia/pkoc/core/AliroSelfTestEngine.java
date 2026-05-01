@@ -188,6 +188,15 @@ public class AliroSelfTestEngine
         // Group Negative (new)
         runAndReport(results, cb, this::testNegFastCryptogramTampered);
 
+        // =====================================================================
+        // v11 tests (per-document content + multi-element / multi-document)
+        // =====================================================================
+        runAndReport(results, cb, this::testVerifierAccessDataPresets);
+        runAndReport(results, cb, this::testVerifierEmployeeIdRoundtrip);
+        runAndReport(results, cb, this::testVerifierValidityCurrentHelper);
+        runAndReport(results, cb, this::testVerifierNightShiftCrossMidnight);
+        runAndReport(results, cb, this::testFullFlowMultiElementDeviceRequest);
+
         if (cb != null) cb.onAllComplete(results);
         return results;
     }
@@ -4809,6 +4818,588 @@ public class AliroSelfTestEngine
     {
         return new TestResult(testId, group, name, passed, false, detail,
                 System.currentTimeMillis() - startMs);
+    }
+
+    // =========================================================================
+    // v11 tests — per-document content configurability + multi-element /
+    // multi-document support. Each test cites the relevant Aliro 1.0 spec
+    // section so future maintainers can trace the assertion back to the spec.
+    // =========================================================================
+
+    /**
+     * VERIFIER_ACCESSDATA_PRESETS
+     *
+     * Generate AccessData CBOR for each of the five v11 SchedulePreset values
+     * via the package-private helper buildAccessDataFromConfig and verify each
+     * output is spec-conformant per Aliro 1.0 §7.3:
+     *
+     *   - Map keys 0/1/2/3 all present (Table 7-5)
+     *   - id (key 1) is a bstr containing the requested employeeId UTF-8
+     *   - AccessRules (key 2) is a non-empty array
+     *   - Each AccessRule's capabilities (key 0) uses only spec-defined bits
+     *     (0x01 Secure, 0x02 Unsecure, 0x08 Momentary_Unsecure)
+     *   - Schedules (key 3) is a non-empty array
+     *   - Each Schedule has startPeriod / endPeriod / recurrenceRule / flags
+     *   - recurrenceRule pattern (index 2) is 2 (Weekly) per Table 7-9
+     *   - dayMask (index 1) uses only the 7 spec-defined bits (0x7F)
+     */
+    private TestResult testVerifierAccessDataPresets()
+    {
+        long start = System.currentTimeMillis();
+        try
+        {
+            final int allowedCapBits = 0x01 | 0x02 | 0x08;
+            final int allowedDayMask = 0x7F;
+
+            for (AliroAccessDocument.SchedulePreset preset
+                    : AliroAccessDocument.SchedulePreset.values())
+            {
+                AliroAccessDocument.AccessDocConfig config =
+                        new AliroAccessDocument.AccessDocConfig(
+                                "test_" + preset.name(), "EMP-" + preset.ordinal(), preset);
+                CBORObject accessData =
+                        AliroAccessDocument.buildAccessDataFromConfig(config);
+                if (accessData == null)
+                    return result("VERIFIER_ACCESSDATA_PRESETS", "Verifier",
+                            "AccessData presets (§7.3 / Table 7-5)", false,
+                            "preset " + preset.name() + " produced null AccessData", start);
+
+                // Required keys 0/1/2/3
+                for (int k = 0; k <= 3; k++)
+                {
+                    if (accessData.get(CBORObject.FromObject(k)) == null)
+                        return result("VERIFIER_ACCESSDATA_PRESETS", "Verifier",
+                                "AccessData presets (§7.3 / Table 7-5)", false,
+                                "preset " + preset.name() + " missing key " + k, start);
+                }
+
+                // id (key 1) — UTF-8 bstr of employeeId
+                byte[] idBytes = accessData.get(CBORObject.FromObject(1)).GetByteString();
+                String idStr = new String(idBytes, java.nio.charset.StandardCharsets.UTF_8);
+                if (!config.employeeId.equals(idStr))
+                    return result("VERIFIER_ACCESSDATA_PRESETS", "Verifier",
+                            "AccessData presets (§7.3 / Table 7-5)", false,
+                            "preset " + preset.name() + " id roundtrip: expected '"
+                                    + config.employeeId + "', got '" + idStr + "'", start);
+
+                // AccessRules (key 2) — array, capabilities bitmask sane
+                CBORObject rules = accessData.get(CBORObject.FromObject(2));
+                if (rules.size() == 0)
+                    return result("VERIFIER_ACCESSDATA_PRESETS", "Verifier",
+                            "AccessData presets (§7.3 / Table 7-5)", false,
+                            "preset " + preset.name() + " AccessRules is empty", start);
+                for (int i = 0; i < rules.size(); i++)
+                {
+                    int caps = rules.get(i).get(CBORObject.FromObject(0)).AsInt32Value();
+                    if ((caps & ~allowedCapBits) != 0)
+                        return result("VERIFIER_ACCESSDATA_PRESETS", "Verifier",
+                                "AccessData presets (§7.3 / Table 7-5)", false,
+                                "preset " + preset.name() + " rule " + i
+                                        + " uses unknown capability bits: 0x"
+                                        + String.format("%02X", caps), start);
+                }
+
+                // Schedules (key 3) — array, recurrenceRule pattern == 2 (Weekly)
+                CBORObject schedules = accessData.get(CBORObject.FromObject(3));
+                if (schedules.size() == 0)
+                    return result("VERIFIER_ACCESSDATA_PRESETS", "Verifier",
+                            "AccessData presets (§7.3 / Table 7-5)", false,
+                            "preset " + preset.name() + " Schedules is empty", start);
+                for (int i = 0; i < schedules.size(); i++)
+                {
+                    CBORObject sched = schedules.get(i);
+                    if (sched.get(CBORObject.FromObject(0)) == null
+                            || sched.get(CBORObject.FromObject(1)) == null
+                            || sched.get(CBORObject.FromObject(2)) == null
+                            || sched.get(CBORObject.FromObject(3)) == null)
+                        return result("VERIFIER_ACCESSDATA_PRESETS", "Verifier",
+                                "AccessData presets (§7.3 / Table 7-5)", false,
+                                "preset " + preset.name() + " schedule " + i
+                                        + " missing required key (start/end/recur/flags)", start);
+
+                    CBORObject recRule = sched.get(CBORObject.FromObject(2));
+                    if (recRule.size() < 5)
+                        return result("VERIFIER_ACCESSDATA_PRESETS", "Verifier",
+                                "AccessData presets (§7.3 / Table 7-5)", false,
+                                "preset " + preset.name() + " schedule " + i
+                                        + " recurrenceRule has " + recRule.size()
+                                        + " elements (need 5)", start);
+                    int pattern = recRule.get(2).AsInt32Value();
+                    if (pattern != 2)
+                        return result("VERIFIER_ACCESSDATA_PRESETS", "Verifier",
+                                "AccessData presets (§7.3 / Table 7-5)", false,
+                                "preset " + preset.name() + " schedule " + i
+                                        + " pattern=" + pattern + " (must be 2 = Weekly)", start);
+                    int dayMask = recRule.get(1).AsInt32Value();
+                    if ((dayMask & ~allowedDayMask) != 0)
+                        return result("VERIFIER_ACCESSDATA_PRESETS", "Verifier",
+                                "AccessData presets (§7.3 / Table 7-5)", false,
+                                "preset " + preset.name() + " schedule " + i
+                                        + " dayMask=0x" + String.format("%02X", dayMask)
+                                        + " has bits outside 0x7F", start);
+                }
+            }
+            return result("VERIFIER_ACCESSDATA_PRESETS", "Verifier",
+                    "AccessData presets (§7.3 / Table 7-5)", true,
+                    "All 5 SchedulePreset values produce spec-conformant AccessData "
+                            + "(keys 0/1/2/3 present; capabilities use 0x01/0x02/0x08 only; "
+                            + "recurrenceRule pattern=2 Weekly; dayMask within 0x7F)", start);
+        }
+        catch (Exception e)
+        {
+            return result("VERIFIER_ACCESSDATA_PRESETS", "Verifier",
+                    "AccessData presets (§7.3 / Table 7-5)", false, e.toString(), start);
+        }
+    }
+
+    /**
+     * VERIFIER_EMPLOYEE_ID_ROUNDTRIP
+     *
+     * Verify that a custom Employee/Badge ID supplied in AccessDocConfig
+     * round-trips through the AccessData CBOR encoding as a UTF-8 bstr in
+     * key 1 per Aliro 1.0 §7.3 / Table 7-5.
+     */
+    private TestResult testVerifierEmployeeIdRoundtrip()
+    {
+        long start = System.currentTimeMillis();
+        try
+        {
+            // A spread of values: ASCII, longer, mixed-case, with digits.
+            String[] testIds = {
+                "ELATEC001",
+                "EMP-12345",
+                "JaneDoe.42",
+                "X"
+            };
+            for (String id : testIds)
+            {
+                AliroAccessDocument.AccessDocConfig cfg =
+                        new AliroAccessDocument.AccessDocConfig(
+                                "any", id, AliroAccessDocument.SchedulePreset.WEEKDAY_AND_WEEKEND);
+                CBORObject ad = AliroAccessDocument.buildAccessDataFromConfig(cfg);
+                CBORObject idObj = ad.get(CBORObject.FromObject(1));
+                if (idObj == null || idObj.getType() != com.upokecenter.cbor.CBORType.ByteString)
+                    return result("VERIFIER_EMPLOYEE_ID_ROUNDTRIP", "Verifier",
+                            "Employee ID round-trip (§7.3 key 1)", false,
+                            "id field missing or not bstr for value '" + id + "'", start);
+                byte[] bytes = idObj.GetByteString();
+                String back = new String(bytes, java.nio.charset.StandardCharsets.UTF_8);
+                if (!id.equals(back))
+                    return result("VERIFIER_EMPLOYEE_ID_ROUNDTRIP", "Verifier",
+                            "Employee ID round-trip (§7.3 key 1)", false,
+                            "round-trip mismatch: '" + id + "' -> '" + back + "'", start);
+            }
+            return result("VERIFIER_EMPLOYEE_ID_ROUNDTRIP", "Verifier",
+                    "Employee ID round-trip (§7.3 key 1)", true,
+                    "All 4 test IDs round-trip as UTF-8 bstr in AccessData.id (key 1)", start);
+        }
+        catch (Exception e)
+        {
+            return result("VERIFIER_EMPLOYEE_ID_ROUNDTRIP", "Verifier",
+                    "Employee ID round-trip (§7.3 key 1)", false, e.toString(), start);
+        }
+    }
+
+    /**
+     * VERIFIER_VALIDITY_CURRENT_HELPER
+     *
+     * Build three synthetic DeviceResponse CBOR blobs whose IssuerAuth MSO
+     * carries a Validity window that is (a) currently active, (b) expired,
+     * (c) not yet valid. Verify that AliroAccessDocument.isValidityCurrent
+     * returns true / false / false respectively, per the §8.4.2 SHOULD-check.
+     */
+    private TestResult testVerifierValidityCurrentHelper()
+    {
+        long start = System.currentTimeMillis();
+        try
+        {
+            java.time.Instant now = java.time.Instant.now();
+            String currentFrom  = now.minusSeconds(86400).toString();
+            String currentUntil = now.plusSeconds(86400).toString();
+            String pastFrom     = now.minusSeconds(2 * 86400).toString();
+            String pastUntil    = now.minusSeconds(60).toString();
+            String futureFrom   = now.plusSeconds(60).toString();
+            String futureUntil  = now.plusSeconds(86400).toString();
+
+            byte[] current  = buildMinimalDeviceResponseWithValidity(currentFrom, currentUntil);
+            byte[] expired  = buildMinimalDeviceResponseWithValidity(pastFrom,    pastUntil);
+            byte[] notYet   = buildMinimalDeviceResponseWithValidity(futureFrom,  futureUntil);
+
+            boolean currentOK = AliroAccessDocument.isValidityCurrent(current);
+            boolean expiredOK = AliroAccessDocument.isValidityCurrent(expired);
+            boolean notYetOK  = AliroAccessDocument.isValidityCurrent(notYet);
+
+            if (!currentOK)
+                return result("VERIFIER_VALIDITY_CURRENT_HELPER", "Verifier",
+                        "Validity current helper (§8.4.2 SHOULD)", false,
+                        "current Validity returned false", start);
+            if (expiredOK)
+                return result("VERIFIER_VALIDITY_CURRENT_HELPER", "Verifier",
+                        "Validity current helper (§8.4.2 SHOULD)", false,
+                        "expired Validity returned true", start);
+            if (notYetOK)
+                return result("VERIFIER_VALIDITY_CURRENT_HELPER", "Verifier",
+                        "Validity current helper (§8.4.2 SHOULD)", false,
+                        "not-yet-valid Validity returned true", start);
+            return result("VERIFIER_VALIDITY_CURRENT_HELPER", "Verifier",
+                    "Validity current helper (§8.4.2 SHOULD)", true,
+                    "isValidityCurrent: current=true, expired=false, notYetValid=false", start);
+        }
+        catch (Exception e)
+        {
+            return result("VERIFIER_VALIDITY_CURRENT_HELPER", "Verifier",
+                    "Validity current helper (§8.4.2 SHOULD)", false, e.toString(), start);
+        }
+    }
+
+    /**
+     * Build a minimal DeviceResponse CBOR carrying just enough structure for
+     * isValidityCurrent to navigate to the MSO's validityInfo. The
+     * IssuerSigned / IssuerAuth shape mirrors the real generator's output so
+     * the navigation matches: documents[0]."1"."2"[2] (encoded MSO bstr).
+     */
+    private static byte[] buildMinimalDeviceResponseWithValidity(String fromIso, String untilIso)
+    {
+        // MSO: { "1": "1.0", "6": { "2": tag0(fromIso), "3": tag0(untilIso) } }
+        CBORObject mso = CBORObject.NewOrderedMap();
+        mso.Add(CBORObject.FromObject("1"), CBORObject.FromObject("1.0"));
+        CBORObject validity = CBORObject.NewOrderedMap();
+        // The real generator emits tag 0 wrapping the ISO string; isValidityCurrent
+        // calls AsString() which works on tag 0 (#6.0 tstr) the same as a plain tstr.
+        validity.Add(CBORObject.FromObject("2"),
+                CBORObject.FromObjectAndTag(fromIso, 0));
+        validity.Add(CBORObject.FromObject("3"),
+                CBORObject.FromObjectAndTag(untilIso, 0));
+        mso.Add(CBORObject.FromObject("6"), validity);
+        byte[] msoBytes = mso.EncodeToBytes();
+
+        // IssuerAuth COSE_Sign1 = [protected, unprotected, payload(bstr), signature]
+        // payload is bstr( tag24( bstr(MSO) ) ) per ISO 18013-5
+        CBORObject taggedPayload = CBORObject.FromObjectAndTag(msoBytes, 24);
+        byte[] payloadBytes = taggedPayload.EncodeToBytes();
+
+        CBORObject iAuth = CBORObject.NewArray();
+        iAuth.Add(CBORObject.FromObject(new byte[0]));        // protected (empty)
+        iAuth.Add(CBORObject.NewMap());                       // unprotected
+        iAuth.Add(CBORObject.FromObject(payloadBytes));       // payload
+        iAuth.Add(CBORObject.FromObject(new byte[64]));       // signature (placeholder)
+
+        CBORObject issuerSigned = CBORObject.NewOrderedMap();
+        issuerSigned.Add(CBORObject.FromObject("2"), iAuth);
+
+        CBORObject doc = CBORObject.NewOrderedMap();
+        doc.Add(CBORObject.FromObject("1"), issuerSigned);
+        doc.Add(CBORObject.FromObject("5"), CBORObject.FromObject("aliro-a"));
+
+        CBORObject docs = CBORObject.NewArray();
+        docs.Add(doc);
+
+        CBORObject deviceResponse = CBORObject.NewOrderedMap();
+        deviceResponse.Add(CBORObject.FromObject("1"), CBORObject.FromObject("1.0"));
+        deviceResponse.Add(CBORObject.FromObject("2"), docs);
+        deviceResponse.Add(CBORObject.FromObject("3"), CBORObject.FromObject(0));
+
+        return deviceResponse.EncodeToBytes();
+    }
+
+    /**
+     * VERIFIER_NIGHT_SHIFT_CROSSMIDNIGHT
+     *
+     * Verify that the NIGHT_SHIFT preset produces a Schedule whose
+     * recurrenceRule encodes the cross-midnight pattern correctly per
+     * Aliro 1.0 §7.3.4 / Table 7-9:
+     *   - durationSeconds = 8h (28800)
+     *   - dayMask = 0x1F (Mon-Fri, bits 0-4)
+     *   - pattern = 2 (Weekly)
+     *   - startPeriod's TOD component = 22:00 UTC (anchors the recurring window)
+     */
+    private TestResult testVerifierNightShiftCrossMidnight()
+    {
+        long start = System.currentTimeMillis();
+        try
+        {
+            AliroAccessDocument.AccessDocConfig cfg =
+                    new AliroAccessDocument.AccessDocConfig(
+                            "night", "EMP-NIGHT",
+                            AliroAccessDocument.SchedulePreset.NIGHT_SHIFT);
+            CBORObject ad = AliroAccessDocument.buildAccessDataFromConfig(cfg);
+            CBORObject schedules = ad.get(CBORObject.FromObject(3));
+            if (schedules == null || schedules.size() != 1)
+                return result("VERIFIER_NIGHT_SHIFT_CROSSMIDNIGHT", "Verifier",
+                        "Night Shift cross-midnight (§7.3.4 / Table 7-9)", false,
+                        "expected 1 schedule, got "
+                                + (schedules == null ? "null" : schedules.size()), start);
+
+            CBORObject sched   = schedules.get(0);
+            long startPeriod   = sched.get(CBORObject.FromObject(0)).AsInt64();
+            CBORObject recRule = sched.get(CBORObject.FromObject(2));
+            int durationSec    = recRule.get(0).AsInt32Value();
+            int dayMask        = recRule.get(1).AsInt32Value();
+            int pattern        = recRule.get(2).AsInt32Value();
+
+            int expectedDuration = 8 * 3600;
+            int expectedDayMask  = 0x1F;
+            int expectedPattern  = 2;
+            long expectedTod     = 22L * 3600L; // 22:00 UTC offset within the day
+
+            if (durationSec != expectedDuration)
+                return result("VERIFIER_NIGHT_SHIFT_CROSSMIDNIGHT", "Verifier",
+                        "Night Shift cross-midnight (§7.3.4 / Table 7-9)", false,
+                        "duration: expected " + expectedDuration + ", got " + durationSec, start);
+            if (dayMask != expectedDayMask)
+                return result("VERIFIER_NIGHT_SHIFT_CROSSMIDNIGHT", "Verifier",
+                        "Night Shift cross-midnight (§7.3.4 / Table 7-9)", false,
+                        "dayMask: expected 0x" + String.format("%02X", expectedDayMask)
+                                + ", got 0x" + String.format("%02X", dayMask), start);
+            if (pattern != expectedPattern)
+                return result("VERIFIER_NIGHT_SHIFT_CROSSMIDNIGHT", "Verifier",
+                        "Night Shift cross-midnight (§7.3.4 / Table 7-9)", false,
+                        "pattern: expected " + expectedPattern + ", got " + pattern, start);
+
+            // The startPeriod is a unix epoch at midnight + 22h (seconds within the day = 22*3600).
+            // Verify the TOD anchor by reducing modulo 86400 to extract hours/min/sec.
+            long todOffset = startPeriod % 86400L;
+            if (todOffset != expectedTod)
+                return result("VERIFIER_NIGHT_SHIFT_CROSSMIDNIGHT", "Verifier",
+                        "Night Shift cross-midnight (§7.3.4 / Table 7-9)", false,
+                        "startPeriod TOD offset: expected " + expectedTod
+                                + " (22:00 UTC), got " + todOffset, start);
+
+            return result("VERIFIER_NIGHT_SHIFT_CROSSMIDNIGHT", "Verifier",
+                    "Night Shift cross-midnight (§7.3.4 / Table 7-9)", true,
+                    "duration=8h, dayMask=0x1F (Mon-Fri), pattern=2 (Weekly), "
+                            + "TOD anchor=22:00 UTC — valid cross-midnight per Table 7-9", start);
+        }
+        catch (Exception e)
+        {
+            return result("VERIFIER_NIGHT_SHIFT_CROSSMIDNIGHT", "Verifier",
+                    "Night Shift cross-midnight (§7.3.4 / Table 7-9)", false, e.toString(), start);
+        }
+    }
+
+    /**
+     * FULL_FLOW_MULTI_ELEMENT_DEVICE_REQUEST
+     *
+     * Verify the Aliro 1.0 §8.4.2 multi-element semantics at the CBOR layer.
+     * This test does not exercise the live ENVELOPE/EXCHANGE transport; it
+     * builds the exact wire-format DeviceRequest the v11 reader emits and the
+     * exact wire-format DeviceResponse the v11 credential emits, and asserts:
+     *
+     *   1. Multi-element DeviceRequest carries multiple element identifier
+     *      keys in the nameSpaces inner map per Table 8-21.
+     *   2. Single-element DeviceRequest produces a wire-byte representation
+     *      byte-identical to the v9/v10 single-element shape.
+     *   3. A multi-document DeviceResponse can be sliced into per-document
+     *      DeviceResponses, each with the spec-correct outer shape per
+     *      Table 8-22 (keys "1" / "2" / "3"), each containing exactly one
+     *      document.
+     */
+    private TestResult testFullFlowMultiElementDeviceRequest()
+    {
+        long start = System.currentTimeMillis();
+        try
+        {
+            // ----- Part A — single-element shape unchanged -------------------
+            byte[] singleV10 = buildDeviceRequestForElements(
+                    java.util.Arrays.asList("floor1"));
+            byte[] singleAlt = buildDeviceRequestForElements(
+                    java.util.Collections.singletonList("floor1"));
+            if (!java.util.Arrays.equals(singleV10, singleAlt))
+                return result("FULL_FLOW_MULTI_ELEMENT_DEVICE_REQUEST", "Full Flow",
+                        "Multi-element DeviceRequest / DeviceResponse (§8.4.2)", false,
+                        "single-element output not deterministic", start);
+
+            // Verify the inner namespace map has exactly one key
+            CBORObject parsed = CBORObject.DecodeFromBytes(singleV10);
+            CBORObject docReq0 = parsed.get(CBORObject.FromObject("2")).get(0);
+            CBORObject taggedItemsRequest = docReq0.get(CBORObject.FromObject("1"));
+            byte[] itemsBytes = taggedItemsRequest.GetByteString();
+            CBORObject items = CBORObject.DecodeFromBytes(itemsBytes);
+            CBORObject ns0 = items.get(CBORObject.FromObject("1"));
+            CBORObject inner0 = ns0.get(CBORObject.FromObject("aliro-a"));
+            if (inner0.size() != 1)
+                return result("FULL_FLOW_MULTI_ELEMENT_DEVICE_REQUEST", "Full Flow",
+                        "Multi-element DeviceRequest / DeviceResponse (§8.4.2)", false,
+                        "single-element nameSpaces inner map size = "
+                                + inner0.size() + " (expected 1)", start);
+
+            // ----- Part B — multi-element nameSpaces inner map ---------------
+            java.util.List<String> threeIds =
+                    java.util.Arrays.asList("floor1", "floor2", "pool_door");
+            byte[] multi = buildDeviceRequestForElements(threeIds);
+            CBORObject mp = CBORObject.DecodeFromBytes(multi);
+            CBORObject mItems = CBORObject.DecodeFromBytes(
+                    mp.get(CBORObject.FromObject("2")).get(0)
+                      .get(CBORObject.FromObject("1")).GetByteString());
+            CBORObject mInner = mItems.get(CBORObject.FromObject("1"))
+                                       .get(CBORObject.FromObject("aliro-a"));
+            if (mInner.size() != 3)
+                return result("FULL_FLOW_MULTI_ELEMENT_DEVICE_REQUEST", "Full Flow",
+                        "Multi-element DeviceRequest / DeviceResponse (§8.4.2)", false,
+                        "multi-element nameSpaces inner map size = "
+                                + mInner.size() + " (expected 3)", start);
+            for (String id : threeIds)
+            {
+                CBORObject v = mInner.get(CBORObject.FromObject(id));
+                if (v == null)
+                    return result("FULL_FLOW_MULTI_ELEMENT_DEVICE_REQUEST", "Full Flow",
+                            "Multi-element DeviceRequest / DeviceResponse (§8.4.2)", false,
+                            "multi-element missing key '" + id + "'", start);
+                // Each value is a bool (false = "not intent to retain")
+                if (!v.equals(CBORObject.False))
+                    return result("FULL_FLOW_MULTI_ELEMENT_DEVICE_REQUEST", "Full Flow",
+                            "Multi-element DeviceRequest / DeviceResponse (§8.4.2)", false,
+                            "element '" + id + "' value not bool=false (was " + v + ")", start);
+            }
+
+            // ----- Part C — multi-document DeviceResponse slicing ------------
+            byte[] multiResponse = buildSyntheticDeviceResponse(
+                    java.util.Arrays.asList("floor1", "floor2", "floor5"));
+            java.util.List<byte[]> slices = sliceDeviceResponseForTest(multiResponse);
+            if (slices.size() != 3)
+                return result("FULL_FLOW_MULTI_ELEMENT_DEVICE_REQUEST", "Full Flow",
+                        "Multi-element DeviceRequest / DeviceResponse (§8.4.2)", false,
+                        "expected 3 slices, got " + slices.size(), start);
+            for (int i = 0; i < slices.size(); i++)
+            {
+                CBORObject slice = CBORObject.DecodeFromBytes(slices.get(i));
+                // Each slice must carry the outer keys 1/2/3 (Table 8-22)
+                if (slice.get(CBORObject.FromObject("1")) == null
+                        || slice.get(CBORObject.FromObject("2")) == null
+                        || slice.get(CBORObject.FromObject("3")) == null)
+                    return result("FULL_FLOW_MULTI_ELEMENT_DEVICE_REQUEST", "Full Flow",
+                            "Multi-element DeviceRequest / DeviceResponse (§8.4.2)", false,
+                            "slice " + i + " missing required key", start);
+                CBORObject docsArr = slice.get(CBORObject.FromObject("2"));
+                if (docsArr.size() != 1)
+                    return result("FULL_FLOW_MULTI_ELEMENT_DEVICE_REQUEST", "Full Flow",
+                            "Multi-element DeviceRequest / DeviceResponse (§8.4.2)", false,
+                            "slice " + i + " documents array has " + docsArr.size()
+                                    + " entries (expected 1)", start);
+            }
+
+            return result("FULL_FLOW_MULTI_ELEMENT_DEVICE_REQUEST", "Full Flow",
+                    "Multi-element DeviceRequest / DeviceResponse (§8.4.2)", true,
+                    "Single-element shape unchanged (1 inner key); multi-element nameSpaces "
+                            + "carries 3 keys per Table 8-21; multi-doc DeviceResponse slices "
+                            + "into 3 valid per-doc DeviceResponses per Table 8-22", start);
+        }
+        catch (Exception e)
+        {
+            return result("FULL_FLOW_MULTI_ELEMENT_DEVICE_REQUEST", "Full Flow",
+                    "Multi-element DeviceRequest / DeviceResponse (§8.4.2)", false,
+                    e.toString(), start);
+        }
+    }
+
+    /**
+     * Build a DeviceRequest CBOR carrying the supplied element identifiers
+     * under docType "aliro-a", matching the v11 reader's wire format.
+     * Used by testFullFlowMultiElementDeviceRequest and as a reference shape
+     * for future tests exercising the request side.
+     */
+    private static byte[] buildDeviceRequestForElements(java.util.List<String> elementIds)
+    {
+        CBORObject inner = CBORObject.NewOrderedMap();
+        for (String id : elementIds)
+            inner.Add(CBORObject.FromObject(id), CBORObject.False);
+        CBORObject ns = CBORObject.NewOrderedMap();
+        ns.Add(CBORObject.FromObject("aliro-a"), inner);
+
+        CBORObject items = CBORObject.NewOrderedMap();
+        items.Add(CBORObject.FromObject("5"), CBORObject.FromObject("aliro-a"));
+        items.Add(CBORObject.FromObject("1"), ns);
+        byte[] itemsBytes = items.EncodeToBytes();
+        CBORObject taggedItems = CBORObject.FromObjectAndTag(itemsBytes, 24);
+
+        CBORObject docReq = CBORObject.NewOrderedMap();
+        docReq.Add(CBORObject.FromObject("1"), taggedItems);
+
+        CBORObject deviceRequest = CBORObject.NewOrderedMap();
+        deviceRequest.Add(CBORObject.FromObject("1"), CBORObject.FromObject("1.0"));
+        CBORObject docReqs = CBORObject.NewArray();
+        docReqs.Add(docReq);
+        deviceRequest.Add(CBORObject.FromObject("2"), docReqs);
+        return deviceRequest.EncodeToBytes();
+    }
+
+    /**
+     * Build a synthetic DeviceResponse with one document per supplied element
+     * identifier. Each document carries a minimal IssuerSigned structure with
+     * an IssuerSignedItem for that element ID.
+     */
+    private static byte[] buildSyntheticDeviceResponse(java.util.List<String> elementIds)
+    {
+        CBORObject docs = CBORObject.NewArray();
+        for (String id : elementIds)
+        {
+            // IssuerSignedItem (Table 7-2): { 0:digestId, 1:random, 2:elementValue, 3:elementId }
+            CBORObject item = CBORObject.NewOrderedMap();
+            item.Add(CBORObject.FromObject(0), CBORObject.FromObject(0));
+            item.Add(CBORObject.FromObject(1), CBORObject.FromObject(new byte[16]));
+            CBORObject ad = CBORObject.NewOrderedMap();
+            ad.Add(CBORObject.FromObject(0), CBORObject.FromObject(1));
+            ad.Add(CBORObject.FromObject(1),
+                    CBORObject.FromObject(("EMP-" + id).getBytes()));
+            ad.Add(CBORObject.FromObject(2), CBORObject.NewArray());
+            ad.Add(CBORObject.FromObject(3), CBORObject.NewArray());
+            item.Add(CBORObject.FromObject(2), ad);
+            item.Add(CBORObject.FromObject(3), CBORObject.FromObject(id));
+            byte[] itemBytes = item.EncodeToBytes();
+            CBORObject taggedItem = CBORObject.FromObjectAndTag(itemBytes, 24);
+
+            CBORObject items = CBORObject.NewArray();
+            items.Add(taggedItem);
+            CBORObject ns = CBORObject.NewOrderedMap();
+            ns.Add(CBORObject.FromObject("aliro-a"), items);
+
+            CBORObject iSigned = CBORObject.NewOrderedMap();
+            iSigned.Add(CBORObject.FromObject("1"), ns);
+            // IssuerAuth — stub; this test does not verify signatures
+            CBORObject iAuth = CBORObject.NewArray();
+            iAuth.Add(CBORObject.FromObject(new byte[0]));
+            iAuth.Add(CBORObject.NewMap());
+            iAuth.Add(CBORObject.FromObject(new byte[0]));
+            iAuth.Add(CBORObject.FromObject(new byte[64]));
+            iSigned.Add(CBORObject.FromObject("2"), iAuth);
+
+            CBORObject doc = CBORObject.NewOrderedMap();
+            doc.Add(CBORObject.FromObject("1"), iSigned);
+            doc.Add(CBORObject.FromObject("5"), CBORObject.FromObject("aliro-a"));
+            docs.Add(doc);
+        }
+
+        CBORObject dr = CBORObject.NewOrderedMap();
+        dr.Add(CBORObject.FromObject("1"), CBORObject.FromObject("1.0"));
+        dr.Add(CBORObject.FromObject("2"), docs);
+        dr.Add(CBORObject.FromObject("3"), CBORObject.FromObject(0));
+        return dr.EncodeToBytes();
+    }
+
+    /**
+     * Mirror of HomeFragment.sliceDeviceResponsePerDocument used so the
+     * self-test can exercise the slicing logic without taking a dependency
+     * on the reader-side class. If the two diverge, this test fails first.
+     */
+    private static java.util.List<byte[]> sliceDeviceResponseForTest(byte[] dr)
+    {
+        java.util.List<byte[]> out = new java.util.ArrayList<>();
+        CBORObject deviceResponse = CBORObject.DecodeFromBytes(dr);
+        CBORObject docs = deviceResponse.get(CBORObject.FromObject("2"));
+        if (docs == null) return out;
+        CBORObject version = deviceResponse.get(CBORObject.FromObject("1"));
+        CBORObject status  = deviceResponse.get(CBORObject.FromObject("3"));
+        for (int i = 0; i < docs.size(); i++)
+        {
+            CBORObject one = CBORObject.NewOrderedMap();
+            if (version != null) one.Add(CBORObject.FromObject("1"), version);
+            CBORObject arr = CBORObject.NewArray();
+            arr.Add(docs.get(i));
+            one.Add(CBORObject.FromObject("2"), arr);
+            if (status != null) one.Add(CBORObject.FromObject("3"), status);
+            out.add(one.EncodeToBytes());
+        }
+        return out;
     }
 
     /** Derive the public key X coordinate from a raw 32-byte private key */

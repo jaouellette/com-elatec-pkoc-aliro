@@ -1268,16 +1268,23 @@ public class AliroAccessDocumentVerifier {
                     else if (days.size() == 7) daysStr = "Every day";
                     else daysStr = String.join(", ", days);
 
-                    // Build time-window string from startPeriod (key 0) % 86400
+                    // Build time-window string from startPeriod (key 0) % 86400.
+                    // When the window crosses midnight (e.g. night-shift 22:00-06:00)
+                    // the raw todEnd will exceed 86400; we mod-wrap and append the
+                    // "(+1d)" indicator so users understand the schedule rolls into
+                    // the next day rather than showing nonsensical "30:00" hours.
                     CBORObject startObj = schedule.get(CBORObject.FromObject(0));
                     String windowStr;
                     if (startObj != null) {
                         long startPeriod = startObj.AsInt64();
                         long todStart = startPeriod % 86400;  // seconds-since-midnight of window open
-                        long todEnd   = todStart + duration;  // seconds-since-midnight of window close
-                        windowStr = String.format("%02d:%02d-%02d:%02d UTC",
+                        long todEndRaw = todStart + duration; // raw seconds-since-midnight of window close
+                        long todEnd    = todEndRaw % 86400;   // wrap into 0..86399
+                        boolean wrapsMidnight = todEndRaw >= 86400;
+                        windowStr = String.format("%02d:%02d-%02d:%02d UTC%s",
                                 todStart / 3600, (todStart % 3600) / 60,
-                                todEnd   / 3600, (todEnd   % 3600) / 60);
+                                todEnd   / 3600, (todEnd   % 3600) / 60,
+                                wrapsMidnight ? " (+1d)" : "");
                     } else {
                         int hours = (int)(duration / 3600);
                         int mins  = (int)((duration % 3600) / 60);
@@ -1563,18 +1570,51 @@ public class AliroAccessDocumentVerifier {
                 long elapsed = nowEpoch - start;
                 if (elapsed < 0) return false;
                 long daysSinceStart = elapsed / 86400L;
-                if (daysSinceStart % interval != 0) {
-                    Log.d(TAG, "isScheduleInRange: Daily interval=" + interval
-                            + " daysSinceStart=" + daysSinceStart + " -> not an active day");
-                    return false;
-                }
-                // Check time-of-day window
                 long todStart = start % 86400L; // time-of-day from startPeriod
                 long todNow   = nowEpoch % 86400L;
-                boolean inWindow = todNow >= todStart && todNow < todStart + duration;
+
+                // Cross-midnight wrap: when todStart + duration > 86400 the
+                // window straddles into the next day. We must consider both
+                // today's recurrence (late-night portion: todNow >= todStart)
+                // AND yesterday's recurrence still in its early-morning
+                // carry-over (todNow < (todStart + duration) - 86400).
+                // §7.3.4 says the recurrence "fires" each interval at todStart
+                // and remains open for `duration`; nothing in the spec restricts
+                // duration to ≤ 86400.
+                long endRaw = todStart + duration;
+                boolean wraps = endRaw > 86400L;
+                boolean inWindowToday;
+                boolean inWindowYesterday = false;
+
+                if (wraps)
+                {
+                    long endWrapped = endRaw - 86400L;
+                    inWindowToday     = todNow >= todStart;
+                    inWindowYesterday = todNow < endWrapped;
+                }
+                else
+                {
+                    inWindowToday = todNow >= todStart && todNow < endRaw;
+                }
+
+                // Determine which "day" we attribute the open window to and
+                // gate it by interval. interval=1 means every day, so this
+                // simplifies; interval>1 needs the day-of-recurrence check.
+                boolean intervalOkToday     = (daysSinceStart % interval) == 0;
+                boolean intervalOkYesterday = ((daysSinceStart - 1) % interval) == 0
+                        && daysSinceStart >= 1;
+
+                boolean inWindow = (inWindowToday     && intervalOkToday)
+                                || (inWindowYesterday && intervalOkYesterday);
+
                 Log.d(TAG, "isScheduleInRange: Daily todNow=" + todNow
                         + " todStart=" + todStart + " duration=" + duration
-                        + " inWindow=" + inWindow);
+                        + " wraps=" + wraps
+                        + " inWindowToday=" + inWindowToday
+                        + " inWindowYesterday=" + inWindowYesterday
+                        + " intervalOkToday=" + intervalOkToday
+                        + " intervalOkYesterday=" + intervalOkYesterday
+                        + " -> " + inWindow);
                 return inWindow;
             }
 
@@ -1597,13 +1637,18 @@ public class AliroAccessDocumentVerifier {
                     case java.util.Calendar.SUNDAY:    aliroDow = 6; break;
                     default: aliroDow = -1; break;
                 }
+                int aliroDowYesterday = (aliroDow >= 0) ? (aliroDow + 6) % 7 : -1;
 
-                boolean dayMatch = aliroDow >= 0 && (mask & (1 << aliroDow)) != 0;
+                boolean dayMatchToday     = aliroDow >= 0
+                        && (mask & (1 << aliroDow)) != 0;
+                boolean dayMatchYesterday = aliroDowYesterday >= 0
+                        && (mask & (1 << aliroDowYesterday)) != 0;
                 Log.d(TAG, "isScheduleInRange: Weekly javaDow=" + javaDow
                         + " aliroDow=" + aliroDow + " mask=0x" + Integer.toHexString(mask)
-                        + " dayMatch=" + dayMatch);
+                        + " dayMatchToday=" + dayMatchToday
+                        + " dayMatchYesterday=" + dayMatchYesterday);
 
-                if (!dayMatch) return false;
+                if (!dayMatchToday && !dayMatchYesterday) return false;
 
                 // Check week interval: how many weeks since startPeriod?
                 long elapsed = nowEpoch - start;
@@ -1615,13 +1660,37 @@ public class AliroAccessDocumentVerifier {
                     return false;
                 }
 
-                // Check time-of-day window
-                long todStart = start % 86400L; // time-of-day from startPeriod
+                // Check time-of-day window with cross-midnight wrap support.
+                // §7.3.4 recurrence fires at todStart on each masked day and
+                // remains open for `duration` seconds. When duration carries
+                // past midnight, today's early-morning hours actually belong
+                // to yesterday's recurrence, so we evaluate both branches.
+                long todStart = start % 86400L;
                 long todNow   = nowEpoch % 86400L;
-                boolean inWindow = todNow >= todStart && todNow < todStart + duration;
+                long endRaw   = todStart + duration;
+                boolean wraps = endRaw > 86400L;
+
+                boolean inWindowToday;
+                boolean inWindowYesterday = false;
+                if (wraps)
+                {
+                    long endWrapped = endRaw - 86400L;
+                    inWindowToday     = todNow >= todStart;
+                    inWindowYesterday = todNow < endWrapped;
+                }
+                else
+                {
+                    inWindowToday = todNow >= todStart && todNow < endRaw;
+                }
+
+                boolean inWindow = (inWindowToday     && dayMatchToday)
+                                || (inWindowYesterday && dayMatchYesterday);
                 Log.d(TAG, "isScheduleInRange: Weekly todNow=" + todNow
                         + " todStart=" + todStart + " duration=" + duration
-                        + " inWindow=" + inWindow);
+                        + " wraps=" + wraps
+                        + " inWindowToday=" + inWindowToday
+                        + " inWindowYesterday=" + inWindowYesterday
+                        + " -> " + inWindow);
                 return inWindow;
             }
 
@@ -1644,14 +1713,38 @@ public class AliroAccessDocumentVerifier {
                     case java.util.Calendar.SUNDAY:    aliroDow = 6; break;
                     default: aliroDow = -1; break;
                 }
-                boolean dayMatch = mask == 0 || (aliroDow >= 0 && (mask & (1 << aliroDow)) != 0);
-                if (!dayMatch) return false;
+                int aliroDowYesterday = (aliroDow >= 0) ? (aliroDow + 6) % 7 : -1;
+                boolean dayMatchToday     = mask == 0
+                        || (aliroDow >= 0 && (mask & (1 << aliroDow)) != 0);
+                boolean dayMatchYesterday = mask == 0
+                        || (aliroDowYesterday >= 0 && (mask & (1 << aliroDowYesterday)) != 0);
+                if (!dayMatchToday && !dayMatchYesterday) return false;
 
                 long todStart = start % 86400L;
                 long todNow   = nowEpoch % 86400L;
-                boolean inWindow = todNow >= todStart && todNow < todStart + duration;
+                long endRaw   = todStart + duration;
+                boolean wraps = endRaw > 86400L;
+                boolean inWindowToday;
+                boolean inWindowYesterday = false;
+                if (wraps)
+                {
+                    long endWrapped = endRaw - 86400L;
+                    inWindowToday     = todNow >= todStart;
+                    inWindowYesterday = todNow < endWrapped;
+                }
+                else
+                {
+                    inWindowToday = todNow >= todStart && todNow < endRaw;
+                }
+                boolean inWindow = (inWindowToday     && dayMatchToday)
+                                || (inWindowYesterday && dayMatchYesterday);
                 Log.d(TAG, "isScheduleInRange: pattern=" + pattern
-                        + " dayMatch=" + dayMatch + " inWindow=" + inWindow);
+                        + " dayMatchToday=" + dayMatchToday
+                        + " dayMatchYesterday=" + dayMatchYesterday
+                        + " wraps=" + wraps
+                        + " inWindowToday=" + inWindowToday
+                        + " inWindowYesterday=" + inWindowYesterday
+                        + " -> " + inWindow);
                 return inWindow;
             }
 

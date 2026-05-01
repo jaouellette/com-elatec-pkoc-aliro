@@ -365,6 +365,23 @@ public class AliroConfigFragment extends Fragment
             return;
         }
 
+        // Step-Up Issuer Public Key — accepts a single 130-char hex value
+        // OR a comma-separated list (Aliro 1.0 §8.4.2 multi-element support).
+        // Empty disables COSE_Sign1 verification entirely.
+        if (!stepUpIssuerKey.isEmpty())
+        {
+            for (String tok : stepUpIssuerKey.split(","))
+            {
+                String t = tok.trim();
+                if (t.isEmpty()) continue;
+                if (!isValidHex(t, 130))
+                {
+                    showStatus("Step-Up Issuer Public Key entry must be exactly 130 hex chars (65 bytes). Multiple keys: separate with commas.", false);
+                    return;
+                }
+            }
+        }
+
         SharedPreferences.Editor editor = requireActivity()
                 .getPreferences(Context.MODE_PRIVATE)
                 .edit();

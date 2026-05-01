@@ -910,10 +910,20 @@ public class AliroBleReaderService extends Service
                         byte[] suSKDevice = Arrays.copyOfRange(suKeys, 0, 32);
                         byte[] suSKReader = Arrays.copyOfRange(suKeys, 32, 64);
 
-                        // Build DeviceRequest CBOR (Table 8-21)
+                        // Build DeviceRequest CBOR (Table 8-21).
+                        // The Step-Up Element Identifier preference accepts a
+                        // single value or a comma-separated list to request
+                        // multiple elements per Aliro 1.0 §7.3 / §8.4.2.
                         CBORObject nameSpaces = CBORObject.NewMap();
                         CBORObject elemMap = CBORObject.NewMap();
-                        elemMap.Add(stepUpElementId, CBORObject.True);
+                        for (String tok : stepUpElementId.split(","))
+                        {
+                            String eid = tok.trim();
+                            if (!eid.isEmpty())
+                                elemMap.Add(eid, CBORObject.True);
+                        }
+                        if (elemMap.size() == 0)
+                            elemMap.Add(stepUpElementId, CBORObject.True);
                         nameSpaces.Add("aliro-a", elemMap);
 
                         CBORObject itemsReq = CBORObject.NewMap();

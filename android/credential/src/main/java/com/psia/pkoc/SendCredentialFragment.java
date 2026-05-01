@@ -209,7 +209,6 @@ public class SendCredentialFragment extends Fragment
                 return;
             }
 
-            binding.readerIcon.setImageResource(R.drawable.ic_reader_success);
             // Determine protocol from the broadcast action
             String action = intent.getAction();
             String transport;
@@ -219,7 +218,28 @@ public class SendCredentialFragment extends Fragment
                 transport = "LEAF NFC";
             else
                 transport = "PKOC NFC";
-            binding.statusText.setText(transport + ": " + getString(R.string.credential_sent));
+
+            // For Aliro NFC, the reader's EXCHANGE message carries an access decision
+            // (Reader Status tag 97). If the reader denied access (e.g. "Credential
+            // Not Present on Device"), surface failure to the user — do NOT show
+            // "authorized" unconditionally. Other transports default to true since
+            // they do not produce a per-transaction reader decision.
+            boolean accessGranted = intent.getBooleanExtra("accessGranted", true);
+            int     readerState   = intent.getIntExtra("readerState", -1);
+
+            if (accessGranted)
+            {
+                binding.readerIcon.setImageResource(R.drawable.ic_reader_success);
+                binding.statusText.setText(transport + ": " + getString(R.string.credential_sent));
+            }
+            else
+            {
+                binding.readerIcon.setImageResource(R.drawable.ic_reader_error);
+                String detail = (readerState >= 0)
+                        ? " (state=" + String.format("%02X", readerState) + ")"
+                        : "";
+                binding.statusText.setText(transport + ": Access Denied" + detail);
+            }
             binding.statusText.setVisibility(View.VISIBLE);
 
             binding.readerIcon.postDelayed(() ->
