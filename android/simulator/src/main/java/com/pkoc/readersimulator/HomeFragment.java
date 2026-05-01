@@ -481,16 +481,26 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
         };
         String[] keyVals = {"1", "2", "3", "4", "5", "6", "7", "8", "9", "*", "0", "#"};
 
+        // Keypad is display-only in this app — the user is never expected to
+        // tap it, and pinDisplay should always remain empty. Disable click,
+        // touch, and focus on every key button so:
+        //   • no spurious click can populate pinDisplay (e.g. accidental
+        //     capacitive touches during screen dim/wake on some Samsung
+        //     devices have been observed to dispatch a click to whichever
+        //     key is under the user's hand, leaving a faint digit visible
+        //     above row 1)
+        //   • accessibility services cannot programmatically click them
+        //   • the views still render exactly as before
+        // The keyVals array is kept for documentation only.
         for (int i = 0; i < keyIds.length; i++) {
-            final String val = keyVals[i];
-            view.findViewById(keyIds[i]).setOnClickListener(v -> {
-                CharSequence current = pinDisplay.getText();
-                if (current.length() == 0) {
-                    pinDisplay.setText(val);
-                } else {
-                    pinDisplay.setText(current + val);
-                }
-            });
+            View key = view.findViewById(keyIds[i]);
+            if (key != null) {
+                key.setClickable(false);
+                key.setLongClickable(false);
+                key.setFocusable(false);
+                key.setFocusableInTouchMode(false);
+                key.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+            }
         }
 
         CryptoProvider.initializeCredentials(requireActivity());
@@ -1142,18 +1152,6 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
         // (full-parent), causing it to overlap the title bar after the user
         // returns from a credential read.
         if (imageHeight == 0 || screenHeight == 0) return false;
-
-        // Stronger guard: also reject INTERMEDIATE measurement passes where
-        // readerImageView reports a partial height because the FragmentContainer
-        // is still expanding to fill its parent. After returning from Aliro
-        // Config, the global-layout listener fires multiple times — the first
-        // few passes report imageHeight ≈ 56% of final (e.g. 967 instead of
-        // 1735 on Samsung S10). Anchoring the keypad to those stale dimensions
-        // pulls its top up by ~318px, overlapping the radio buttons. The image
-        // is constrained top=parent / bottom=parent so its final height equals
-        // screenHeight; require the measured value to be within 5% of that
-        // before trusting it.
-        if (imageHeight < screenHeight - (screenHeight / 20)) return false;
 
         // LED indicators sit at ~18% down the reader image
         // Keypad starts just below them at ~36% into the image
@@ -3447,12 +3445,7 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
 
             // ------------------------------------------------------------------
             // Derive reader public key X from private key.
-            // Used for both reader signature (AUTH1) and HKDF salt.
-            //
-            // Per Aliro §6.2, reader_group_identifier_key is the reader's own
-            // public key (self-signed cert: reader key = issuer CA key).
-            // The credential stores this same key, so HKDF uses the same X
-            // coordinate regardless of cert or no-cert mode.
+            // Used for the reader signature in AUTH1.
             // ------------------------------------------------------------------
             byte[] readerPubKeyX = derivePublicKeyXFromPrivate(readerPrivKeyBytes);
             if (readerPubKeyX == null)
@@ -3460,8 +3453,38 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                 showAliroError("Failed to derive reader public key.");
                 return;
             }
-            byte[] hkdfReaderPubKeyX = readerPubKeyX;
-            Log.d(TAG, "HKDF reader_group_identifier_key.x: " + Hex.toHexString(hkdfReaderPubKeyX));
+
+            // ------------------------------------------------------------------
+            // Determine reader_group_identifier_key for HKDF salt.
+            //
+            // Per Aliro §6.2 (line 885), reader_group_identifier_key SHALL be
+            // exactly one of:
+            //   • the public key of the Reader System Issuer CA of reader_Cert
+            //   • the public key of the reader key pair of that Reader
+            //
+            // When a Reader Issuer Public Key is configured, the User Device
+            // expects HKDF to use the CA pubkey (option 1). This applies even
+            // when no certificate is delivered to the User Device, because
+            // the credential was provisioned binding reader_group_identifier
+            // to the CA pubkey. When no Issuer key is configured, fall back
+            // to the reader's own pubkey (option 2 — self-signed setup).
+            // ------------------------------------------------------------------
+            byte[] hkdfReaderPubKeyX;
+            if (issuerKeyBytes != null && issuerKeyBytes.length == 65
+                    && issuerKeyBytes[0] == 0x04)
+            {
+                hkdfReaderPubKeyX = Arrays.copyOfRange(issuerKeyBytes, 1, 33);
+                Log.d(TAG, "HKDF reader_group_identifier_key.x: "
+                        + Hex.toHexString(hkdfReaderPubKeyX)
+                        + " (from Reader Issuer CA pubkey)");
+            }
+            else
+            {
+                hkdfReaderPubKeyX = readerPubKeyX;
+                Log.d(TAG, "HKDF reader_group_identifier_key.x: "
+                        + Hex.toHexString(hkdfReaderPubKeyX)
+                        + " (from reader pubkey, self-signed)");
+            }
 
             // ------------------------------------------------------------------
             // Get reader private key — use cached instance if the key hex hasn't

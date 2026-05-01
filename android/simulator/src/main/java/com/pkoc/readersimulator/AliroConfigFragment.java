@@ -345,13 +345,19 @@ public class AliroConfigFragment extends Fragment
             return;
         }
 
-        // Validate optional certificate fields — both must be present or both absent
+        // Validate optional certificate fields. Per Aliro §6.2 line 885, the
+        // Reader Issuer Public Key (the Reader System Issuer CA pubkey) is
+        // also used as reader_group_identifier_key in HKDF derivation, even
+        // when no certificate is being delivered to the User Device. So we
+        // allow Issuer Public Key alone (without a Certificate). A Certificate
+        // without an Issuer key remains invalid because the cert needs the
+        // issuer pubkey to be verifiable.
         boolean hasCert    = !TextUtils.isEmpty(cert);
         boolean hasIssuer  = !TextUtils.isEmpty(issuerKey);
 
-        if (hasCert != hasIssuer)
+        if (hasCert && !hasIssuer)
         {
-            showStatus("Provide both Issuer Public Key and Certificate, or leave both blank.", false);
+            showStatus("Reader Certificate requires Reader Issuer Public Key.", false);
             return;
         }
         if (hasIssuer && !isValidHex(issuerKey, 130))

@@ -242,14 +242,26 @@
         app:layout_constraintLeft_toRightOf="@id/guidelineLeft"
         app:layout_constraintRight_toLeftOf="@id/guidelineRight">
 
-        <!-- PIN display -->
+        <!-- PIN display.
+             android:text=""              starts empty on every inflation.
+             android:freezesText="false"  prevents Android from saving and
+             restoring the TextView's text across fragment/activity
+             recreation. Without this, any digit ever written to the field
+             (e.g. by an accidental brush of the keypad area) persists in
+             saved-instance-state and reappears as a faint character above
+             row 1 after the fragment is recreated, even though no code
+             writes a digit at runtime in normal use. The keypad is
+             display-only in this app, so we never want this field to
+             retain its value. -->
         <TextView
             android:id="@+id/pinDisplay"
             android:layout_width="match_parent"
             android:layout_height="0dp"
             android:layout_weight="1"
             android:gravity="center"
+            android:text=""
             android:hint=""
+            android:freezesText="false"
             android:textColor="#AAAAAA"
             android:textColorHint="#CCCCCC"
             android:fontFamily="sans-serif-light"

@@ -799,19 +799,20 @@ public class AliroAccessDocumentVerifier {
 
         // Per §7.2.4 (Aliro 1.0 spec): When TimeVerificationRequired=true and the Reader
         // cannot validate time-based fields, the Reader SHALL consider all time-based checks
-        // as failed. This Reader does not support the time concept (PICS: NOT time-based
-        // elements), so if timeVerificationRequired=true, we immediately fail.
-        if (timeVerificationRequired) {
-            Log.w(TAG, "Step 5: timeVerificationRequired=true but Reader does not support"
-                    + " time concept — all time-based checks fail per §7.2.4");
-            return VerificationResult.failure(STATUS_INVALID_CONTENT_B1,
-                    STATUS_INVALID_CONTENT_B2,
-                    "TimeVerificationRequired=true but Reader cannot validate time"
-                            + " (Reader does not support time concept per PICS)");
-        }
-
+        // as failed. This Reader DOES support the time concept — it uses Instant.now()
+        // backed by the device's system clock — so we proceed to actual time validation
+        // below regardless of timeVerificationRequired's value. The reader is therefore
+        // declared as time-supporting in its PICS profile.
+        //
+        // Earlier versions of this code returned a hard failure here on the assumption
+        // that the reader did not support time. That was a deliberate PICS choice for
+        // self-test scenarios where the device clock was not trusted, but for real-world
+        // credentials (e.g. those issued by Apple Wallet via SwiftConnect) the
+        // timeVerificationRequired flag is typically true, and the reader needs to
+        // perform the validity check rather than reject outright.
         Instant now = Instant.now();
-        Log.d(TAG, "Step 5: current time=" + now);
+        Log.d(TAG, "Step 5: current time=" + now
+                + " timeVerificationRequired=" + timeVerificationRequired);
 
         boolean timeCheckFailed = now.isBefore(validFromInstant) || now.isAfter(validUntilInstant);
         if (timeCheckFailed) {
