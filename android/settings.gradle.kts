@@ -23,5 +23,6 @@ rootProject.name = "PSIA PKOC Credential App"
 include(":credential")
 include(":shared")
 include(":simulator")
+include(":wear")
 
 project(":shared").projectDir = file("shared")
