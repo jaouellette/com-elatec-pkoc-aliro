@@ -441,7 +441,7 @@ public class AliroBleReaderService extends Service
                 .build();
 
         // Set device name so credential app can display it in the reader list
-        bluetoothAdapter.setName("ELATEC Aliro");
+        bluetoothAdapter.setName("ELATEC PKOC - Aliro");
 
         ParcelUuid aliroUuid = ParcelUuid.fromString("0000FFF2-0000-1000-8000-00805F9B34FB");
 

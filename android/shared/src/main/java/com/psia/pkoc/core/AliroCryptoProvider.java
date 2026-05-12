@@ -128,7 +128,7 @@ public class AliroCryptoProvider
         }
         catch (Exception e)
         {
-            Log.e(TAG, "generateEphemeralKeypair failed", e);
+            AliroDiagnosticLog.e(TAG, "generateEphemeralKeypair failed", e);
             return null;
         }
     }
@@ -190,7 +190,7 @@ public class AliroCryptoProvider
         }
         catch (Exception e)
         {
-            Log.e(TAG, "ecdhSharedSecretX failed", e);
+            AliroDiagnosticLog.e(TAG, "ecdhSharedSecretX failed", e);
             return null;
         }
     }
@@ -237,7 +237,7 @@ public class AliroCryptoProvider
         }
         catch (Exception e)
         {
-            Log.e(TAG, "computeReaderSignature failed", e);
+            AliroDiagnosticLog.e(TAG, "computeReaderSignature failed", e);
             return null;
         }
     }
@@ -297,7 +297,7 @@ public class AliroCryptoProvider
         }
         catch (Exception e)
         {
-            Log.e(TAG, "verifyCredentialSignature failed", e);
+            AliroDiagnosticLog.e(TAG, "verifyCredentialSignature failed", e);
             return false;
         }
     }
@@ -437,7 +437,7 @@ public class AliroCryptoProvider
         }
         catch (Exception e)
         {
-            Log.e(TAG, "deriveKeys failed", e);
+            AliroDiagnosticLog.e(TAG, "deriveKeys failed", e);
             return null;
         }
     }
@@ -553,12 +553,12 @@ public class AliroCryptoProvider
             hmacInput[pos] = 0x01; // n=1
 
             byte[] kpersistent = hmacSha256(prk, hmacInput);
-            Log.d(TAG, "deriveKpersistent: 32 bytes derived");
+            AliroDiagnosticLog.d(TAG, "deriveKpersistent: 32 bytes derived");
             return kpersistent;
         }
         catch (Exception e)
         {
-            Log.e(TAG, "deriveKpersistent failed", e);
+            AliroDiagnosticLog.e(TAG, "deriveKpersistent failed", e);
             return null;
         }
     }
@@ -636,7 +636,7 @@ public class AliroCryptoProvider
             sha256.update(credentialPubKeyX);
             byte[] saltHash = sha256.digest(); // 32-byte salt
 
-            Log.d(TAG, "deriveFastKeys salt inputs:"
+            AliroDiagnosticLog.d(TAG, "deriveFastKeys salt inputs:"
                     + " readerPubKeyX=" + Hex.toHexString(readerPubKeyX)
                     + " readerID=" + Hex.toHexString(readerID)
                     + " interfaceByte=" + String.format("%02x", interfaceByte)
@@ -646,7 +646,7 @@ public class AliroCryptoProvider
                     + " flag=" + Hex.toHexString(flag)
                     + " selectTLV=" + Hex.toHexString(selectProprietaryTLV)
                     + " credPubKeyX=" + Hex.toHexString(credentialPubKeyX));
-            Log.d(TAG, "deriveFastKeys saltHash=" + Hex.toHexString(saltHash)
+            AliroDiagnosticLog.d(TAG, "deriveFastKeys saltHash=" + Hex.toHexString(saltHash)
                     + " kpersistent=" + Hex.toHexString(kpersistent));
 
             // HKDF-Extract: PRK = HMAC-SHA256(salt_fast_hash, Kpersistent)
@@ -690,7 +690,7 @@ public class AliroCryptoProvider
                 idx += 32;
                 n++;
             }
-            Log.d(TAG, "deriveFastKeys: " + outputSize + " bytes derived"
+            AliroDiagnosticLog.d(TAG, "deriveFastKeys: " + outputSize + " bytes derived"
                     + " [0..31]=" + Hex.toHexString(Arrays.copyOfRange(output, 0, 32))
                     + " [32..63]=" + Hex.toHexString(Arrays.copyOfRange(output, 32, 64))
                     + " [64..95]=" + Hex.toHexString(Arrays.copyOfRange(output, 64, Math.min(96, output.length))));
@@ -698,7 +698,7 @@ public class AliroCryptoProvider
         }
         catch (Exception e)
         {
-            Log.e(TAG, "deriveFastKeys failed", e);
+            AliroDiagnosticLog.e(TAG, "deriveFastKeys failed", e);
             return null;
         }
     }
@@ -926,7 +926,7 @@ public class AliroCryptoProvider
         }
         catch (Exception e)
         {
-            Log.e(TAG, "computeCredentialSignature failed", e);
+            AliroDiagnosticLog.e(TAG, "computeCredentialSignature failed", e);
             return null;
         }
     }
@@ -984,7 +984,7 @@ public class AliroCryptoProvider
         }
         catch (Exception e)
         {
-            Log.e(TAG, "verifyReaderSignature failed", e);
+            AliroDiagnosticLog.e(TAG, "verifyReaderSignature failed", e);
             return false;
         }
     }
@@ -1034,7 +1034,7 @@ public class AliroCryptoProvider
         }
         catch (Exception e)
         {
-            Log.e(TAG, "buildSignatureData failed", e);
+            AliroDiagnosticLog.e(TAG, "buildSignatureData failed", e);
             return null;
         }
     }
@@ -1059,7 +1059,7 @@ public class AliroCryptoProvider
         }
         catch (Exception e)
         {
-            Log.e(TAG, "buildSignatureHash failed", e);
+            AliroDiagnosticLog.e(TAG, "buildSignatureHash failed", e);
             return null;
         }
     }
@@ -1104,7 +1104,7 @@ public class AliroCryptoProvider
         }
         catch (Exception e)
         {
-            Log.e(TAG, "hmacSha256 failed", e);
+            AliroDiagnosticLog.e(TAG, "hmacSha256 failed", e);
             return null;
         }
     }
@@ -1128,12 +1128,12 @@ public class AliroCryptoProvider
         }
         catch (InvalidCipherTextException e)
         {
-            Log.e(TAG, "GCM auth tag mismatch", e);
+            AliroDiagnosticLog.e(TAG, "GCM auth tag mismatch", e);
             return null;
         }
         catch (Exception e)
         {
-            Log.e(TAG, "gcm operation failed", e);
+            AliroDiagnosticLog.e(TAG, "gcm operation failed", e);
             return null;
         }
     }
@@ -1255,12 +1255,12 @@ public class AliroCryptoProvider
         }
         catch (InvalidCipherTextException e)
         {
-            Log.e(TAG, "GCM-AAD auth tag mismatch", e);
+            AliroDiagnosticLog.e(TAG, "GCM-AAD auth tag mismatch", e);
             return null;
         }
         catch (Exception e)
         {
-            Log.e(TAG, "gcmWithAad operation failed", e);
+            AliroDiagnosticLog.e(TAG, "gcmWithAad operation failed", e);
             return null;
         }
     }
@@ -1314,7 +1314,7 @@ public class AliroCryptoProvider
         }
         catch (Exception e)
         {
-            Log.e(TAG, "deriveStepUpSessionKeys failed", e);
+            AliroDiagnosticLog.e(TAG, "deriveStepUpSessionKeys failed", e);
             return null;
         }
     }
@@ -1355,7 +1355,7 @@ public class AliroCryptoProvider
         }
         catch (Exception e)
         {
-            Log.e(TAG, "hkdfDeriveKey failed", e);
+            AliroDiagnosticLog.e(TAG, "hkdfDeriveKey failed", e);
             return null;
         }
     }

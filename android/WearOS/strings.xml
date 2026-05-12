@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">HCE Spike</string>
+
+    <string name="status_waiting">Waiting for NFC tap…\n\nHold watch to a reader\nsending SELECT for AID\nF0010203040506</string>
+
+    <!-- Surfaced by Android Settings > Connections > NFC > Contactless payments
+         and similar listing UIs. Keep concise. -->
+    <string name="hce_service_description">Wear OS HCE Routing Spike</string>
+    <string name="hce_aid_group_description">Test AID</string>
+</resources>

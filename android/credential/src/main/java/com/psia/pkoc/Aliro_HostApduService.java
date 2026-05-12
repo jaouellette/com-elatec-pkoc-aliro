@@ -8,6 +8,7 @@ import android.os.Bundle;
 import android.util.Base64;
 import android.util.Log;
 
+import com.psia.pkoc.core.AliroDiagnosticLog;
 import com.psia.pkoc.core.AliroCryptoProvider;
 import com.psia.pkoc.core.AliroAccessDocument;
 import com.psia.pkoc.core.AliroProvisioningManager;
@@ -71,6 +72,22 @@ public class Aliro_HostApduService extends HostApduService
     private static final byte[] STEPUP_AID = {
         (byte)0xA0, 0x00, 0x00, 0x09, 0x09,
         (byte)0xAC, (byte)0xCE, 0x55, 0x02
+    };
+
+    /**
+     * Enrollment AID — out-of-band reader provisioning channel.
+     * Last byte 0xFE is reserved for enrollment by agreement with ELATEC.
+     * When the reader emits its keypair over NFC (via this AID), the
+     * credential receives the pub key + reader ID with a custom INS 0xE0
+     * write, prompts the user to confirm, and on approval registers the
+     * reader as a trusted/provisioned reader. The enrollment path is gated
+     * by the user-controlled enrollment-mode toggle in Settings; if
+     * enrollment is disabled (the default), SELECT to this AID returns an
+     * error and no provisioning occurs.
+     */
+    private static final byte[] ENROLLMENT_AID = {
+        (byte)0xA0, 0x00, 0x00, 0x09, 0x09,
+        (byte)0xAC, (byte)0xCE, 0x55, (byte)0xFE
     };
 
     // Proprietary TLV (A5): Type, protocol versions, extended length info.
@@ -187,9 +204,27 @@ public class Aliro_HostApduService extends HostApduService
     private static final int    MAILBOX_MAX_SIZE    = 65536;
 
     // -------------------------------------------------------------------------
+    // Enrollment wire format constants (out-of-band reader provisioning)
+    //
+    // Wire payload (97 bytes after the 5-byte APDU header + 1-byte length):
+    //   byte 0:        version (currently 0x01) — bump when format changes
+    //   bytes 1..65:   65 bytes uncompressed reader public key (0x04 || X || Y)
+    //   bytes 66..97:  32 bytes reader identifier
+    //
+    // Total payload length = 1 + 65 + 32 = 98 bytes. The APDU INS is 0xE0
+    // (custom; doesn't collide with any standard Aliro INS).
+    // -------------------------------------------------------------------------
+    private static final byte ENROLLMENT_INS_WRITE      = (byte)0xE0;
+    private static final int  ENROLLMENT_PAYLOAD_LEN    = 98;
+    private static final byte ENROLLMENT_VERSION        = 0x01;
+    private static final byte ENROLLMENT_SW_DISABLED_HI = (byte)0x69;
+    private static final byte ENROLLMENT_SW_DISABLED_LO = (byte)0x86;  // 6986: "command not allowed (no current EF)"
+                                                                       // re-used to signal "enrollment mode is off"
+
+    // -------------------------------------------------------------------------
     // Per-transaction state (reset on deactivation)
     // -------------------------------------------------------------------------
-    private enum State { IDLE, SELECTED, AUTH0_DONE, CERT_LOADED, AUTH1_DONE, EXCHANGE_DONE }
+    private enum State { IDLE, SELECTED, AUTH0_DONE, CERT_LOADED, AUTH1_DONE, EXCHANGE_DONE, ENROLLMENT_SELECTED }
 
     private State   state = State.IDLE;
     private KeyPair udEphKP;              // UD ephemeral keypair (generated in AUTH0)
@@ -260,7 +295,7 @@ public class Aliro_HostApduService extends HostApduService
             return SW_ERROR;
         }
 
-        Log.d(TAG, "APDU: " + Hex.toHexString(apdu));
+        AliroDiagnosticLog.d(TAG, "APDU: " + Hex.toHexString(apdu));
 
         byte cla = apdu[0];
         byte ins = apdu[1];
@@ -292,7 +327,7 @@ public class Aliro_HostApduService extends HostApduService
                     chainBuffer = combined;
                 }
             }
-            Log.d(TAG, "APDU chaining: buffered " + dataLen + " bytes, total=" +
+            AliroDiagnosticLog.d(TAG, "APDU chaining: buffered " + dataLen + " bytes, total=" +
                     (chainBuffer != null ? chainBuffer.length : 0));
             inboundWasChained = true;
             // Respond with SW 9000 to request next chunk
@@ -303,7 +338,7 @@ public class Aliro_HostApduService extends HostApduService
         // the chaining was not completed — abort and clear the buffer.
         if (chainBuffer != null && ins != chainINS && ins != (byte)0xC0) // C0 = GET RESPONSE, allowed
         {
-            Log.w(TAG, "APDU chaining NOT completed: expected INS=" +
+            AliroDiagnosticLog.w(TAG, "APDU chaining NOT completed: expected INS=" +
                     String.format("%02X", chainINS) + ", got INS=" + String.format("%02X", ins));
             chainBuffer = null;
             chainINS = 0;
@@ -361,7 +396,7 @@ public class Aliro_HostApduService extends HostApduService
                 reassembled[reassembled.length - 1] = 0x00; // Le
             }
 
-            Log.d(TAG, "APDU chaining complete: reassembled " + fullData.length +
+            AliroDiagnosticLog.d(TAG, "APDU chaining complete: reassembled " + fullData.length +
                     " bytes, INS=" + String.format("%02X", chainedIns) +
                     (fullData.length > 255 ? " (extended length)" : " (short)"));
 
@@ -381,8 +416,9 @@ public class Aliro_HostApduService extends HostApduService
             case (byte)0x3C: return handleControlFlow(apdu);
             case (byte)0xC3: return handleEnvelope(apdu);   // Step-Up ENVELOPE
             case (byte)0xC0: return handleGetResponse(apdu); // Step-Up GET RESPONSE
+            case ENROLLMENT_INS_WRITE: return handleEnrollmentWrite(apdu);
             default:
-                Log.w(TAG, "Unknown INS: " + String.format("%02X", ins));
+                AliroDiagnosticLog.w(TAG, "Unknown INS: " + String.format("%02X", ins));
                 return SW_ERROR;
         }
     }
@@ -390,7 +426,7 @@ public class Aliro_HostApduService extends HostApduService
     @Override
     public void onDeactivated(int reason)
     {
-        Log.d(TAG, "Deactivated, reason=" + reason);
+        AliroDiagnosticLog.d(TAG, "Deactivated, reason=" + reason);
         resetState();
     }
 
@@ -406,13 +442,44 @@ public class Aliro_HostApduService extends HostApduService
         if (apdu.length < 5 + aidLen) return SW_ERROR;
         byte[] requestedAid = Arrays.copyOfRange(apdu, 5, 5 + aidLen);
 
-        boolean isExpedited = Arrays.equals(requestedAid, SELECT_AID);
-        boolean isStepUp    = Arrays.equals(requestedAid, STEPUP_AID);
+        boolean isExpedited  = Arrays.equals(requestedAid, SELECT_AID);
+        boolean isStepUp     = Arrays.equals(requestedAid, STEPUP_AID);
+        boolean isEnrollment = Arrays.equals(requestedAid, ENROLLMENT_AID);
 
-        if (!isExpedited && !isStepUp)
+        if (!isExpedited && !isStepUp && !isEnrollment)
         {
-            Log.w(TAG, "SELECT with wrong AID: " + Hex.toHexString(requestedAid));
+            AliroDiagnosticLog.w(TAG, "SELECT with wrong AID: " + Hex.toHexString(requestedAid));
             return SW_ERROR;
+        }
+
+        if (isEnrollment)
+        {
+            // Enrollment AID — only honored when the user has explicitly
+            // enabled enrollment mode in Settings. Otherwise return an
+            // error SW so a misbehaving or hostile reader can't silently
+            // probe this channel.
+            if (!AliroProvisioningManager.isEnrollmentMode(this))
+            {
+                AliroDiagnosticLog.w(TAG, "SELECT enrollment AID rejected: enrollment mode is disabled");
+                return new byte[] { ENROLLMENT_SW_DISABLED_HI, ENROLLMENT_SW_DISABLED_LO };
+            }
+            resetState();
+            state = State.ENROLLMENT_SELECTED;
+            AliroDiagnosticLog.d(TAG, "SELECT enrollment AID OK — awaiting INS 0xE0 with reader keypair");
+            // Return a minimal FCI echoing the enrollment AID, plus 9000.
+            // The reader doesn't consume any proprietary data from this AID,
+            // so the shortest valid template suffices.
+            byte[] enrollResp = new byte[2 + 2 + ENROLLMENT_AID.length + 2];
+            int rp = 0;
+            enrollResp[rp++] = 0x6F;                                  // FCI tag
+            enrollResp[rp++] = (byte)(2 + ENROLLMENT_AID.length);     // FCI len
+            enrollResp[rp++] = (byte)0x84;                            // AID tag
+            enrollResp[rp++] = (byte)ENROLLMENT_AID.length;           // AID len
+            System.arraycopy(ENROLLMENT_AID, 0, enrollResp, rp, ENROLLMENT_AID.length);
+            rp += ENROLLMENT_AID.length;
+            enrollResp[rp++] = (byte)0x90;                            // SW1
+            enrollResp[rp]   = 0x00;                                  // SW2
+            return enrollResp;
         }
 
         if (isStepUp)
@@ -421,10 +488,10 @@ public class Aliro_HostApduService extends HostApduService
             // Per Aliro §8.4: step-up phase requires completed expedited phase.
             if (state != State.AUTH1_DONE && state != State.EXCHANGE_DONE)
             {
-                Log.w(TAG, "SELECT Step-Up AID rejected: state=" + state + " (need AUTH1_DONE or EXCHANGE_DONE)");
+                AliroDiagnosticLog.w(TAG, "SELECT Step-Up AID rejected: state=" + state + " (need AUTH1_DONE or EXCHANGE_DONE)");
                 return SW_CONDITIONS;
             }
-            Log.d(TAG, "SELECT Step-Up AID OK (state=" + state + ")");
+            AliroDiagnosticLog.d(TAG, "SELECT Step-Up AID OK (state=" + state + ")");
             // Return same FCI response
             byte[] response = new byte[SELECT_RESPONSE.length + 2];
             System.arraycopy(SELECT_RESPONSE, 0, response, 0, SELECT_RESPONSE.length);
@@ -435,15 +502,121 @@ public class Aliro_HostApduService extends HostApduService
 
         resetState();
         state = State.SELECTED;
-        Log.d(TAG, "SELECT OK");
+        AliroDiagnosticLog.d(TAG, "SELECT OK");
 
         // Response: SELECT_RESPONSE + SW 9000
         byte[] response = new byte[SELECT_RESPONSE.length + 2];
         System.arraycopy(SELECT_RESPONSE, 0, response, 0, SELECT_RESPONSE.length);
         response[SELECT_RESPONSE.length]     = (byte)0x90;
         response[SELECT_RESPONSE.length + 1] = 0x00;
-        Log.d(TAG, "SELECT response: " + Hex.toHexString(response));
+        AliroDiagnosticLog.d(TAG, "SELECT response: " + Hex.toHexString(response));
         return response;
+    }
+
+    // -------------------------------------------------------------------------
+    // ENROLLMENT WRITE (INS E0) — out-of-band reader provisioning
+    //
+    // Wire format (after the standard 5-byte APDU header CLA INS P1 P2 Lc):
+    //   byte 0:        version (must equal ENROLLMENT_VERSION = 0x01)
+    //   bytes 1..65:   65-byte uncompressed reader public key (0x04 || X || Y)
+    //   bytes 66..97:  32-byte reader identifier
+    //
+    // Total payload: 98 bytes.
+    //
+    // Acknowledgement model:
+    //   - The credential validates the format synchronously and returns
+    //     9000 immediately if it looks well-formed.
+    //   - The actual storage of the reader provisioning happens AFTER the
+    //     user approves a confirmation prompt that pops up via full-screen
+    //     intent. The reader's SELECT/INS-E0 round-trip just tells the
+    //     reader "your payload was received and looks valid" — not "the
+    //     credential has trusted you." That decision belongs to the human
+    //     holding the phone.
+    //
+    // This INS is only honored while in the ENROLLMENT_SELECTED state
+    // (i.e., after a SELECT to the enrollment AID succeeded). Outside
+    // that state we return 6985 (conditions not satisfied), which also
+    // covers the case of an enrollment-disabled credential getting an
+    // INS E0 without the preceding SELECT.
+    // -------------------------------------------------------------------------
+
+    private byte[] handleEnrollmentWrite(byte[] apdu)
+    {
+        if (state != State.ENROLLMENT_SELECTED)
+        {
+            AliroDiagnosticLog.w(TAG, "Enrollment INS in wrong state: " + state);
+            return SW_CONDITIONS;
+        }
+
+        // Validate header + length byte
+        if (apdu.length < 5)
+        {
+            AliroDiagnosticLog.w(TAG, "Enrollment INS: APDU too short");
+            return SW_ERROR;
+        }
+        int lc = apdu[4] & 0xFF;
+        if (lc != ENROLLMENT_PAYLOAD_LEN)
+        {
+            AliroDiagnosticLog.w(TAG, "Enrollment INS: bad Lc=" + lc
+                    + " (expected " + ENROLLMENT_PAYLOAD_LEN + ")");
+            return SW_WRONG_LENGTH;
+        }
+        if (apdu.length < 5 + lc)
+        {
+            AliroDiagnosticLog.w(TAG, "Enrollment INS: payload truncated, got "
+                    + (apdu.length - 5) + " bytes");
+            return SW_WRONG_LENGTH;
+        }
+
+        byte version = apdu[5];
+        if (version != ENROLLMENT_VERSION)
+        {
+            AliroDiagnosticLog.w(TAG, "Enrollment INS: unsupported version 0x"
+                    + String.format("%02X", version)
+                    + " (we support 0x" + String.format("%02X", ENROLLMENT_VERSION) + ")");
+            // 6A86: incorrect parameters P1-P2 — closest to "version mismatch"
+            return new byte[] { (byte)0x6A, (byte)0x86 };
+        }
+
+        byte[] readerPub = Arrays.copyOfRange(apdu, 6,  6 + 65);
+        byte[] readerId  = Arrays.copyOfRange(apdu, 71, 71 + 32);
+
+        if (readerPub[0] != 0x04)
+        {
+            AliroDiagnosticLog.w(TAG, "Enrollment INS: pub key must start with 0x04 "
+                    + "(uncompressed), got 0x" + String.format("%02X", readerPub[0]));
+            return new byte[] { (byte)0x6A, (byte)0x80 }; // wrong data
+        }
+
+        AliroDiagnosticLog.i(TAG, "Enrollment INS received: pub="
+                + Hex.toHexString(readerPub).substring(0, 16) + "..., readerId="
+                + Hex.toHexString(readerId).substring(0, 16) + "...");
+
+        // Hand off to the confirmation activity. The activity is launched
+        // via a full-screen intent so it pops up over the lock screen if
+        // the user's phone was idle when the tap happened — same UX as the
+        // transaction result screen. Storage of the provisioning happens
+        // only if the user taps Approve.
+        try
+        {
+            EnrollmentConfirmActivity.launch(getApplicationContext(), readerPub, readerId);
+        }
+        catch (Throwable t)
+        {
+            AliroDiagnosticLog.e(TAG, "Failed to launch enrollment confirmation activity", t);
+            // Don't fail the reader's transaction over a UI issue — the
+            // reader has done its job; the user just won't see a prompt
+            // and the provisioning won't get stored. The reader will time
+            // out on the user side.
+        }
+
+        // Reset state — the enrollment AID session is one-shot. If the
+        // reader wants to retry it must SELECT again. We do this regardless
+        // of whether the activity launched, to avoid leaving a dangling
+        // session.
+        resetState();
+
+        return new byte[] { (byte)0x90, 0x00 };
     }
 
     // -------------------------------------------------------------------------
@@ -458,19 +631,19 @@ public class Aliro_HostApduService extends HostApduService
         // between test cases), we auto-transition to SELECTED.
         if (state == State.IDLE)
         {
-            Log.d(TAG, "AUTH0 in IDLE state — auto-accepting (AID routing confirmed)");
+            AliroDiagnosticLog.d(TAG, "AUTH0 in IDLE state — auto-accepting (AID routing confirmed)");
             state = State.SELECTED;
         }
         if (state != State.SELECTED)
         {
-            Log.w(TAG, "AUTH0 in wrong state: " + state);
+            AliroDiagnosticLog.w(TAG, "AUTH0 in wrong state: " + state);
             return SW_CONDITIONS;
         }
 
         // Validate P1=00 P2=00 per Aliro spec
         if (apdu.length >= 4 && (apdu[2] != 0x00 || apdu[3] != 0x00))
         {
-            Log.w(TAG, String.format("AUTH0: invalid P1=%02X P2=%02X (must be 00 00)", apdu[2], apdu[3]));
+            AliroDiagnosticLog.w(TAG, String.format("AUTH0: invalid P1=%02X P2=%02X (must be 00 00)", apdu[2], apdu[3]));
             return SW_CONDITIONS;
         }
 
@@ -484,7 +657,7 @@ public class Aliro_HostApduService extends HostApduService
             if (dataOffset < 0 || dataLen < 0) return SW_ERROR;
 
             byte[] data = Arrays.copyOfRange(apdu, dataOffset, dataOffset + dataLen);
-            Log.d(TAG, "AUTH0 data (" + data.length + " bytes): " + Hex.toHexString(data));
+            AliroDiagnosticLog.d(TAG, "AUTH0 data (" + data.length + " bytes): " + Hex.toHexString(data));
 
             // Parse TLVs
             readerEphPubBytes = null;
@@ -519,18 +692,18 @@ public class Aliro_HostApduService extends HostApduService
                 }
             }
             auth0Flag = new byte[]{ cmdParams, authPolicy };
-            Log.d(TAG, "Parsed auth0Flag: " + String.format("%02x%02x", cmdParams, authPolicy));
+            AliroDiagnosticLog.d(TAG, "Parsed auth0Flag: " + String.format("%02x%02x", cmdParams, authPolicy));
 
             // Parse TLVs from AUTH0 data using sequential TLV walk.
             parseTlvsFromAuth0(data, 0, data.length);
 
-            Log.d(TAG, "After parse — readerEphPub=" + (readerEphPubBytes != null) +
+            AliroDiagnosticLog.d(TAG, "After parse — readerEphPub=" + (readerEphPubBytes != null) +
                     " tid=" + (transactionId != null) + " readerId=" + (readerIdBytes != null) +
                     " vendorExt=" + (auth0CmdVendorExt != null ? auth0CmdVendorExt.length + "B" : "null"));
 
             if (readerEphPubBytes == null || transactionId == null || readerIdBytes == null)
             {
-                Log.e(TAG, "AUTH0 missing required TLV(s)");
+                AliroDiagnosticLog.e(TAG, "AUTH0 missing required TLV(s)");
                 return SW_ERROR;
             }
             if (selectedProtocol == null)
@@ -538,10 +711,10 @@ public class Aliro_HostApduService extends HostApduService
                 selectedProtocol = new byte[]{ 0x01, 0x00 }; // default to 01.00
             }
 
-            Log.d(TAG, "Reader eph pub: " + Hex.toHexString(readerEphPubBytes));
-            Log.d(TAG, "Transaction ID: " + Hex.toHexString(transactionId));
-            Log.d(TAG, "Reader ID:      " + Hex.toHexString(readerIdBytes));
-            Log.d(TAG, "Protocol:       " + Hex.toHexString(selectedProtocol));
+            AliroDiagnosticLog.d(TAG, "Reader eph pub: " + Hex.toHexString(readerEphPubBytes));
+            AliroDiagnosticLog.d(TAG, "Transaction ID: " + Hex.toHexString(transactionId));
+            AliroDiagnosticLog.d(TAG, "Reader ID:      " + Hex.toHexString(readerIdBytes));
+            AliroDiagnosticLog.d(TAG, "Protocol:       " + Hex.toHexString(selectedProtocol));
 
             // --- Multi-group reader key lookup ---
             // Per Aliro §8.3.3.4.5: the credential SHALL look up the correct reader
@@ -563,13 +736,13 @@ public class Aliro_HostApduService extends HostApduService
                         {
                             readerStaticPubKey = mappedKey;
                             readerStaticPubKeyX = Arrays.copyOfRange(mappedKey, 1, 33);
-                            Log.d(TAG, "AUTH0: multi-group reader key lookup HIT for group_id=" + groupIdHex
+                            AliroDiagnosticLog.d(TAG, "AUTH0: multi-group reader key lookup HIT for group_id=" + groupIdHex
                                     + " -> pubKeyX=" + Hex.toHexString(readerStaticPubKeyX));
                         }
                     }
                     catch (Exception ex)
                     {
-                        Log.w(TAG, "AUTH0: failed to decode mapped reader key", ex);
+                        AliroDiagnosticLog.w(TAG, "AUTH0: failed to decode mapped reader key", ex);
                     }
                 }
                 else
@@ -586,13 +759,13 @@ public class Aliro_HostApduService extends HostApduService
                         {
                             readerStaticPubKey = provKey;
                             readerStaticPubKeyX = Arrays.copyOfRange(provKey, 1, 33);
-                            Log.d(TAG, "AUTH0: provisioned reader key matched for group_id=" + groupIdHex
+                            AliroDiagnosticLog.d(TAG, "AUTH0: provisioned reader key matched for group_id=" + groupIdHex
                                     + " -> pubKeyX=" + Hex.toHexString(readerStaticPubKeyX));
                         }
                     }
                     if (readerStaticPubKey == null)
                     {
-                        Log.d(TAG, "AUTH0: group_id=" + groupIdHex + " not in multi-group map (will use config/LOAD CERT key)");
+                        AliroDiagnosticLog.d(TAG, "AUTH0: group_id=" + groupIdHex + " not in multi-group map (will use config/LOAD CERT key)");
                     }
                 }
             }
@@ -602,7 +775,7 @@ public class Aliro_HostApduService extends HostApduService
                     || (selectedProtocol[0] == 0x00 && selectedProtocol[1] == 0x09);
             if (!validProto)
             {
-                Log.w(TAG, "AUTH0: unsupported protocol version " + Hex.toHexString(selectedProtocol));
+                AliroDiagnosticLog.w(TAG, "AUTH0: unsupported protocol version " + Hex.toHexString(selectedProtocol));
                 return SW_CONDITIONS;
             }
 
@@ -632,13 +805,13 @@ public class Aliro_HostApduService extends HostApduService
 
                     if (!groupMatch && !subGroupMatch)
                     {
-                        Log.w(TAG, "Strict mode: Reader group ID and sub_group_id both mismatch — rejecting");
+                        AliroDiagnosticLog.w(TAG, "Strict mode: Reader group ID and sub_group_id both mismatch — rejecting");
                         return SW_CONDITIONS; // 6985
                     }
                     if (groupMatch)
-                        Log.d(TAG, "Strict mode: Reader group ID verified (exact match)");
+                        AliroDiagnosticLog.d(TAG, "Strict mode: Reader group ID verified (exact match)");
                     else
-                        Log.d(TAG, "Strict mode: Reader sub_group_id verified (group_id differs, sub_group_id matches)");
+                        AliroDiagnosticLog.d(TAG, "Strict mode: Reader sub_group_id verified (group_id differs, sub_group_id matches)");
                 }
             }
 
@@ -654,7 +827,7 @@ public class Aliro_HostApduService extends HostApduService
             // command_parameters (tag 0x41): 0x00 = standard, 0x01 = fast
             // authentication_policy (tag 0x42): 0x01=UD, 0x02=UD+force, 0x03=force user auth
             boolean fastMode = (cmdParams & 0x01) == 0x01;
-            Log.d(TAG, "AUTH0: fastMode=" + fastMode + " cmdParams=" + String.format("%02x", cmdParams));
+            AliroDiagnosticLog.d(TAG, "AUTH0: fastMode=" + fastMode + " cmdParams=" + String.format("%02x", cmdParams));
 
             // Build response data: 86 41 <UD eph pub key 65 bytes>
             // For fast mode, also include cryptogram: 9D 40 <64 bytes encrypted>
@@ -675,9 +848,9 @@ public class Aliro_HostApduService extends HostApduService
                     if (kpHex != null)
                     {
                         try { kpersistent = Hex.decode(kpHex); }
-                        catch (Exception ex) { Log.w(TAG, "AUTH0 fast: invalid kpersistent hex", ex); }
+                        catch (Exception ex) { AliroDiagnosticLog.w(TAG, "AUTH0 fast: invalid kpersistent hex", ex); }
                     }
-                    Log.d(TAG, "AUTH0 fast: kpersistent " + (kpersistent != null ? "FOUND" : "NOT FOUND")
+                    AliroDiagnosticLog.d(TAG, "AUTH0 fast: kpersistent " + (kpersistent != null ? "FOUND" : "NOT FOUND")
                             + " for sub_group_id=" + Hex.toHexString(subGroupId));
                 }
 
@@ -694,7 +867,13 @@ public class Aliro_HostApduService extends HostApduService
                             : new byte[32]; // fallback: 32 zero bytes
 
                     // Need reader's static public key X for derivation.
-                    // Use same fallback logic as AUTH1: prefer LOAD CERT, else test harness key, else eph key.
+                    // Per §8.3.1.12 the salt_fast MUST contain the x coordinate
+                    // of the reader_group_identifier_key. If neither LOAD CERT
+                    // nor a stored reader key is available we cannot derive
+                    // correct fast session keys; rather than substitute the
+                    // ephemeral key X and silently desync, fall back to a
+                    // normal STANDARD transaction by omitting the cryptogram
+                    // from the AUTH0 response.
                     byte[] fastReaderPubKeyX = readerStaticPubKeyX;
                     if (fastReaderPubKeyX == null)
                     {
@@ -702,9 +881,17 @@ public class Aliro_HostApduService extends HostApduService
                         if (testKey != null && testKey.length == 65)
                             fastReaderPubKeyX = Arrays.copyOfRange(testKey, 1, 33);
                     }
-                    if (fastReaderPubKeyX == null)
-                        fastReaderPubKeyX = readerEphPubX; // last-resort fallback
 
+                    if (fastReaderPubKeyX == null)
+                    {
+                        AliroDiagnosticLog.w(TAG, "AUTH0 fast: no reader_group_identifier_key.x available; "
+                                + "downgrading to STANDARD flow (no cryptogram). "
+                                + "Provide a reader pub key via provisioning or test-harness.");
+                        // Leave cryptogram null — caller will omit tag 0x9D and
+                        // the reader will fall through to AUTH1.
+                    }
+                    else
+                    {
                     byte[] fastKeys = AliroCryptoProvider.deriveFastKeys(
                             kpersistent, 160,
                             selectedProtocol,
@@ -745,9 +932,9 @@ public class Aliro_HostApduService extends HostApduService
                         // Result: 48 bytes ciphertext + 16 bytes tag = 64 bytes
                         cryptogram = AliroCryptoProvider.encryptCryptogram(cryptogramSK, plainPayload);
                         if (cryptogram != null)
-                            Log.d(TAG, "AUTH0 fast: real cryptogram (64 bytes) generated");
+                            AliroDiagnosticLog.d(TAG, "AUTH0 fast: real cryptogram (64 bytes) generated");
                         else
-                            Log.w(TAG, "AUTH0 fast: cryptogram encryption failed");
+                            AliroDiagnosticLog.w(TAG, "AUTH0 fast: cryptogram encryption failed");
 
                         // Set session keys from FAST derivation for subsequent EXCHANGE
                         // In FAST mode there is no AUTH1 — go directly to AUTH1_DONE
@@ -760,12 +947,13 @@ public class Aliro_HostApduService extends HostApduService
                         readerCounter = 1;
                         deviceCounter = 1;
                         state = State.AUTH1_DONE;
-                        Log.d(TAG, "AUTH0 fast: session keys set, state=AUTH1_DONE for EXCHANGE");
+                        AliroDiagnosticLog.d(TAG, "AUTH0 fast: session keys set, state=AUTH1_DONE for EXCHANGE");
                     }
                     else
                     {
-                        Log.e(TAG, "AUTH0 fast: deriveFastKeys failed");
+                        AliroDiagnosticLog.e(TAG, "AUTH0 fast: deriveFastKeys failed");
                     }
+                    } // end fastReaderPubKeyX != null
                 }
 
                 // If Kpersistent not found OR derivation failed: return 64 bytes of random data
@@ -773,7 +961,7 @@ public class Aliro_HostApduService extends HostApduService
                 if (cryptogram == null)
                 {
                     cryptogram = AliroCryptoProvider.generateRandom(64);
-                    Log.d(TAG, "AUTH0 fast: Kpersistent not found — returning random cryptogram");
+                    AliroDiagnosticLog.d(TAG, "AUTH0 fast: Kpersistent not found — returning random cryptogram");
                 }
             }
 
@@ -823,7 +1011,7 @@ public class Aliro_HostApduService extends HostApduService
                 System.arraycopy(responseData, 0, response, 0, responseData.length);
                 response[responseData.length]     = (byte)0x90;
                 response[responseData.length + 1] = 0x00;
-                Log.d(TAG, "AUTH0 response direct: " + responseData.length + " bytes + SW 9000 (Le=" + expectedLe + ")");
+                AliroDiagnosticLog.d(TAG, "AUTH0 response direct: " + responseData.length + " bytes + SW 9000 (Le=" + expectedLe + ")");
                 return response;
             }
             else
@@ -838,13 +1026,13 @@ public class Aliro_HostApduService extends HostApduService
                 System.arraycopy(responseData, 0, firstChunk, 0, chunkSize);
                 firstChunk[chunkSize]     = 0x61;
                 firstChunk[chunkSize + 1] = (byte) Math.min(left, 0xFF);
-                Log.d(TAG, "AUTH0 response chained: sent " + chunkSize + " bytes, " + left + " remaining (Le=" + expectedLe + ")");
+                AliroDiagnosticLog.d(TAG, "AUTH0 response chained: sent " + chunkSize + " bytes, " + left + " remaining (Le=" + expectedLe + ")");
                 return firstChunk;
             }
         }
         catch (Exception e)
         {
-            Log.e(TAG, "AUTH0 error", e);
+            AliroDiagnosticLog.e(TAG, "AUTH0 error", e);
             return SW_ERROR;
         }
     }
@@ -927,7 +1115,7 @@ public class Aliro_HostApduService extends HostApduService
                         int tlvHeaderLen = (lenByte < 0x80) ? 2 : (lenByte == 0x81) ? 3 : 4;
                         int tlvStart = i - tlvHeaderLen; // back up to tag start
                         auth0CmdVendorExt = Arrays.copyOfRange(data, tlvStart, i + len);
-                        Log.d(TAG, "AUTH0: captured vendor extension (" + len + " bytes) at offset " + tlvStart);
+                        AliroDiagnosticLog.d(TAG, "AUTH0: captured vendor extension (" + len + " bytes) at offset " + tlvStart);
                     }
                     break;
                 default:
@@ -947,7 +1135,7 @@ public class Aliro_HostApduService extends HostApduService
     {
         if (state != State.AUTH0_DONE)
         {
-            Log.w(TAG, "LOAD CERT in wrong state: " + state);
+            AliroDiagnosticLog.w(TAG, "LOAD CERT in wrong state: " + state);
             return SW_CONDITIONS;
         }
 
@@ -967,7 +1155,7 @@ public class Aliro_HostApduService extends HostApduService
                 // ASN.1 DER encoded starting with SEQUENCE tag 0x30.
                 if (cert.length < 4 || (cert[0] & 0xFF) != 0x30)
                 {
-                    Log.w(TAG, "LOAD CERT: invalid cert format — does not start with 0x30 SEQUENCE" +
+                    AliroDiagnosticLog.w(TAG, "LOAD CERT: invalid cert format — does not start with 0x30 SEQUENCE" +
                             " (first byte: " + (cert.length > 0 ? String.format("0x%02X", cert[0] & 0xFF) : "empty") + ")");
                     return SW_CONDITIONS; // 6985 — reject invalid format
                 }
@@ -995,13 +1183,13 @@ public class Aliro_HostApduService extends HostApduService
                 }
                 else
                 {
-                    Log.w(TAG, "LOAD CERT: invalid ASN.1 length encoding");
+                    AliroDiagnosticLog.w(TAG, "LOAD CERT: invalid ASN.1 length encoding");
                     return SW_CONDITIONS;
                 }
 
                 if (seqHeaderLen + seqLen > cert.length)
                 {
-                    Log.w(TAG, "LOAD CERT: SEQUENCE length (" + seqLen +
+                    AliroDiagnosticLog.w(TAG, "LOAD CERT: SEQUENCE length (" + seqLen +
                             ") exceeds cert data (" + cert.length + " bytes)");
                     return SW_CONDITIONS;
                 }
@@ -1019,7 +1207,7 @@ public class Aliro_HostApduService extends HostApduService
                             readerStaticPubKey[0] = 0x04;
                             System.arraycopy(cert, i + 4, readerStaticPubKey, 1, 64);
                             foundPubKey = true;
-                            Log.d(TAG, "LOAD CERT: reader static pub key X = " +
+                            AliroDiagnosticLog.d(TAG, "LOAD CERT: reader static pub key X = " +
                                     org.bouncycastle.util.encoders.Hex.toHexString(readerStaticPubKeyX));
                         }
                         break;
@@ -1028,19 +1216,19 @@ public class Aliro_HostApduService extends HostApduService
 
                 if (!foundPubKey)
                 {
-                    Log.w(TAG, "LOAD CERT: could not parse reader static pub key — rejecting");
+                    AliroDiagnosticLog.w(TAG, "LOAD CERT: could not parse reader static pub key — rejecting");
                     return SW_CONDITIONS;
                 }
             }
             else
             {
-                Log.w(TAG, "LOAD CERT: empty or invalid data field");
+                AliroDiagnosticLog.w(TAG, "LOAD CERT: empty or invalid data field");
                 return SW_CONDITIONS;
             }
         }
         catch (Exception e)
         {
-            Log.w(TAG, "LOAD CERT parse error: " + e.getMessage());
+            AliroDiagnosticLog.w(TAG, "LOAD CERT parse error: " + e.getMessage());
             return SW_CONDITIONS;
         }
 
@@ -1060,21 +1248,21 @@ public class Aliro_HostApduService extends HostApduService
                         boolean certValid = AliroProvisioningManager.verifyProfile0000Cert(certData, issuerPubKey);
                         if (!certValid)
                         {
-                            Log.w(TAG, "Strict mode: Reader certificate verification FAILED");
+                            AliroDiagnosticLog.w(TAG, "Strict mode: Reader certificate verification FAILED");
                             return SW_SECURITY; // 6982
                         }
-                        Log.d(TAG, "Strict mode: Reader certificate verified against Issuer CA");
+                        AliroDiagnosticLog.d(TAG, "Strict mode: Reader certificate verified against Issuer CA");
                     }
                 }
             }
             catch (Exception e)
             {
-                Log.w(TAG, "Strict mode cert verify error: " + e.getMessage());
+                AliroDiagnosticLog.w(TAG, "Strict mode cert verify error: " + e.getMessage());
             }
         }
 
         state = State.CERT_LOADED;
-        Log.d(TAG, "LOAD CERT received, acknowledged");
+        AliroDiagnosticLog.d(TAG, "LOAD CERT received, acknowledged");
         return SW_OK;
     }
 
@@ -1084,18 +1272,19 @@ public class Aliro_HostApduService extends HostApduService
 
     private byte[] handleAuth1(byte[] apdu)
     {
+        final long tAuth1Start = android.os.SystemClock.elapsedRealtime();
         State expectedState = (state == State.AUTH0_DONE || state == State.CERT_LOADED)
                 ? state : null;
         if (expectedState == null)
         {
-            Log.w(TAG, "AUTH1 in wrong state: " + state);
+            AliroDiagnosticLog.w(TAG, "AUTH1 in wrong state: " + state);
             return SW_CONDITIONS;
         }
 
         // Validate P1=00 P2=00 per Aliro spec
         if (apdu.length >= 4 && (apdu[2] != 0x00 || apdu[3] != 0x00))
         {
-            Log.w(TAG, String.format("AUTH1: invalid P1=%02X P2=%02X (must be 00 00)", apdu[2], apdu[3]));
+            AliroDiagnosticLog.w(TAG, String.format("AUTH1: invalid P1=%02X P2=%02X (must be 00 00)", apdu[2], apdu[3]));
             return SW_CONDITIONS;
         }
 
@@ -1107,7 +1296,7 @@ public class Aliro_HostApduService extends HostApduService
             if (dataOffset < 0 || dataLen < 3) return SW_ERROR;
 
             byte[] data = Arrays.copyOfRange(apdu, dataOffset, dataOffset + dataLen);
-            Log.d(TAG, "AUTH1 data: " + Hex.toHexString(data));
+            AliroDiagnosticLog.d(TAG, "AUTH1 data: " + Hex.toHexString(data));
 
             // Parse TLVs: find 41 (command_parameters), 9E (signature), 90 (reader_cert)
             // Uses BER-TLV length decoding: single-byte for values < 0x80,
@@ -1150,7 +1339,7 @@ public class Aliro_HostApduService extends HostApduService
                 if (tag == 0x41 && len == 1)
                 {
                     auth1CmdParams = data[valOff];
-                    Log.d(TAG, "AUTH1: command_parameters = " + String.format("%02X", auth1CmdParams));
+                    AliroDiagnosticLog.d(TAG, "AUTH1: command_parameters = " + String.format("%02X", auth1CmdParams));
                 }
                 else if (tag == 0x9E && len == 64)
                 {
@@ -1160,7 +1349,7 @@ public class Aliro_HostApduService extends HostApduService
                 {
                     // reader_Cert per Table 8-10 — optional, same format as LOAD CERT
                     auth1ReaderCert = Arrays.copyOfRange(data, valOff, valOff + len);
-                    Log.d(TAG, "AUTH1: found reader_cert (" + len + " bytes)");
+                    AliroDiagnosticLog.d(TAG, "AUTH1: found reader_cert (" + len + " bytes)");
                 }
                 i = valOff + len;
             }
@@ -1173,79 +1362,100 @@ public class Aliro_HostApduService extends HostApduService
 
             if (readerSig == null)
             {
-                Log.e(TAG, "AUTH1: no reader signature found");
+                AliroDiagnosticLog.e(TAG, "AUTH1: no reader signature found");
                 return SW_ERROR;
             }
-            Log.d(TAG, "Reader signature: " + Hex.toHexString(readerSig));
+            AliroDiagnosticLog.d(TAG, "Reader signature: " + Hex.toHexString(readerSig));
 
             // Get credential keypair from Android KeyStore
             PrivateKey credPrivKey = getCredentialPrivateKey();
             byte[] credPubKeyBytes = getCredentialPublicKeyBytes();
             if (credPrivKey == null || credPubKeyBytes == null)
             {
-                Log.e(TAG, "AUTH1: credential keypair not available");
+                AliroDiagnosticLog.e(TAG, "AUTH1: credential keypair not available");
                 return SW_ERROR;
             }
 
             byte[] readerEphPubX = Arrays.copyOfRange(readerEphPubBytes, 1, 33);
             byte[] udEphPubX     = Arrays.copyOfRange(udEphPubBytes, 1, 33);
 
-            // Verify reader signature against the reader's public key from LOAD CERT (tag 0x85).
-            // Per §8.3.3.4.5 the credential SHALL verify the reader signature and execute the
-            // failure process if it fails. We log but stay permissive for now so that readers
-            // without a provisioned CA key still complete the transaction.
-            boolean readerSigValid = false;
+            // Verify reader signature against the reader's static public key.
+            //
+            // Per Aliro §8.3.3.4.5 the User Device SHALL verify the reader
+            // signature using the reader public key from (in priority order):
+            //   1. LOAD CERT command processing (tag 0x85 of the cert) — when
+            //      a reader cert was loaded prior to AUTH1, or embedded in the
+            //      AUTH1 command itself via tag 0x90.
+            //   2. Lookup by reader_group_identifier — already attempted in
+            //      handleAuth0() against the provisioned reader_group_id, the
+            //      multi-group static map, and the legacy test-harness slot,
+            //      which all populate readerStaticPubKey on success.
+            //   3. The dedicated test-harness reader pub key slot, retried
+            //      here as a last resort (the AUTH0 lookup above may not have
+            //      consulted it if the credential isn't provisioned at all).
+            //
+            // If NONE of these yield a key the failure process MUST be executed
+            // per §8.3.3.4.5 — we cannot derive correct session keys without
+            // the reader_group_identifier_key.x value either way (§8.3.1.13).
             byte[] sigVerifyKey = readerStaticPubKey;
 
-            // If no reader key from LOAD CERT, try test harness reader key
             if (sigVerifyKey == null)
             {
                 sigVerifyKey = AliroProvisioningManager.getTestHarnessReaderPubKey(this);
                 if (sigVerifyKey != null)
-                    Log.d(TAG, "AUTH1: using test harness reader public key for sig verification");
+                    AliroDiagnosticLog.d(TAG, "AUTH1: using test-harness reader public key for sig verification");
             }
 
-            if (sigVerifyKey != null)
+            if (sigVerifyKey == null)
             {
-                readerSigValid = AliroCryptoProvider.verifyReaderSignature(
-                        readerSig, sigVerifyKey,
-                        readerIdBytes, udEphPubX, readerEphPubX, transactionId);
+                AliroDiagnosticLog.w(TAG, "AUTH1: no reader public key bound to reader_group_identifier; "
+                        + "executing failure process per §8.3.3.4.5. "
+                        + "Provide one via LOAD CERT, AUTH1-embedded cert (tag 0x90), "
+                        + "credential provisioning, or the test-harness reader pub key slot.");
+                zeroSessionKeys();
+                return SW_SECURITY; // 6982
             }
-            else
-            {
-                Log.w(TAG, "AUTH1: no reader public key available for signature verification");
-            }
-            Log.d(TAG, "Reader signature valid: " + readerSigValid);
 
-            // Per §8.3.3.4.5: credential SHALL verify the reader signature and execute
-            // the failure process if it fails. When a verification key is available
-            // (from LOAD CERT or test harness config), always reject invalid signatures.
-            if (sigVerifyKey != null && !readerSigValid)
+            boolean readerSigValid = AliroCryptoProvider.verifyReaderSignature(
+                    readerSig, sigVerifyKey,
+                    readerIdBytes, udEphPubX, readerEphPubX, transactionId);
+            AliroDiagnosticLog.d(TAG, "AUTH1: reader signature valid = " + readerSigValid
+                    + " (verifier key=" + Hex.toHexString(sigVerifyKey) + ")");
+
+            if (!readerSigValid)
             {
-                Log.w(TAG, "AUTH1: reader signature INVALID — rejecting per spec");
+                AliroDiagnosticLog.w(TAG, "AUTH1: reader signature INVALID — executing failure process per §8.3.3.4.5");
+                zeroSessionKeys();
                 return SW_SECURITY; // 6982
             }
 
             // Derive session keys.
-            // reader_group_identifier_key.x = reader static pub key X per section 8.3.1.13.
-            // Parsed from LOAD CERT tag 0x85; fall back to readerEphPubX if not available.
-            byte[] hkdfReaderPubKeyX = readerStaticPubKeyX;
-            String hkdfSource = "LOAD CERT";
-            if (hkdfReaderPubKeyX == null && sigVerifyKey != null && sigVerifyKey.length == 65)
+            // Per §8.3.1.13 the HKDF salt MUST contain the x coordinate of
+            // the reader_group_identifier_key (i.e. the reader's static public
+            // key, or the issuer CA public key bound to the group_id; these
+            // are equivalent under §6.2). We use the same key we just verified
+            // against. There is NO valid fallback to the ephemeral key X:
+            // substituting it would silently derive the wrong session keys.
+            byte[] hkdfReaderPubKeyX;
+            String hkdfSource;
+            if (readerStaticPubKeyX != null)
             {
-                // Use X coordinate from test harness reader pub key
+                hkdfReaderPubKeyX = readerStaticPubKeyX;
+                hkdfSource = (readerStaticPubKey == sigVerifyKey)
+                        ? "LOAD CERT / cert-in-AUTH1"
+                        : "reader_group_identifier lookup";
+            }
+            else
+            {
                 hkdfReaderPubKeyX = Arrays.copyOfRange(sigVerifyKey, 1, 33);
-                hkdfSource = "test harness reader key";
+                hkdfSource = "test-harness reader key";
             }
-            if (hkdfReaderPubKeyX == null)
-            {
-                hkdfReaderPubKeyX = readerEphPubX;
-                hkdfSource = "eph key fallback";
-            }
-            Log.d(TAG, "AUTH1: using readerPubKeyX from " + hkdfSource);
+            AliroDiagnosticLog.d(TAG, "AUTH1: using readerPubKeyX from " + hkdfSource
+                    + " (X=" + Hex.toHexString(hkdfReaderPubKeyX) + ")");
 
             // Derive 96 bytes: ExpeditedSKReader[0..31], ExpeditedSKDevice[32..63],
             // StepUpSK[64..95] per Aliro §8.3.1.13
+            long tDk0 = android.os.SystemClock.elapsedRealtime();
             byte[] keybuf = AliroCryptoProvider.deriveKeys(
                     udEphKP.getPrivate(),
                     readerEphPubBytes,
@@ -1261,10 +1471,12 @@ public class Aliro_HostApduService extends HostApduService
                     auth0RspVendorExt,   // vendor ext from AUTH0 response (null for us)
                     AliroCryptoProvider.INTERFACE_BYTE_NFC,
                     auth0Flag);
+            long tDk1 = android.os.SystemClock.elapsedRealtime();
+            AliroDiagnosticLog.d(TAG, "AUTH1: deriveKeys elapsed=" + (tDk1 - tDk0) + "ms");
 
             if (keybuf == null)
             {
-                Log.e(TAG, "AUTH1: key derivation failed");
+                AliroDiagnosticLog.e(TAG, "AUTH1: key derivation failed");
                 return SW_ERROR;
             }
             skReader  = Arrays.copyOfRange(keybuf, 0,  32);  // ExpeditedSKReader
@@ -1272,11 +1484,14 @@ public class Aliro_HostApduService extends HostApduService
             stepUpSK  = Arrays.copyOfRange(keybuf, 64, 96);  // StepUpSK (for ENVELOPE)
 
             // Compute credential signature
+            long tCs0 = android.os.SystemClock.elapsedRealtime();
             byte[] credSig = AliroCryptoProvider.computeCredentialSignature(
                     credPrivKey, readerIdBytes, udEphPubX, readerEphPubX, transactionId);
+            long tCs1 = android.os.SystemClock.elapsedRealtime();
+            AliroDiagnosticLog.d(TAG, "AUTH1: computeCredentialSignature elapsed=" + (tCs1 - tCs0) + "ms");
             if (credSig == null)
             {
-                Log.e(TAG, "AUTH1: credential signature failed");
+                AliroDiagnosticLog.e(TAG, "AUTH1: credential signature failed");
                 zeroSessionKeys();
                 return SW_ERROR;
             }
@@ -1290,34 +1505,81 @@ public class Aliro_HostApduService extends HostApduService
             // Bit5: Mailbox can be WRITTEN
             // Bit6: Sending data to backend supported
             // Bit7: Sending data to bound app supported
-            // We use the multi-doc API so that signaling_bitmap reflects the
-            // full collection rather than just the legacy single-doc mirror.
-            java.util.List<AliroAccessDocument.StoredDocument> storedDocs =
-                    AliroAccessDocument.getAllDocuments(this);
+            long t0 = android.os.SystemClock.elapsedRealtime();
+
+            // Compute signaling_bitmap (tag 0x5E) per Table 8-11 — fast path.
+            //
+            // The previous implementation Base64-decoded every stored Access
+            // and Revocation document just to learn whether they were present.
+            // For credentials with multiple large CBOR documents that added
+            // hundreds of milliseconds and pushed AUTH1 past Android's HCE
+            // timeout. We now ask SharedPreferences whether the per-doc keys
+            // exist and have non-empty STRING values — no decoding, no parsing.
+            //
+            // Bit 0 (hasAccessDoc): any KEY_ACCESS_DOC:<docId> with non-empty
+            //   base64 string → true.
+            // Bit 1 (hasRevocDoc):  any KEY_REVOC_DOC:<docId> with non-empty
+            //   base64 string → true.
+            // Bit 3 (mailbox has data): mailbox blob non-empty (string-level
+            //   check; decoding it just to know its length is wasteful).
+            // Bits 4/5 (mailbox readable/writable): always set — we support
+            //   mailbox EXCHANGE operations.
+            int signalingBits = 0;
             boolean hasAccessDoc = false;
             boolean hasRevocDoc  = false;
-            for (AliroAccessDocument.StoredDocument sd : storedDocs)
+            try
             {
-                if (sd.accessDocBytes      != null && sd.accessDocBytes.length      > 0) hasAccessDoc = true;
-                if (sd.revocationDocBytes  != null && sd.revocationDocBytes.length  > 0) hasRevocDoc  = true;
+                SharedPreferences docPrefs = getSharedPreferences(
+                        AliroAccessDocument.PREFS_NAME, Context.MODE_PRIVATE);
+                String csv = docPrefs.getString("aliro_doc_ids", "");
+                if (!csv.isEmpty())
+                {
+                    for (String raw : csv.split(","))
+                    {
+                        String docId = raw.trim();
+                        if (docId.isEmpty()) continue;
+                        if (!hasAccessDoc)
+                        {
+                            String b64 = docPrefs.getString(
+                                    AliroAccessDocument.KEY_ACCESS_DOC + ":" + docId, null);
+                            if (b64 != null && !b64.isEmpty()) hasAccessDoc = true;
+                        }
+                        if (!hasRevocDoc)
+                        {
+                            String b64 = docPrefs.getString(
+                                    AliroAccessDocument.KEY_REVOC_DOC + ":" + docId, null);
+                            if (b64 != null && !b64.isEmpty()) hasRevocDoc = true;
+                        }
+                        if (hasAccessDoc && hasRevocDoc) break;
+                    }
+                }
             }
-            int signalingBits = 0;
-            if (hasAccessDoc) signalingBits |= 0x0001; // bit 0: access doc present
-            if (hasRevocDoc)  signalingBits |= 0x0002; // bit 1: revocation doc present
+            catch (Exception sigEx)
+            {
+                AliroDiagnosticLog.w(TAG, "AUTH1: bitmap doc check failed", sigEx);
+            }
+            if (hasAccessDoc) signalingBits |= 0x0001; // bit 0
+            if (hasRevocDoc)  signalingBits |= 0x0002; // bit 1
             // Bit2 (step-up AID re-SELECT): not required, leave 0
 
-            // Check if mailbox has data
-            byte[] currentMailbox = loadMailbox();
-            boolean hasMailboxData = (currentMailbox != null && currentMailbox.length > 0);
-            if (hasMailboxData) signalingBits |= 0x0008; // bit 3: mailbox has data
+            // Mailbox-has-data: string-level non-empty check, no decode.
+            try
+            {
+                SharedPreferences sp = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+                String mb = sp.getString(PREF_MAILBOX_KEY, null);
+                if (mb != null && !mb.isEmpty()) signalingBits |= 0x0008; // bit 3
+            }
+            catch (Exception ignored) { /* leave bit3 clear */ }
 
-            // Always report mailbox as readable/writable — this credential supports
-            // mailbox operations per the spec.
+            // Always report mailbox as readable/writable — this credential
+            // supports mailbox operations per the spec.
             signalingBits |= 0x0010; // bit 4: mailbox can be read
             signalingBits |= 0x0020; // bit 5: mailbox can be written
 
-            Log.d(TAG, "AUTH1: signaling_bitmap=0x" + String.format("%04X", signalingBits)
-                    + " (hasAccessDoc=" + hasAccessDoc + ", hasRevocDoc=" + hasRevocDoc + ")");
+            long t1 = android.os.SystemClock.elapsedRealtime();
+            AliroDiagnosticLog.d(TAG, "AUTH1: signaling_bitmap=0x" + String.format("%04X", signalingBits)
+                    + " (hasAccessDoc=" + hasAccessDoc + ", hasRevocDoc=" + hasRevocDoc
+                    + ", elapsed=" + (t1 - t0) + "ms)");
 
             // Build AUTH1 response plaintext per Table 8-11:
             //   When auth1 command_parameters bit0 = 0: include key_slot (4E 08)
@@ -1333,7 +1595,7 @@ public class Aliro_HostApduService extends HostApduService
                 credIdentifier[0] = 0x4E;
                 credIdentifier[1] = 0x08;
                 System.arraycopy(keySlotValue, 0, credIdentifier, 2, 8);
-                Log.d(TAG, "AUTH1: using key_slot = " + Hex.toHexString(keySlotValue));
+                AliroDiagnosticLog.d(TAG, "AUTH1: using key_slot = " + Hex.toHexString(keySlotValue));
             }
             else
             {
@@ -1342,7 +1604,7 @@ public class Aliro_HostApduService extends HostApduService
                 credIdentifier[0] = 0x5A;
                 credIdentifier[1] = 0x41;
                 System.arraycopy(credPubKeyBytes, 0, credIdentifier, 2, 65);
-                Log.d(TAG, "AUTH1: using full public key");
+                AliroDiagnosticLog.d(TAG, "AUTH1: using full public key");
             }
 
             // Per Table 8-11, signaling_bitmap (0x5E) is MANDATORY and SHALL always be present,
@@ -1366,80 +1628,105 @@ public class Aliro_HostApduService extends HostApduService
             byte[] encrypted = AliroCryptoProvider.encryptDeviceGcm(skDevice, plaintext, deviceCounter++);
             if (encrypted == null)
             {
-                Log.e(TAG, "AUTH1: encryption failed");
+                AliroDiagnosticLog.e(TAG, "AUTH1: encryption failed");
                 zeroSessionKeys();
                 return SW_ERROR;
             }
 
             state = State.AUTH1_DONE;
 
-            // --- Derive and store Kpersistent after successful AUTH1 ---
-            // Per Aliro §8.3.1.13: derive Kpersistent for future FAST AUTH0 transactions.
-            // Key is indexed by sub_group_id (bytes 16-31 of readerIdBytes).
-            try
+            // --- Schedule Kpersistent derivation for AFTER we return ---
+            // Per Aliro §8.3.1.13: derive Kpersistent so that a subsequent
+            // FAST AUTH0 from the same reader sub_group can complete without
+            // an AUTH1 round-trip. Critically, this work is for the NEXT
+            // transaction, not the current one, so it does not need to be
+            // on the AUTH1 critical path.
+            //
+            // Running it inline previously added ~600-900ms to the AUTH1
+            // response time, pushing past Android HCE's ~1s timeout and
+            // causing the link to be torn down before we could return. We
+            // now post it to a background thread that fires immediately
+            // after this method returns the response bytes to the framework.
+            //
+            // Captured locals must be effectively final — we snapshot the
+            // primitives/references here. AliroCryptoProvider.deriveKpersistent
+            // is stateless and SharedPreferences.edit().apply() is documented
+            // safe from any thread.
+            final java.security.PrivateKey kpUdEphPriv = udEphKP.getPrivate();
+            final byte[] kpReaderEphPub   = readerEphPubBytes;
+            final byte[] kpProtocol       = selectedProtocol;
+            final byte[] kpReaderPubX     = hkdfReaderPubKeyX;
+            final byte[] kpReaderId       = readerIdBytes;
+            final byte[] kpTid            = transactionId;
+            final byte[] kpReaderEphPubX  = readerEphPubX;
+            final byte[] kpUdEphPubX      = udEphPubX;
+            final byte[] kpVendorCmd      = auth0CmdVendorExt;
+            final byte[] kpVendorRsp      = auth0RspVendorExt;
+            final byte[] kpFlag           = auth0Flag;
+            final Context kpAppContext    = getApplicationContext();
+            new Thread(() ->
             {
-                byte[] credPubBytes = getCredentialPublicKeyBytes();
-                byte[] credPubX = (credPubBytes != null && credPubBytes.length == 65)
-                        ? Arrays.copyOfRange(credPubBytes, 1, 33)
-                        : null;
-
-                if (credPubX != null)
+                try
                 {
+                    byte[] credPubBytes = getCredentialPublicKeyBytes();
+                    byte[] credPubX = (credPubBytes != null && credPubBytes.length == 65)
+                            ? Arrays.copyOfRange(credPubBytes, 1, 33)
+                            : null;
+                    if (credPubX == null)
+                    {
+                        AliroDiagnosticLog.w(TAG, "AUTH1[bg]: credential public key not available — Kpersistent not stored");
+                        return;
+                    }
                     byte[] kpersistent = AliroCryptoProvider.deriveKpersistent(
-                            udEphKP.getPrivate(),
-                            readerEphPubBytes,
-                            selectedProtocol,
-                            hkdfReaderPubKeyX,
-                            readerIdBytes,
-                            transactionId,
-                            readerEphPubX,
-                            udEphPubX,
+                            kpUdEphPriv,
+                            kpReaderEphPub,
+                            kpProtocol,
+                            kpReaderPubX,
+                            kpReaderId,
+                            kpTid,
+                            kpReaderEphPubX,
+                            kpUdEphPubX,
                             credPubX,
-                            PROPRIETARY_TLV, // full A5 TLV including DO'7F66' — matches harness HKDF
-                            auth0CmdVendorExt,
-                            auth0RspVendorExt,
+                            PROPRIETARY_TLV,
+                            kpVendorCmd,
+                            kpVendorRsp,
                             AliroCryptoProvider.INTERFACE_BYTE_NFC,
-                            auth0Flag);
-
-                    if (kpersistent != null)
+                            kpFlag);
+                    if (kpersistent == null)
                     {
-                        // sub_group_id = bytes 16-31 of readerIdBytes
-                        byte[] subGroupId = Arrays.copyOfRange(readerIdBytes, 16, 32);
-                        String kpKey = "kpersistent_" + Hex.toHexString(subGroupId);
-                        SharedPreferences kpPrefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
-                        kpPrefs.edit()
-                               .putString(kpKey, Hex.toHexString(kpersistent))
-                               .apply();
-                        Log.d(TAG, "AUTH1: Kpersistent stored for sub_group_id=" + Hex.toHexString(subGroupId));
+                        AliroDiagnosticLog.w(TAG, "AUTH1[bg]: deriveKpersistent returned null — not stored");
+                        return;
                     }
-                    else
-                    {
-                        Log.w(TAG, "AUTH1: deriveKpersistent returned null — not stored");
-                    }
+                    byte[] subGroupId = Arrays.copyOfRange(kpReaderId, 16, 32);
+                    String kpKey = "kpersistent_" + Hex.toHexString(subGroupId);
+                    kpAppContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                            .edit()
+                            .putString(kpKey, Hex.toHexString(kpersistent))
+                            .apply();
+                    AliroDiagnosticLog.d(TAG, "AUTH1[bg]: Kpersistent stored for sub_group_id="
+                            + Hex.toHexString(subGroupId));
                 }
-                else
+                catch (Exception kpEx)
                 {
-                    Log.w(TAG, "AUTH1: credential public key not available — Kpersistent not stored");
+                    AliroDiagnosticLog.w(TAG, "AUTH1[bg]: Kpersistent derivation/storage failed", kpEx);
                 }
-            }
-            catch (Exception kpEx)
-            {
-                Log.w(TAG, "AUTH1: Kpersistent derivation/storage failed", kpEx);
-            }
+            }, "AliroAuth1KpDerive").start();
 
             // Response: <encrypted> SW9000
             byte[] response = new byte[encrypted.length + 2];
             System.arraycopy(encrypted, 0, response, 0, encrypted.length);
             response[encrypted.length]     = (byte)0x90;
             response[encrypted.length + 1] = 0x00;
-            Log.d(TAG, "AUTH1 response length: " + response.length
+            long tAuth1End = android.os.SystemClock.elapsedRealtime();
+            AliroDiagnosticLog.d(TAG, "AUTH1 response length: " + response.length
                     + " (signaling_bitmap=0x" + String.format("%04X", signalingBits)
-                    + ", keySlot=" + useKeySlot + ")");
+                    + ", keySlot=" + useKeySlot
+                    + ", TOTAL_AUTH1=" + (tAuth1End - tAuth1Start) + "ms)");
             return response;
         }
         catch (Exception e)
         {
-            Log.e(TAG, "AUTH1 error", e);
+            AliroDiagnosticLog.e(TAG, "AUTH1 error", e);
             zeroSessionKeys();
             return SW_ERROR;
         }
@@ -1460,7 +1747,7 @@ public class Aliro_HostApduService extends HostApduService
         }
         catch (Exception e)
         {
-            Log.e(TAG, "computeKeySlot failed", e);
+            AliroDiagnosticLog.e(TAG, "computeKeySlot failed", e);
             // Fallback: return first 8 bytes of public key X coordinate
             return Arrays.copyOfRange(uncompressedPubKey, 1, 9);
         }
@@ -1485,7 +1772,7 @@ public class Aliro_HostApduService extends HostApduService
                         readerStaticPubKey = new byte[65];
                         readerStaticPubKey[0] = 0x04;
                         System.arraycopy(cert, i + 4, readerStaticPubKey, 1, 64);
-                        Log.d(TAG, "parseReaderCertForPubKey: reader static pub key X = " +
+                        AliroDiagnosticLog.d(TAG, "parseReaderCertForPubKey: reader static pub key X = " +
                                 Hex.toHexString(readerStaticPubKeyX));
                     }
                     break;
@@ -1494,7 +1781,7 @@ public class Aliro_HostApduService extends HostApduService
         }
         catch (Exception e)
         {
-            Log.w(TAG, "parseReaderCertForPubKey error: " + e.getMessage());
+            AliroDiagnosticLog.w(TAG, "parseReaderCertForPubKey error: " + e.getMessage());
         }
     }
 
@@ -1509,7 +1796,7 @@ public class Aliro_HostApduService extends HostApduService
         // Accept from AUTH1_DONE or EXCHANGE_DONE.
         if (state != State.AUTH1_DONE && state != State.EXCHANGE_DONE)
         {
-            Log.w(TAG, "EXCHANGE in wrong state: " + state);
+            AliroDiagnosticLog.w(TAG, "EXCHANGE in wrong state: " + state);
             return SW_CONDITIONS;
         }
 
@@ -1546,11 +1833,11 @@ public class Aliro_HostApduService extends HostApduService
 
             if (decrypted == null)
             {
-                Log.e(TAG, "EXCHANGE: decryption failed (readerCounter was " + (readerCounter - 1) + ")");
+                AliroDiagnosticLog.e(TAG, "EXCHANGE: decryption failed (readerCounter was " + (readerCounter - 1) + ")");
                 zeroSessionKeys();
                 return SW_ERROR;
             }
-            Log.d(TAG, "EXCHANGE decrypted: " + Hex.toHexString(decrypted));
+            AliroDiagnosticLog.d(TAG, "EXCHANGE decrypted: " + Hex.toHexString(decrypted));
 
             // Parse tag 97 (reader status): 97 02 <success> <state>
             // Per §8.3.3.5, on NFC the EXCHANGE command "is used by the reader
@@ -1569,14 +1856,34 @@ public class Aliro_HostApduService extends HostApduService
                     readerState   = decrypted[i + 3] & 0xFF;
                     accessGranted = (readerStatus == 0x01);
                     exchangeWasTerminal = true;
-                    Log.d(TAG, "Reader status: success=" + String.format("%02X", readerStatus)
+                    AliroDiagnosticLog.d(TAG, "Reader status: success=" + String.format("%02X", readerStatus)
                             + " state=" + String.format("%02X", readerState)
                             + " granted=" + accessGranted);
                     break;
                 }
             }
 
-            Log.d(TAG, "Aliro transaction complete, access granted: " + accessGranted);
+            AliroDiagnosticLog.d(TAG, "Aliro transaction complete, access granted: " + accessGranted);
+
+            // Trigger user-facing feedback (tone pair + heads-up notification
+            // with full-screen intent). Only fire when the EXCHANGE actually
+            // carried a 0x97 reader status TLV — otherwise this EXCHANGE was
+            // a non-terminal mailbox / data operation and the transaction is
+            // not yet "done" from the user's perspective.
+            if (exchangeWasTerminal)
+            {
+                try
+                {
+                    AliroTransactionFeedback.notifyTransactionComplete(
+                            getApplicationContext(), accessGranted, readerState);
+                }
+                catch (Throwable feedbackEx)
+                {
+                    // Feedback is best-effort — a failure here must never
+                    // poison the spec-mandated APDU response path.
+                    AliroDiagnosticLog.w(TAG, "transaction feedback failed", feedbackEx);
+                }
+            }
 
             // ----------------------------------------------------------------
             // Process mailbox operations from the decrypted EXCHANGE payload
@@ -1589,7 +1896,7 @@ public class Aliro_HostApduService extends HostApduService
             // payload contains mailbox operations (tag 0xBA) with wrong lengths.
             if (hasMailboxValidationError(decrypted))
             {
-                Log.w(TAG, "EXCHANGE: malformed mailbox TLV — returning error");
+                AliroDiagnosticLog.w(TAG, "EXCHANGE: malformed mailbox TLV — returning error");
                 state = State.EXCHANGE_DONE;
                 byte[] errPlaintext = new byte[]{ 0x00, 0x02, 0x01, 0x06 }; // error: invalid data format
                 byte[] errEnc = inStepUpPhase
@@ -1613,14 +1920,22 @@ public class Aliro_HostApduService extends HostApduService
 
             byte[] mailboxReadData = processMailboxTags(decrypted);
 
-            // Broadcast result to the UI
-            Intent intent = new Intent("com.psia.pkoc.ALIRO_CREDENTIAL_SENT");
-            intent.setPackage(getPackageName());
-            intent.putExtra("accessGranted", accessGranted);
-            intent.putExtra("readerStatus",  readerStatus);
-            intent.putExtra("readerState",   readerState);
-            sendBroadcast(intent);
-
+            // Broadcast result to the UI — but ONLY when this EXCHANGE actually
+            // carried a reader status (tag 0x97). Per Aliro §8.3.3.5 a reader is
+            // permitted to send mailbox-only EXCHANGEs (no 0x97 tag) before the
+            // step-up phase; those are not access decisions and broadcasting
+            // them as accessGranted=false (the default when no 0x97 is found)
+            // causes a spurious "Access Denied" UI flash before the real
+            // closing EXCHANGE arrives ~2 seconds later.
+            if (exchangeWasTerminal)
+            {
+                Intent intent = new Intent("com.psia.pkoc.ALIRO_CREDENTIAL_SENT");
+                intent.setPackage(getPackageName());
+                intent.putExtra("accessGranted", accessGranted);
+                intent.putExtra("readerStatus",  readerStatus);
+                intent.putExtra("readerState",   readerState);
+                sendBroadcast(intent);
+            }
             state = State.EXCHANGE_DONE;
 
             // Per §8.3.3.5.5: if a mailbox operation failed (out of bounds),
@@ -1628,7 +1943,7 @@ public class Aliro_HostApduService extends HostApduService
             byte[] plaintext;
             if (mailboxError)
             {
-                Log.w(TAG, "EXCHANGE: mailbox error — returning error status");
+                AliroDiagnosticLog.w(TAG, "EXCHANGE: mailbox error — returning error status");
                 plaintext = new byte[]{ 0x00, 0x02, 0x01, 0x00 }; // error: implementation-specific
             }
             else
@@ -1649,7 +1964,7 @@ public class Aliro_HostApduService extends HostApduService
                     : AliroCryptoProvider.encryptDeviceGcm(skDevice, plaintext, deviceCounter++);
             if (encryptedResponse == null)
             {
-                Log.e(TAG, "EXCHANGE: response encryption failed (deviceCounter was " + (deviceCounter - 1) + ")");
+                AliroDiagnosticLog.e(TAG, "EXCHANGE: response encryption failed (deviceCounter was " + (deviceCounter - 1) + ")");
                 zeroSessionKeys();
                 return SW_ERROR;
             }
@@ -1674,13 +1989,13 @@ public class Aliro_HostApduService extends HostApduService
             if (exchangeWasTerminal)
             {
                 terminalExchangeReceived = true;
-                Log.d(TAG, "EXCHANGE: terminal flag set — subsequent EXCHANGEs will fail per §8.3.3.5");
+                AliroDiagnosticLog.d(TAG, "EXCHANGE: terminal flag set — subsequent EXCHANGEs will fail per §8.3.3.5");
             }
             return response;
         }
         catch (Exception e)
         {
-            Log.e(TAG, "EXCHANGE error", e);
+            AliroDiagnosticLog.e(TAG, "EXCHANGE error", e);
             zeroSessionKeys();
             return SW_ERROR;
         }
@@ -1815,7 +2130,7 @@ public class Aliro_HostApduService extends HostApduService
                     // Per Table 8-15, 0xBA wraps the mailbox operation TLVs.
                     // Skip the BA + length header; the inner tags (0x8C, 0x87,
                     // 0x8A, 0x95) will be processed by subsequent loop iterations.
-                    Log.d(TAG, "Mailbox: entering BA container (" + len + " bytes)");
+                    AliroDiagnosticLog.d(TAG, "Mailbox: entering BA container (" + len + " bytes)");
                     i = valOff; // enter the container — do NOT skip past it
                     continue;   // re-enter the while loop at the first inner tag
 
@@ -1829,7 +2144,7 @@ public class Aliro_HostApduService extends HostApduService
                             mailboxPendingWrites = (mailbox != null)
                                     ? Arrays.copyOf(mailbox, mailbox.length)
                                     : new byte[0];
-                            Log.d(TAG, "Mailbox: atomic session START");
+                            AliroDiagnosticLog.d(TAG, "Mailbox: atomic session START");
                         }
                         else if (!start && mailboxAtomicActive)
                         {
@@ -1847,7 +2162,7 @@ public class Aliro_HostApduService extends HostApduService
                             }
                             mailboxAtomicActive  = false;
                             mailboxPendingWrites = null;
-                            Log.d(TAG, "Mailbox: atomic session STOP — committed");
+                            AliroDiagnosticLog.d(TAG, "Mailbox: atomic session STOP — committed");
                         }
                     }
                     break;
@@ -1872,7 +2187,7 @@ public class Aliro_HostApduService extends HostApduService
                             // from offset 0 with a length larger than the mailbox.
                             if (offset > 0 || src.length == 0)
                             {
-                                Log.w(TAG, "Mailbox: read OOB offset=" + offset
+                                AliroDiagnosticLog.w(TAG, "Mailbox: read OOB offset=" + offset
                                         + " len=" + readLen
                                         + " mailboxSize=" + src.length);
                                 mailboxError = true;
@@ -1884,7 +2199,7 @@ public class Aliro_HostApduService extends HostApduService
                                 readOutput.write((actualRead >> 8) & 0xFF);
                                 readOutput.write(actualRead & 0xFF);
                                 readOutput.write(src, 0, actualRead);
-                                Log.d(TAG, "Mailbox: read offset=0"
+                                AliroDiagnosticLog.d(TAG, "Mailbox: read offset=0"
                                         + " requested=" + readLen
                                         + " clamped=" + actualRead
                                         + " mailboxSize=" + src.length);
@@ -1896,7 +2211,7 @@ public class Aliro_HostApduService extends HostApduService
                             readOutput.write((readLen >> 8) & 0xFF);
                             readOutput.write(readLen & 0xFF);
                             readOutput.write(src, offset, readLen);
-                            Log.d(TAG, "Mailbox: read offset=" + offset
+                            AliroDiagnosticLog.d(TAG, "Mailbox: read offset=" + offset
                                     + " len=" + readLen
                                     + " mailboxSize=" + src.length);
                         }
@@ -1915,7 +2230,7 @@ public class Aliro_HostApduService extends HostApduService
                         int needed    = offset + dataLen;
                         if (needed > MAILBOX_MAX_SIZE)
                         {
-                            Log.w(TAG, "Mailbox: write exceeds max size, ignoring");
+                            AliroDiagnosticLog.w(TAG, "Mailbox: write exceeds max size, ignoring");
                             break;
                         }
                         if (needed > target.length)
@@ -1932,7 +2247,7 @@ public class Aliro_HostApduService extends HostApduService
                             mailbox  = target;
                             didWrite = true;
                         }
-                        Log.d(TAG, "Mailbox: write offset=" + offset + " len=" + dataLen);
+                        AliroDiagnosticLog.d(TAG, "Mailbox: write offset=" + offset + " len=" + dataLen);
                     }
                     break;
 
@@ -1950,7 +2265,7 @@ public class Aliro_HostApduService extends HostApduService
                         int needed  = offset + setLen;
                         if (needed > MAILBOX_MAX_SIZE)
                         {
-                            Log.w(TAG, "Mailbox: set exceeds max size, ignoring");
+                            AliroDiagnosticLog.w(TAG, "Mailbox: set exceeds max size, ignoring");
                             break;
                         }
                         if (needed > target.length)
@@ -1967,7 +2282,7 @@ public class Aliro_HostApduService extends HostApduService
                             mailbox  = target;
                             didWrite = true;
                         }
-                        Log.d(TAG, "Mailbox: set offset=" + offset
+                        AliroDiagnosticLog.d(TAG, "Mailbox: set offset=" + offset
                                 + " len=" + setLen
                                 + " value=" + String.format("%02X", value & 0xFF));
                     }
@@ -2003,7 +2318,7 @@ public class Aliro_HostApduService extends HostApduService
         }
         catch (Exception e)
         {
-            Log.e(TAG, "loadMailbox failed", e);
+            AliroDiagnosticLog.e(TAG, "loadMailbox failed", e);
             return new byte[0];
         }
     }
@@ -2016,11 +2331,11 @@ public class Aliro_HostApduService extends HostApduService
             prefs.edit()
                  .putString(PREF_MAILBOX_KEY, Base64.encodeToString(data, Base64.DEFAULT))
                  .apply();
-            Log.d(TAG, "Mailbox: saved " + data.length + " bytes");
+            AliroDiagnosticLog.d(TAG, "Mailbox: saved " + data.length + " bytes");
         }
         catch (Exception e)
         {
-            Log.e(TAG, "saveMailbox failed", e);
+            AliroDiagnosticLog.e(TAG, "saveMailbox failed", e);
         }
     }
 
@@ -2036,12 +2351,12 @@ public class Aliro_HostApduService extends HostApduService
         // EXCHANGE_DONE (normal flow), or in subsequent ENVELOPE chains.
         if (state != State.AUTH1_DONE && state != State.EXCHANGE_DONE && envelopeBuffer == null)
         {
-            Log.w(TAG, "ENVELOPE in wrong state: " + state);
+            AliroDiagnosticLog.w(TAG, "ENVELOPE in wrong state: " + state);
             return SW_CONDITIONS;
         }
         if (stepUpSK == null)
         {
-            Log.e(TAG, "ENVELOPE: stepUpSK not available (AUTH1 not completed)");
+            AliroDiagnosticLog.e(TAG, "ENVELOPE: stepUpSK not available (AUTH1 not completed)");
             return SW_CONDITIONS;
         }
 
@@ -2070,12 +2385,12 @@ public class Aliro_HostApduService extends HostApduService
             if (!last)
             {
                 // More chunks coming — acknowledge with SW 9000, no data
-                Log.d(TAG, "ENVELOPE: received chunk (" + dataLen + " bytes), waiting for more");
+                AliroDiagnosticLog.d(TAG, "ENVELOPE: received chunk (" + dataLen + " bytes), waiting for more");
                 return SW_OK;
             }
 
             // Last chunk received — envelopeBuffer contains the raw SessionData CBOR.
-            Log.d(TAG, "ENVELOPE: complete SessionData (" + envelopeBuffer.length + " bytes)");
+            AliroDiagnosticLog.d(TAG, "ENVELOPE: complete SessionData (" + envelopeBuffer.length + " bytes)");
             byte[] sessionDataIn = envelopeBuffer;
             envelopeBuffer = null;
 
@@ -2096,7 +2411,7 @@ public class Aliro_HostApduService extends HostApduService
                     tlvLen = ((sessionDataIn[2] & 0xFF) << 8) | (sessionDataIn[3] & 0xFF);
                     tlvHeaderLen = 4;
                 }
-                Log.d(TAG, "ENVELOPE: unwrapping tag 0x53 (" + tlvLen + " bytes CBOR inside)");
+                AliroDiagnosticLog.d(TAG, "ENVELOPE: unwrapping tag 0x53 (" + tlvLen + " bytes CBOR inside)");
                 sessionDataIn = Arrays.copyOfRange(sessionDataIn, tlvHeaderLen, tlvHeaderLen + tlvLen);
             }
 
@@ -2111,13 +2426,13 @@ public class Aliro_HostApduService extends HostApduService
                     .deriveStepUpSessionKeys(stepUpSK);
             if (stepUpSessionKeys == null)
             {
-                Log.e(TAG, "ENVELOPE: step-up session key derivation failed");
+                AliroDiagnosticLog.e(TAG, "ENVELOPE: step-up session key derivation failed");
                 return SW_ERROR;
             }
             byte[] suSKDevice = Arrays.copyOfRange(stepUpSessionKeys, 0,  32); // credential encrypts response
             byte[] suSKReader = Arrays.copyOfRange(stepUpSessionKeys, 32, 64); // credential decrypts request
-            Log.d(TAG, "ENVELOPE: suSKDevice=" + Hex.toHexString(suSKDevice));
-            Log.d(TAG, "ENVELOPE: suSKReader=" + Hex.toHexString(suSKReader));
+            AliroDiagnosticLog.d(TAG, "ENVELOPE: suSKDevice=" + Hex.toHexString(suSKDevice));
+            AliroDiagnosticLog.d(TAG, "ENVELOPE: suSKReader=" + Hex.toHexString(suSKReader));
 
             try
             {
@@ -2127,7 +2442,7 @@ public class Aliro_HostApduService extends HostApduService
                 CBORObject dataIn = sdIn.get(CBORObject.FromObject("data"));
                 if (dataIn == null)
                 {
-                    Log.e(TAG, "ENVELOPE: SessionData missing 'data' field — failure process");
+                    AliroDiagnosticLog.e(TAG, "ENVELOPE: SessionData missing 'data' field — failure process");
                     zeroSessionKeys();
                     return SW_ERROR;
                 }
@@ -2137,18 +2452,18 @@ public class Aliro_HostApduService extends HostApduService
                         .decryptReaderGcm(suSKReader, encryptedRequest);
                 if (deviceRequest == null)
                 {
-                    Log.e(TAG, "ENVELOPE: DeviceRequest AES-GCM authentication failed — failure process");
+                    AliroDiagnosticLog.e(TAG, "ENVELOPE: DeviceRequest AES-GCM authentication failed — failure process");
                     zeroSessionKeys();
                     return SW_ERROR;
                 }
-                Log.d(TAG, "ENVELOPE: DeviceRequest (" + deviceRequest.length + " bytes)");
-                Log.d(TAG, "ENVELOPE: DeviceRequest HEX: " + Hex.toHexString(deviceRequest));
+                AliroDiagnosticLog.d(TAG, "ENVELOPE: DeviceRequest (" + deviceRequest.length + " bytes)");
+                AliroDiagnosticLog.d(TAG, "ENVELOPE: DeviceRequest HEX: " + Hex.toHexString(deviceRequest));
 
                 // Step 3: Build DeviceResponse from stored documents, per requested docTypes
                 byte[] deviceResponse = buildDeviceResponse(deviceRequest);
                 if (deviceResponse == null)
                 {
-                    Log.e(TAG, "ENVELOPE: failed to build DeviceResponse — failure process");
+                    AliroDiagnosticLog.e(TAG, "ENVELOPE: failed to build DeviceResponse — failure process");
                     zeroSessionKeys();
                     return SW_ERROR;
                 }
@@ -2159,7 +2474,7 @@ public class Aliro_HostApduService extends HostApduService
                         .encryptDeviceGcm(suSKDevice, deviceResponse);
                 if (encryptedResponse == null)
                 {
-                    Log.e(TAG, "ENVELOPE: DeviceResponse encryption failed — failure process");
+                    AliroDiagnosticLog.e(TAG, "ENVELOPE: DeviceResponse encryption failed — failure process");
                     zeroSessionKeys();
                     return SW_ERROR;
                 }
@@ -2167,8 +2482,8 @@ public class Aliro_HostApduService extends HostApduService
                 sdOut.Add(CBORObject.FromObject("data"),
                         CBORObject.FromObject(encryptedResponse));
                 byte[] sessionDataOut = sdOut.EncodeToBytes();
-                Log.d(TAG, "ENVELOPE: SessionData CBOR (" + sessionDataOut.length + " bytes)");
-                Log.d(TAG, "ENVELOPE: SessionData HEX: " + Hex.toHexString(sessionDataOut));
+                AliroDiagnosticLog.d(TAG, "ENVELOPE: SessionData CBOR (" + sessionDataOut.length + " bytes)");
+                AliroDiagnosticLog.d(TAG, "ENVELOPE: SessionData HEX: " + Hex.toHexString(sessionDataOut));
 
                 // Step 5: Wrap in BER-TLV tag 0x53 per ISO 18013-5 §11.7.1
                 byte[] wrapped;
@@ -2196,7 +2511,7 @@ public class Aliro_HostApduService extends HostApduService
                     wrapped[3] = (byte) (sessionDataOut.length & 0xFF);
                     System.arraycopy(sessionDataOut, 0, wrapped, 4, sessionDataOut.length);
                 }
-                Log.d(TAG, "ENVELOPE: response wrapped in tag 0x53 (" + wrapped.length + " bytes total)");
+                AliroDiagnosticLog.d(TAG, "ENVELOPE: response wrapped in tag 0x53 (" + wrapped.length + " bytes total)");
 
                 // Step 6b: Save step-up session keys for subsequent EXCHANGE commands.
                 // Per Aliro §8.3.3.5: "The EXCHANGE command uses ... StepUpSKDevice
@@ -2209,7 +2524,7 @@ public class Aliro_HostApduService extends HostApduService
                 // ENVELOPE uses counter 1 for both directions, so EXCHANGE starts at 2.
                 stepUpReaderCounter = 2;
                 stepUpDeviceCounter = 2;
-                Log.d(TAG, "ENVELOPE: step-up phase keys saved for subsequent EXCHANGE");
+                AliroDiagnosticLog.d(TAG, "ENVELOPE: step-up phase keys saved for subsequent EXCHANGE");
 
                 // Step 7: Prepare chunked GET RESPONSE
                 pendingGetResponse    = wrapped;
@@ -2225,7 +2540,7 @@ public class Aliro_HostApduService extends HostApduService
         }
         catch (Exception e)
         {
-            Log.e(TAG, "ENVELOPE error — failure process", e);
+            AliroDiagnosticLog.e(TAG, "ENVELOPE error — failure process", e);
             envelopeBuffer = null;
             zeroSessionKeys();
             return SW_ERROR;
@@ -2240,7 +2555,7 @@ public class Aliro_HostApduService extends HostApduService
     {
         if (pendingGetResponse == null || pendingGetResponseOff >= pendingGetResponse.length)
         {
-            Log.w(TAG, "GET RESPONSE: no pending data");
+            AliroDiagnosticLog.w(TAG, "GET RESPONSE: no pending data");
             return SW_ERROR;
         }
         return nextGetResponseChunk();
@@ -2266,7 +2581,7 @@ public class Aliro_HostApduService extends HostApduService
             // SW 61 xx: more data available
             chunk[chunkLen]     = 0x61;
             chunk[chunkLen + 1] = (byte) Math.min(leftAfter, 0xFF);
-            Log.d(TAG, "GET RESPONSE: sent " + chunkLen + " bytes, " + leftAfter + " remaining");
+            AliroDiagnosticLog.d(TAG, "GET RESPONSE: sent " + chunkLen + " bytes, " + leftAfter + " remaining");
         }
         else
         {
@@ -2275,7 +2590,7 @@ public class Aliro_HostApduService extends HostApduService
             chunk[chunkLen + 1] = 0x00;
             pendingGetResponse    = null;
             pendingGetResponseOff = 0;
-            Log.d(TAG, "GET RESPONSE: sent final " + chunkLen + " bytes");
+            AliroDiagnosticLog.d(TAG, "GET RESPONSE: sent final " + chunkLen + " bytes");
         }
         return chunk;
     }
@@ -2327,7 +2642,7 @@ public class Aliro_HostApduService extends HostApduService
         // "pool_door"); the reader picks which one(s) it wants via DeviceRequest.
         java.util.List<AliroAccessDocument.StoredDocument> storedDocs =
                 AliroAccessDocument.getAllDocuments(this);
-        Log.d(TAG, "buildDeviceResponse: stored docs=" + storedDocs.size());
+        AliroDiagnosticLog.d(TAG, "buildDeviceResponse: stored docs=" + storedDocs.size());
 
         try
         {
@@ -2398,7 +2713,7 @@ public class Aliro_HostApduService extends HostApduService
                         }
                         if (docType == null) continue;
 
-                        Log.d(TAG, "buildDeviceResponse: reader requests docType=" + docType);
+                        AliroDiagnosticLog.d(TAG, "buildDeviceResponse: reader requests docType=" + docType);
 
                         // Pull namespaces (key "1" inside itemsRequest): map
                         //   { "<namespace>": { "<elementId>": <bool>, ... }, ... }
@@ -2436,7 +2751,7 @@ public class Aliro_HostApduService extends HostApduService
                                             elementList.add(elemId);
                                         }
                                         foundElements = true;
-                                        Log.d(TAG, "buildDeviceResponse:   namespace=" + ns
+                                        AliroDiagnosticLog.d(TAG, "buildDeviceResponse:   namespace=" + ns
                                                 + " element=" + elemId);
                                     }
                                     catch (Exception ignored) {}
@@ -2449,7 +2764,7 @@ public class Aliro_HostApduService extends HostApduService
                             // Reader requested a docType but didn't enumerate elements
                             // (or we couldn't parse them). Treat as "any element".
                             docTypesAnyElement.add(docType);
-                            Log.d(TAG, "buildDeviceResponse:   docType=" + docType
+                            AliroDiagnosticLog.d(TAG, "buildDeviceResponse:   docType=" + docType
                                     + " requested with no specific elements");
                         }
                     }
@@ -2458,7 +2773,7 @@ public class Aliro_HostApduService extends HostApduService
             }
             catch (Exception parseEx)
             {
-                Log.w(TAG, "buildDeviceResponse: could not parse DeviceRequest", parseEx);
+                AliroDiagnosticLog.w(TAG, "buildDeviceResponse: could not parse DeviceRequest", parseEx);
             }
 
             // ---- Fallback: parse failed or no docTypes found ----
@@ -2468,11 +2783,11 @@ public class Aliro_HostApduService extends HostApduService
                 if (!storedDocs.isEmpty())
                 {
                     byte[] firstAccess = storedDocs.get(0).accessDocBytes;
-                    Log.d(TAG, "buildDeviceResponse: fallback — returning first stored Access Document ("
+                    AliroDiagnosticLog.d(TAG, "buildDeviceResponse: fallback — returning first stored Access Document ("
                             + firstAccess.length + " bytes)");
                     return firstAccess;
                 }
-                Log.d(TAG, "buildDeviceResponse: no document provisioned — returning empty DeviceResponse");
+                AliroDiagnosticLog.d(TAG, "buildDeviceResponse: no document provisioned — returning empty DeviceResponse");
                 return EMPTY_RESPONSE;
             }
 
@@ -2497,7 +2812,7 @@ public class Aliro_HostApduService extends HostApduService
                     // Validity is not current. Drop expired or not-yet-valid docs.
                     if (!AliroAccessDocument.isValidityCurrent(sd.accessDocBytes))
                     {
-                        Log.d(TAG, "buildDeviceResponse: skipping elementId=" + sd.elementId
+                        AliroDiagnosticLog.d(TAG, "buildDeviceResponse: skipping elementId=" + sd.elementId
                                 + " — IssuerAuth Validity not current");
                         continue;
                     }
@@ -2505,7 +2820,7 @@ public class Aliro_HostApduService extends HostApduService
                     if (inner != null)
                     {
                         matchedDocs.add(inner);
-                        Log.d(TAG, "buildDeviceResponse: matched Access Document elementId="
+                        AliroDiagnosticLog.d(TAG, "buildDeviceResponse: matched Access Document elementId="
                                 + sd.elementId + " (any-element mode)");
                     }
                 }
@@ -2526,13 +2841,13 @@ public class Aliro_HostApduService extends HostApduService
                     }
                     if (matchSd == null)
                     {
-                        Log.d(TAG, "buildDeviceResponse: requested elementId="
+                        AliroDiagnosticLog.d(TAG, "buildDeviceResponse: requested elementId="
                                 + requestedElemId + " not present — skipping");
                         continue;
                     }
                     if (!AliroAccessDocument.isValidityCurrent(matchSd.accessDocBytes))
                     {
-                        Log.d(TAG, "buildDeviceResponse: skipping elementId=" + matchSd.elementId
+                        AliroDiagnosticLog.d(TAG, "buildDeviceResponse: skipping elementId=" + matchSd.elementId
                                 + " — IssuerAuth Validity not current");
                         continue;
                     }
@@ -2540,7 +2855,7 @@ public class Aliro_HostApduService extends HostApduService
                     if (inner != null)
                     {
                         matchedDocs.add(inner);
-                        Log.d(TAG, "buildDeviceResponse: matched Access Document elementId="
+                        AliroDiagnosticLog.d(TAG, "buildDeviceResponse: matched Access Document elementId="
                                 + matchSd.elementId + " (request-order position "
                                 + (matchedDocs.size() - 1) + ")");
                     }
@@ -2559,7 +2874,7 @@ public class Aliro_HostApduService extends HostApduService
                     if (sd.revocationDocBytes == null) continue;
                     if (!AliroAccessDocument.isValidityCurrent(sd.revocationDocBytes))
                     {
-                        Log.d(TAG, "buildDeviceResponse: skipping revoc elementId="
+                        AliroDiagnosticLog.d(TAG, "buildDeviceResponse: skipping revoc elementId="
                                 + sd.elementId + " — IssuerAuth Validity not current");
                         continue;
                     }
@@ -2567,7 +2882,7 @@ public class Aliro_HostApduService extends HostApduService
                     if (inner != null)
                     {
                         matchedDocs.add(inner);
-                        Log.d(TAG, "buildDeviceResponse: matched Revocation Document elementId="
+                        AliroDiagnosticLog.d(TAG, "buildDeviceResponse: matched Revocation Document elementId="
                                 + sd.elementId + " (any-element mode)");
                     }
                 }
@@ -2588,13 +2903,13 @@ public class Aliro_HostApduService extends HostApduService
                     }
                     if (matchSd == null)
                     {
-                        Log.d(TAG, "buildDeviceResponse: requested revoc elementId="
+                        AliroDiagnosticLog.d(TAG, "buildDeviceResponse: requested revoc elementId="
                                 + requestedElemId + " not present — skipping");
                         continue;
                     }
                     if (!AliroAccessDocument.isValidityCurrent(matchSd.revocationDocBytes))
                     {
-                        Log.d(TAG, "buildDeviceResponse: skipping revoc elementId="
+                        AliroDiagnosticLog.d(TAG, "buildDeviceResponse: skipping revoc elementId="
                                 + matchSd.elementId + " — IssuerAuth Validity not current");
                         continue;
                     }
@@ -2602,7 +2917,7 @@ public class Aliro_HostApduService extends HostApduService
                     if (inner != null)
                     {
                         matchedDocs.add(inner);
-                        Log.d(TAG, "buildDeviceResponse: matched Revocation Document elementId="
+                        AliroDiagnosticLog.d(TAG, "buildDeviceResponse: matched Revocation Document elementId="
                                 + matchSd.elementId + " (request-order position "
                                 + (matchedDocs.size() - 1) + ")");
                     }
@@ -2611,7 +2926,7 @@ public class Aliro_HostApduService extends HostApduService
 
             if (matchedDocs.isEmpty())
             {
-                Log.d(TAG, "buildDeviceResponse: no matching documents — returning empty DeviceResponse");
+                AliroDiagnosticLog.d(TAG, "buildDeviceResponse: no matching documents — returning empty DeviceResponse");
                 return EMPTY_RESPONSE;
             }
 
@@ -2624,14 +2939,14 @@ public class Aliro_HostApduService extends HostApduService
             newResponse.Add(CBORObject.FromObject("3"), CBORObject.FromObject(0));
 
             byte[] responseBytes = newResponse.EncodeToBytes();
-            Log.d(TAG, "buildDeviceResponse: built DeviceResponse with " + matchedDocs.size()
+            AliroDiagnosticLog.d(TAG, "buildDeviceResponse: built DeviceResponse with " + matchedDocs.size()
                     + " document(s) (" + responseBytes.length + " bytes)");
-            Log.d(TAG, "buildDeviceResponse HEX: " + Hex.toHexString(responseBytes));
+            AliroDiagnosticLog.d(TAG, "buildDeviceResponse HEX: " + Hex.toHexString(responseBytes));
             return responseBytes;
         }
         catch (Exception e)
         {
-            Log.e(TAG, "buildDeviceResponse failed", e);
+            AliroDiagnosticLog.e(TAG, "buildDeviceResponse failed", e);
             // Last-resort fallback: return first stored access doc if available
             if (!storedDocs.isEmpty()) return storedDocs.get(0).accessDocBytes;
             return EMPTY_RESPONSE;
@@ -2655,7 +2970,7 @@ public class Aliro_HostApduService extends HostApduService
         }
         catch (Exception ex)
         {
-            Log.w(TAG, "extractInnerDocument failed", ex);
+            AliroDiagnosticLog.w(TAG, "extractInnerDocument failed", ex);
         }
         return null;
     }
@@ -2682,7 +2997,7 @@ public class Aliro_HostApduService extends HostApduService
     private byte[] handleControlFlow(byte[] apdu)
     {
         // Per section 10.2.2.2: respond with empty data field
-        Log.d(TAG, "CONTROL FLOW received — reader signaling failure, resetting state");
+        AliroDiagnosticLog.d(TAG, "CONTROL FLOW received — reader signaling failure, resetting state");
         resetState();
         return SW_OK;
     }
@@ -2703,7 +3018,7 @@ public class Aliro_HostApduService extends HostApduService
             ks.load(null);
             if (!ks.containsAlias(ALIRO_KEYSTORE_ALIAS))
             {
-                Log.i(TAG, "Generating NEW Aliro credential keypair");
+                AliroDiagnosticLog.i(TAG, "Generating NEW Aliro credential keypair");
                 android.security.keystore.KeyGenParameterSpec spec =
                         new android.security.keystore.KeyGenParameterSpec.Builder(
                                 ALIRO_KEYSTORE_ALIAS,
@@ -2734,13 +3049,13 @@ public class Aliro_HostApduService extends HostApduService
                 uncompressed[0] = 0x04;
                 System.arraycopy(x, 0, uncompressed, 1, 32);
                 System.arraycopy(y, 0, uncompressed, 33, 32);
-                Log.i(TAG, "=== ALIRO CREDENTIAL PUBLIC KEY (for test harness th_access_credential_public_key) ===");
-                Log.i(TAG, "=== " + Hex.toHexString(uncompressed) + " ===");
+                AliroDiagnosticLog.i(TAG, "=== ALIRO CREDENTIAL PUBLIC KEY (for test harness th_access_credential_public_key) ===");
+                AliroDiagnosticLog.i(TAG, "=== " + Hex.toHexString(uncompressed) + " ===");
             }
         }
         catch (Exception e)
         {
-            Log.e(TAG, "ensureAliroKeypairExists failed", e);
+            AliroDiagnosticLog.e(TAG, "ensureAliroKeypairExists failed", e);
         }
     }
 
@@ -2758,7 +3073,7 @@ public class Aliro_HostApduService extends HostApduService
         }
         catch (Exception e)
         {
-            Log.e(TAG, "getCredentialPrivateKey failed", e);
+            AliroDiagnosticLog.e(TAG, "getCredentialPrivateKey failed", e);
         }
         return null;
     }
@@ -2782,7 +3097,7 @@ public class Aliro_HostApduService extends HostApduService
         }
         catch (Exception e)
         {
-            Log.e(TAG, "getCredentialPublicKeyBytes failed", e);
+            AliroDiagnosticLog.e(TAG, "getCredentialPublicKeyBytes failed", e);
         }
         return null;
     }
@@ -2865,7 +3180,7 @@ public class Aliro_HostApduService extends HostApduService
      */
     private byte[] enterFailureProcess(String reason)
     {
-        Log.w(TAG, "Failure process (§8.3.3.1): " + reason);
+        AliroDiagnosticLog.w(TAG, "Failure process (§8.3.3.1): " + reason);
         // §8.3.3.1 step 3: destroy session-bound keys.
         zeroSessionKeys();
         if (stepUpSK != null) { Arrays.fill(stepUpSK, (byte)0); stepUpSK = null; }

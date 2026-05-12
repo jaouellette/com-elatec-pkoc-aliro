@@ -64,6 +64,9 @@ public class CredentialAliroConfigFragment extends Fragment
     private CheckBox    chkStrictMode;
     private Button      btnExportReaderConfig;
     private Button      btnClearProvisioning;
+    private Button      btnImportProvisioning;
+    private Button      btnViewDiagnosticLog;
+    private androidx.appcompat.widget.SwitchCompat switchEnrollmentMode;
 
     // Test Harness section views
     private EditText    editTestHarnessGroupId;
@@ -154,6 +157,9 @@ public class CredentialAliroConfigFragment extends Fragment
         chkStrictMode         = view.findViewById(R.id.chkStrictMode);
         btnExportReaderConfig = view.findViewById(R.id.btnExportReaderConfig);
         btnClearProvisioning  = view.findViewById(R.id.btnClearProvisioning);
+        btnImportProvisioning = view.findViewById(R.id.btnImportProvisioning);
+        btnViewDiagnosticLog  = view.findViewById(R.id.btnViewDiagnosticLog);
+        switchEnrollmentMode  = view.findViewById(R.id.switchEnrollmentMode);
 
         txtDocumentStatus  = view.findViewById(R.id.txtAccessDocStatus);
         btnGenerateTest    = view.findViewById(R.id.btnGenerateTestDoc);
@@ -235,6 +241,26 @@ public class CredentialAliroConfigFragment extends Fragment
                 AliroProvisioningManager.setStrictMode(requireContext(), checked));
         btnExportReaderConfig.setOnClickListener(v -> exportReaderConfig());
         btnClearProvisioning.setOnClickListener(v -> confirmClearProvisioning());
+        if (btnImportProvisioning != null)
+            btnImportProvisioning.setOnClickListener(v -> showImportProvisioningDialog());
+        if (btnViewDiagnosticLog != null)
+            btnViewDiagnosticLog.setOnClickListener(v ->
+                    startActivity(new android.content.Intent(requireContext(),
+                            com.psia.pkoc.DiagnosticLogActivity.class)));
+
+        // Enrollment mode toggle. Reads current state from
+        // AliroProvisioningManager (the same source the HCE service consults
+        // on every enrollment-AID SELECT) so that the switch reflects what
+        // the credential actually does at the wire level. The listener writes
+        // back through the manager's helper so the change applies immediately
+        // and is logged to the diagnostic log.
+        if (switchEnrollmentMode != null)
+        {
+            switchEnrollmentMode.setChecked(
+                    AliroProvisioningManager.isEnrollmentMode(requireContext()));
+            switchEnrollmentMode.setOnCheckedChangeListener((btn, checked) ->
+                    AliroProvisioningManager.setEnrollmentMode(requireContext(), checked));
+        }
 
         // Test Harness section
         editTestHarnessGroupId      = view.findViewById(R.id.editTestHarnessGroupId);
@@ -401,6 +427,69 @@ public class CredentialAliroConfigFragment extends Fragment
                     AliroProvisioningManager.clearProvisioning(requireContext());
                     refreshProvisioningStatus();
                     showStatus("Provisioning cleared. Credential is in simulator mode.", true);
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    /**
+     * Show a dialog that accepts a reader-supplied provisioning JSON blob.
+     * The reader (e.g. a TWN4 firmware) generates its own keypair locally,
+     * formats a JSON payload, and the engineer pastes it here. The credential
+     * adopts the reader's keypair, reader_id, and (optionally) cert/issuer CA.
+     *
+     * Expected JSON (v=1, type "aliro_reader_provisioning"; the legacy
+     * "aliro_reader_config" type is also accepted for round-trip testing):
+     * {
+     *   "v": 1,
+     *   "type": "aliro_reader_provisioning",
+     *   "readerPrivateKey": "&lt;64 hex&gt;",
+     *   "readerId":         "&lt;64 hex&gt;",
+     *   "issuerPubKey":     "&lt;130 hex, 04|X|Y&gt;",
+     *   "readerCert":       "&lt;hex, optional&gt;",
+     *   "readerGroupId":    "&lt;32 hex, optional — derived if absent&gt;"
+     * }
+     */
+    private void showImportProvisioningDialog()
+    {
+        final EditText input = new EditText(requireContext());
+        input.setHint("Paste reader provisioning JSON");
+        input.setSingleLine(false);
+        input.setMinLines(4);
+        input.setMaxLines(10);
+        input.setTextSize(11f);
+        input.setTypeface(android.graphics.Typeface.MONOSPACE);
+
+        int pad = (int)(16 * requireContext().getResources().getDisplayMetrics().density);
+        android.widget.FrameLayout wrap = new android.widget.FrameLayout(requireContext());
+        wrap.setPadding(pad, pad / 2, pad, 0);
+        wrap.addView(input);
+
+        new AlertDialog.Builder(requireContext())
+                .setTitle("Import Reader Provisioning")
+                .setMessage("Paste a reader-generated provisioning JSON. The credential "
+                        + "will adopt the reader's keypair so AUTH1 from that reader "
+                        + "verifies against this credential.")
+                .setView(wrap)
+                .setPositiveButton("Import", (d, w) ->
+                {
+                    String json = input.getText().toString().trim();
+                    if (json.isEmpty())
+                    {
+                        showStatus("No JSON provided.", false);
+                        return;
+                    }
+                    String summary = AliroProvisioningManager.importProvisioning(
+                            requireContext(), json);
+                    if (summary == null)
+                    {
+                        showStatus("Import failed. Open the Diagnostic Log for the specific validation error.", false);
+                    }
+                    else
+                    {
+                        refreshProvisioningStatus();
+                        showStatus("\u2713 " + summary, true);
+                    }
                 })
                 .setNegativeButton("Cancel", null)
                 .show();
@@ -1475,5 +1564,55 @@ public class CredentialAliroConfigFragment extends Fragment
         txtStatus.setTextColor(success
                 ? requireContext().getColor(R.color.colorAccent)
                 : requireContext().getColor(android.R.color.holo_red_dark));
+
+        // Also surface as a Toast — the txtStatus TextView lives at the bottom
+        // of the scroll view and may be off-screen depending on which button
+        // the user just tapped, so a Toast provides immediate visual confirmation
+        // regardless of current scroll position.
+        try
+        {
+            // Use the first line of multi-line messages for the Toast so it stays compact.
+            String toastMsg = message;
+            int nl = toastMsg.indexOf('\n');
+            if (nl > 0) toastMsg = toastMsg.substring(0, nl);
+            android.widget.Toast.makeText(requireContext(), toastMsg,
+                    success ? android.widget.Toast.LENGTH_SHORT
+                            : android.widget.Toast.LENGTH_LONG)
+                    .show();
+        }
+        catch (Exception ignored) { /* don't let toast failures break the flow */ }
+
+        // Scroll the status into view so the user can see the full multi-line
+        // detail (which the Toast truncates to one line).
+        try
+        {
+            View root = getView();
+            if (root != null)
+            {
+                final android.widget.ScrollView scroll = findEnclosingScrollView(root);
+                if (scroll != null)
+                {
+                    scroll.post(() -> scroll.smoothScrollTo(0, txtStatus.getTop()));
+                }
+            }
+        }
+        catch (Exception ignored) { /* scrolling is best-effort */ }
+    }
+
+    /** Walk the view tree looking for the enclosing ScrollView, if any. */
+    private static android.widget.ScrollView findEnclosingScrollView(View v)
+    {
+        if (v == null) return null;
+        if (v instanceof android.widget.ScrollView) return (android.widget.ScrollView) v;
+        if (v instanceof android.view.ViewGroup)
+        {
+            android.view.ViewGroup vg = (android.view.ViewGroup) v;
+            for (int i = 0; i < vg.getChildCount(); i++)
+            {
+                android.widget.ScrollView sv = findEnclosingScrollView(vg.getChildAt(i));
+                if (sv != null) return sv;
+            }
+        }
+        return null;
     }
 }

@@ -1,0 +1,52 @@
+// Wear OS HCE Spike — module-level Gradle build file.
+//
+// This is a standalone Wear OS APK. Add it as a new module to the existing
+// Android Studio project (File → New → New Module → Wear OS Module), then
+// replace the auto-generated build.gradle with this one.
+//
+// Or add it manually:
+//   1. Drop the wear/ directory next to your existing app/ module
+//   2. In settings.gradle add:  include ':wear'
+//   3. Sync Gradle, then Run > Run 'wear' on a Pixel Watch ADB target
+
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.psia.pkoc.wearspike'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.psia.pkoc.wearspike"
+        // Wear OS 4 (Pixel Watch 2) ships with Android 13 / API 33.
+        // Wear OS 5 (Pixel Watch 3) ships with API 34.
+        // Wear OS 6 (Pixel Watch 4) ships with API 35.
+        // minSdk 30 covers Wear OS 3+ for broader compatibility.
+        minSdk 30
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+        debug {
+            // Easier to attach adb and inspect logs.
+            debuggable true
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+}
+
+dependencies {
+    // Deliberately minimal. The whole point of a spike is to remove
+    // variables. No AndroidX wear lib, no Compose, no third-party crypto.
+    // If routing works, those come later for the real port.
+}

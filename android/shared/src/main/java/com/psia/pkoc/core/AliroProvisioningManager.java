@@ -79,6 +79,17 @@ public class AliroProvisioningManager
     private static final String KEY_STRICT_MODE     = "strict_mode";
     private static final String KEY_READER_PUB_KEY  = "test_harness_reader_pub_key";
 
+    /**
+     * Boolean — enrollment mode toggle. When true, the credential will
+     * accept reader-provisioning data sent over the special enrollment AID
+     * (A000000909ACCE55FE). When false (the default), the credential rejects
+     * such traffic. The user must explicitly enable enrollment in Settings
+     * before tapping a reader that's emitting its keypair. This prevents a
+     * hostile reader from silently provisioning itself if the user taps it
+     * unintentionally.
+     */
+    public  static final String KEY_ENROLLMENT_MODE = "enrollment_mode";
+
     // BouncyCastle OIDs
     private static final String OID_SECP256R1          = "1.2.840.10045.3.1.7";
     private static final String OID_EC_PUBLIC_KEY      = "1.2.840.10045.2.1";
@@ -132,7 +143,7 @@ public class AliroProvisioningManager
             byte[] readerPubUncomp  = getUncompressedPublicKey(readerKeyPair);
             byte[] readerPrivRaw    = getPrivateKeyRaw(readerKeyPair);
 
-            Log.d(TAG, "Reader pub (= issuer CA pub): " + Hex.toHexString(readerPubUncomp));
+            AliroDiagnosticLog.d(TAG, "Reader pub (= issuer CA pub): " + Hex.toHexString(readerPubUncomp));
 
             // ------------------------------------------------------------------
             // 2. Build reader_group_identifier: first 16 bytes of SHA-256(reader_pub)
@@ -226,7 +237,7 @@ public class AliroProvisioningManager
                     pubKeyField,
                     signatureField);
 
-            Log.d(TAG, "Reader cert (profile0000): " + Hex.toHexString(readerCertBytes));
+            AliroDiagnosticLog.d(TAG, "Reader cert (profile0000): " + Hex.toHexString(readerCertBytes));
 
             // ------------------------------------------------------------------
             // 7. Store everything in SharedPreferences
@@ -253,7 +264,7 @@ public class AliroProvisioningManager
         }
         catch (Exception e)
         {
-            Log.e(TAG, "provisionCredential failed", e);
+            AliroDiagnosticLog.e(TAG, "provisionCredential failed", e);
             return null;
         }
     }
@@ -283,7 +294,7 @@ public class AliroProvisioningManager
         }
         catch (Exception e)
         {
-            Log.e(TAG, "buildExportJson failed", e);
+            AliroDiagnosticLog.e(TAG, "buildExportJson failed", e);
             return null;
         }
     }
@@ -436,6 +447,308 @@ public class AliroProvisioningManager
     }
 
     // =========================================================================
+    // Credential-side import helper — reader-supplied keypair
+    // =========================================================================
+
+    /**
+     * Import a reader-generated keypair into the credential's provisioning
+     * storage. This is the reverse of {@link #buildExportJson(Context)}:
+     * instead of the phone generating keys and handing them to the reader,
+     * the reader generates keys (out of band) and hands them to the phone.
+     *
+     * Use this when an OEM firmware engineer wants to test against a
+     * credential running on this device with the reader's own authentication
+     * key pair, rather than the keypair the credential app would otherwise
+     * generate locally.
+     *
+     * Required JSON fields (v=1, type="aliro_reader_provisioning"):
+     *   readerPrivateKey  — 64-char hex (32-byte raw scalar)
+     *   readerId          — 64-char hex (32 bytes: 16 group_id || 16 sub_group_id)
+     *   issuerPubKey      — 130-char hex (65-byte uncompressed). For a
+     *                       self-signed reader cert this equals the reader pub
+     *                       key. For a CA-signed cert this is the CA's pub key
+     *                       used to verify the reader cert.
+     * Optional:
+     *   readerCert        — hex Profile0000 cert (any length). Empty if none.
+     *   readerGroupId     — 32-char hex (16 bytes). If absent, derived from
+     *                       the first 16 bytes of SHA-256(reader_pub_key).
+     *
+     * The reader_group_identifier is also validated against the readerId's
+     * first 16 bytes (per §6.2 these must agree); a mismatch causes failure.
+     *
+     * After import the credential is marked provisioned. Strict mode is left
+     * as whatever the user had set previously; the caller may toggle it via
+     * {@link #setStrictMode(Context, boolean)}.
+     *
+     * @param context Android context (credential app)
+     * @param json    JSON string (typically from a QR scanned from the reader)
+     * @return Summary string on success, null on validation failure
+     */
+    public static String importProvisioning(Context context, String json)
+    {
+        try
+        {
+            JSONObject obj = new JSONObject(json);
+            int v = obj.optInt("v", 0);
+            String type = obj.optString("type", "");
+            boolean okType = "aliro_reader_provisioning".equals(type)
+                          || "aliro_reader_config".equals(type);
+            if (v != 1 || !okType)
+            {
+                AliroDiagnosticLog.e(TAG, "importProvisioning: invalid JSON type or version (v=" + v
+                        + ", type=" + type + ")");
+                return null;
+            }
+
+            String readerPrivKey = obj.optString("readerPrivateKey", "")
+                    .toLowerCase(Locale.US);
+            String readerId      = obj.optString("readerId", "")
+                    .toLowerCase(Locale.US);
+            String issuerPubKey  = obj.optString("issuerPubKey", "")
+                    .toLowerCase(Locale.US);
+            String readerCert    = obj.optString("readerCert", "")
+                    .toLowerCase(Locale.US);
+            String readerGroupId = obj.optString("readerGroupId", "")
+                    .toLowerCase(Locale.US);
+
+            // ---- Field validation -----------------------------------------
+            if (readerPrivKey.length() != 64 || !readerPrivKey.matches("[0-9a-f]+"))
+            {
+                AliroDiagnosticLog.e(TAG, "importProvisioning: readerPrivateKey must be 64 hex chars");
+                return null;
+            }
+            if (readerId.length() != 64 || !readerId.matches("[0-9a-f]+"))
+            {
+                AliroDiagnosticLog.e(TAG, "importProvisioning: readerId must be 64 hex chars");
+                return null;
+            }
+            if (issuerPubKey.length() != 130 || !issuerPubKey.matches("[0-9a-f]+")
+                    || !issuerPubKey.startsWith("04"))
+            {
+                AliroDiagnosticLog.e(TAG, "importProvisioning: issuerPubKey must be 130 hex chars "
+                        + "starting with 04 (uncompressed EC point)");
+                return null;
+            }
+            if (!readerCert.isEmpty() && !readerCert.matches("[0-9a-f]+"))
+            {
+                AliroDiagnosticLog.e(TAG, "importProvisioning: readerCert is not valid hex");
+                return null;
+            }
+
+            // ---- Derive / validate the reader public key ------------------
+            byte[] privBytes = Hex.decode(readerPrivKey);
+            byte[] readerPubUncomp = computeP256PublicKey(privBytes);
+            if (readerPubUncomp == null)
+            {
+                AliroDiagnosticLog.e(TAG, "importProvisioning: failed to derive public key from private");
+                return null;
+            }
+
+            MessageDigest sha256 = MessageDigest.getInstance("SHA-256");
+            byte[] pubHash = sha256.digest(readerPubUncomp);
+            byte[] derivedGroupId = Arrays.copyOfRange(pubHash, 0, 16);
+            String derivedGroupIdHex = Hex.toHexString(derivedGroupId);
+
+            String readerIdGroupHex = readerId.substring(0, 32);
+            if (!derivedGroupIdHex.equalsIgnoreCase(readerIdGroupHex))
+            {
+                AliroDiagnosticLog.e(TAG, "importProvisioning: readerId group portion ("
+                        + readerIdGroupHex + ") does not match SHA-256(pub)[0..15] ("
+                        + derivedGroupIdHex + "). Check that the private key and "
+                        + "readerId are from the same provisioning.");
+                return null;
+            }
+
+            if (!readerGroupId.isEmpty())
+            {
+                if (readerGroupId.length() != 32
+                        || !readerGroupId.equalsIgnoreCase(derivedGroupIdHex))
+                {
+                    AliroDiagnosticLog.e(TAG, "importProvisioning: supplied readerGroupId does not "
+                            + "match the derived group identifier");
+                    return null;
+                }
+            }
+            else
+            {
+                readerGroupId = derivedGroupIdHex;
+            }
+
+            String readerPubHex = Hex.toHexString(readerPubUncomp);
+            boolean selfSigned = issuerPubKey.equalsIgnoreCase(readerPubHex);
+            String issuerCaPrivKey = selfSigned ? readerPrivKey : "";
+
+            SharedPreferences.Editor editor = context
+                    .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                    .edit();
+            editor.putString(KEY_ISSUER_CA_PRIV,  issuerCaPrivKey);
+            editor.putString(KEY_ISSUER_CA_PUB,   issuerPubKey);
+            editor.putString(KEY_READER_PRIV,     readerPrivKey);
+            editor.putString(KEY_READER_ID,       readerId);
+            editor.putString(KEY_READER_CERT,     readerCert);
+            editor.putString(KEY_READER_GROUP_ID, readerGroupId);
+            editor.putString(KEY_READER_PUB_KEY,  readerPubHex);
+            editor.putBoolean(KEY_PROVISIONED,    true);
+            editor.apply();
+
+            AliroDiagnosticLog.i(TAG, "importProvisioning: stored reader-supplied provisioning "
+                    + "(selfSigned=" + selfSigned + ", certBytes="
+                    + (readerCert.length() / 2) + ")");
+
+            return "Imported reader provisioning\n"
+                    + "Reader ID:    " + readerId.substring(0, 8) + "...\n"
+                    + "Group ID:     " + readerGroupId.substring(0, 8) + "...\n"
+                    + "Self-signed:  " + (selfSigned ? "yes" : "no (external CA)") + "\n"
+                    + "Cert:         " + (readerCert.length() / 2) + " bytes";
+        }
+        catch (Exception e)
+        {
+            AliroDiagnosticLog.e(TAG, "importProvisioning failed", e);
+            return null;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Enrollment mode (over-NFC provisioning) helpers
+    // -------------------------------------------------------------------------
+
+    /**
+     * Read the enrollment-mode toggle from SharedPreferences. Defaults to
+     * false — enrollment must be explicitly opted into by the user from the
+     * Settings screen. This is checked on the HCE path before any enrollment
+     * APDU is honored.
+     */
+    public static boolean isEnrollmentMode(Context context)
+    {
+        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .getBoolean(KEY_ENROLLMENT_MODE, false);
+    }
+
+    /**
+     * Toggle enrollment mode. Called from the Settings screen.
+     */
+    public static void setEnrollmentMode(Context context, boolean enabled)
+    {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putBoolean(KEY_ENROLLMENT_MODE, enabled)
+                .apply();
+        AliroDiagnosticLog.i(TAG, "enrollment mode "
+                + (enabled ? "ENABLED" : "DISABLED")
+                + " by user");
+    }
+
+    /**
+     * Store reader provisioning data received over the enrollment NFC
+     * channel (AID A000000909ACCE55FE). Unlike {@link #importProvisioning},
+     * this path receives only the reader's PUBLIC key + reader ID — there
+     * is no private key (the reader keeps that) and no certificate. We
+     * store the pub key in both the issuer-CA-pub and reader-pub-key slots
+     * (treating it as a self-signed reader with no separate CA), compute
+     * the group ID locally, and mark the credential as provisioned.
+     *
+     * This method is meant to be called from the enrollment confirmation
+     * activity AFTER the user has approved the prompt.
+     *
+     * @param readerPubKey  65-byte uncompressed P-256 public key (0x04 || X || Y)
+     * @param readerId      32-byte reader identifier
+     * @return null on failure, or a human-readable summary string on success
+     */
+    public static String storeEnrolledReader(Context context,
+                                             byte[] readerPubKey,
+                                             byte[] readerId)
+    {
+        try
+        {
+            if (readerPubKey == null || readerPubKey.length != 65 || readerPubKey[0] != 0x04)
+            {
+                AliroDiagnosticLog.e(TAG, "storeEnrolledReader: pub key must be 65 bytes uncompressed (0x04 || X || Y)");
+                return null;
+            }
+            if (readerId == null || readerId.length != 32)
+            {
+                AliroDiagnosticLog.e(TAG, "storeEnrolledReader: readerId must be 32 bytes");
+                return null;
+            }
+
+            // The reader_identifier the reader sent consists of two 16-byte
+            // halves per Aliro §6.2: reader_group_identifier || reader_group_sub_identifier.
+            // The reader_group_identifier is the lookup key the credential will
+            // see in every subsequent AUTH0, so this is the value AUTH0 has to
+            // match on. The binding between reader_group_identifier and the
+            // reader public key is implementation-defined by the reader (the
+            // spec only requires the binding exist and that the identifier be
+            // globally unique). The credential SHALL accept whatever value the
+            // reader chose and use it verbatim for lookup.
+            String readerIdHex      = Hex.toHexString(readerId);
+            String readerGroupIdHex = readerIdHex.substring(0, 32);
+            String readerPubHex     = Hex.toHexString(readerPubKey);
+
+            // Store. Self-signed model with no CA private key — the credential
+            // never needs the reader's private key for authentication; it just
+            // verifies signatures with the pub key during AUTH1. Index under
+            // the reader-supplied reader_group_identifier (NOT a value we
+            // re-derived locally) so AUTH0 lookup finds this entry.
+            SharedPreferences.Editor editor = context
+                    .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                    .edit();
+            editor.putString(KEY_ISSUER_CA_PRIV,  "");                 // we don't have it
+            editor.putString(KEY_ISSUER_CA_PUB,   readerPubHex);       // self-signed = pub
+            editor.putString(KEY_READER_PRIV,     "");                 // we don't have it
+            editor.putString(KEY_READER_ID,       readerIdHex);
+            editor.putString(KEY_READER_CERT,     "");                 // no cert sent
+            editor.putString(KEY_READER_GROUP_ID, readerGroupIdHex);   // <-- reader-supplied, not derived
+            editor.putString(KEY_READER_PUB_KEY,  readerPubHex);
+            editor.putBoolean(KEY_PROVISIONED,    true);
+            editor.apply();
+
+            AliroDiagnosticLog.i(TAG, "storeEnrolledReader: stored over-NFC enrollment "
+                    + "(groupId=" + readerGroupIdHex.substring(0, 8) + "..., "
+                    + "readerId=" + readerIdHex.substring(0, 8) + "...)");
+
+            return "Enrolled reader\n"
+                    + "Reader ID:    " + readerIdHex.substring(0, 8) + "...\n"
+                    + "Group ID:     " + readerGroupIdHex.substring(0, 8) + "...\n"
+                    + "Pub key:      " + readerPubHex.substring(0, 16) + "...";
+        }
+        catch (Exception e)
+        {
+            AliroDiagnosticLog.e(TAG, "storeEnrolledReader failed", e);
+            return null;
+        }
+    }
+
+    /**
+     * Derive the 65-byte uncompressed P-256 public key from a 32-byte
+     * private scalar. Uses BouncyCastle scalar multiplication on the
+     * secp256r1 generator.
+     */
+    private static byte[] computeP256PublicKey(byte[] privBytes)
+    {
+        try
+        {
+            if (privBytes == null || privBytes.length != 32) return null;
+            BigInteger d = new BigInteger(1, privBytes);
+            org.bouncycastle.jce.spec.ECNamedCurveParameterSpec spec =
+                    org.bouncycastle.jce.ECNamedCurveTable.getParameterSpec("secp256r1");
+            if (d.signum() <= 0 || d.compareTo(spec.getN()) >= 0) return null;
+            org.bouncycastle.math.ec.ECPoint q = spec.getG().multiply(d).normalize();
+            byte[] x = toBytes32(q.getAffineXCoord().toBigInteger());
+            byte[] y = toBytes32(q.getAffineYCoord().toBigInteger());
+            byte[] out = new byte[65];
+            out[0] = 0x04;
+            System.arraycopy(x, 0, out, 1, 32);
+            System.arraycopy(y, 0, out, 33, 32);
+            return out;
+        }
+        catch (Exception e)
+        {
+            AliroDiagnosticLog.e(TAG, "computeP256PublicKey failed", e);
+            return null;
+        }
+    }
+
+    // =========================================================================
     // Reader-side import helper
     // =========================================================================
 
@@ -458,7 +771,7 @@ public class AliroProvisioningManager
             if (obj.optInt("v", 0) != 1 ||
                 !"aliro_reader_config".equals(obj.optString("type", "")))
             {
-                Log.e(TAG, "importReaderConfig: invalid JSON type or version");
+                AliroDiagnosticLog.e(TAG, "importReaderConfig: invalid JSON type or version");
                 return null;
             }
 
@@ -490,7 +803,7 @@ public class AliroProvisioningManager
         }
         catch (Exception e)
         {
-            Log.e(TAG, "importReaderConfig failed", e);
+            AliroDiagnosticLog.e(TAG, "importReaderConfig failed", e);
             return null;
         }
     }
@@ -536,7 +849,7 @@ public class AliroProvisioningManager
 
             if (outerSeq.size() < 2)
             {
-                Log.w(TAG, "verifyProfile0000Cert: outer SEQUENCE has fewer than 2 elements");
+                AliroDiagnosticLog.w(TAG, "verifyProfile0000Cert: outer SEQUENCE has fewer than 2 elements");
                 return false;
             }
 
@@ -546,12 +859,12 @@ public class AliroProvisioningManager
                 profileId = org.bouncycastle.asn1.ASN1OctetString.getInstance(
                         outerSeq.getObjectAt(0)).getOctets();
             } catch (Exception e) {
-                Log.w(TAG, "verifyProfile0000Cert: first element is not OCTET STRING: " + e);
+                AliroDiagnosticLog.w(TAG, "verifyProfile0000Cert: first element is not OCTET STRING: " + e);
                 return false;
             }
             if (profileId.length != 2 || profileId[0] != 0x00 || profileId[1] != 0x00)
             {
-                Log.w(TAG, "verifyProfile0000Cert: invalid profile ID: " + Hex.toHexString(profileId));
+                AliroDiagnosticLog.w(TAG, "verifyProfile0000Cert: invalid profile ID: " + Hex.toHexString(profileId));
                 return false;
             }
 
@@ -560,7 +873,7 @@ public class AliroProvisioningManager
             try {
                 dataSeq = ASN1Sequence.getInstance(outerSeq.getObjectAt(1));
             } catch (Exception e) {
-                Log.w(TAG, "verifyProfile0000Cert: second element is not SEQUENCE: " + e);
+                AliroDiagnosticLog.w(TAG, "verifyProfile0000Cert: second element is not SEQUENCE: " + e);
                 return false;
             }
 
@@ -573,7 +886,7 @@ public class AliroProvisioningManager
             byte[] publicKey    = null;
             byte[] sigField     = null;
 
-            Log.d(TAG, "verifyProfile0000Cert: parsing " + dataSeq.size() + " data elements");
+            AliroDiagnosticLog.d(TAG, "verifyProfile0000Cert: parsing " + dataSeq.size() + " data elements");
             for (int idx = 0; idx < dataSeq.size(); idx++)
             {
                 org.bouncycastle.asn1.ASN1Encodable el = dataSeq.getObjectAt(idx);
@@ -589,7 +902,7 @@ public class AliroProvisioningManager
                         // Fallback: get the raw encoded content
                         octets = tagged.getBaseObject().toASN1Primitive().getEncoded();
                     }
-                    Log.d(TAG, "  tag[" + tagNo + "] = " + octets.length + " bytes");
+                    AliroDiagnosticLog.d(TAG, "  tag[" + tagNo + "] = " + octets.length + " bytes");
                     switch (tagNo)
                     {
                         case 0: serialNumber = octets; break;
@@ -605,7 +918,7 @@ public class AliroProvisioningManager
 
             if (publicKey == null || sigField == null)
             {
-                Log.w(TAG, "verifyProfile0000Cert: missing publicKey (" + (publicKey != null)
+                AliroDiagnosticLog.w(TAG, "verifyProfile0000Cert: missing publicKey (" + (publicKey != null)
                         + ") or signature (" + (sigField != null) + "), elements=" + dataSeq.size());
                 return false;
             }
@@ -632,12 +945,12 @@ public class AliroProvisioningManager
             sig.initVerify(issuerPub);
             sig.update(tbsDer);
             boolean valid = sig.verify(sigDer);
-            Log.d(TAG, "verifyProfile0000Cert: signature valid = " + valid);
+            AliroDiagnosticLog.d(TAG, "verifyProfile0000Cert: signature valid = " + valid);
             return valid;
         }
         catch (Exception e)
         {
-            Log.e(TAG, "verifyProfile0000Cert failed", e);
+            AliroDiagnosticLog.e(TAG, "verifyProfile0000Cert failed", e);
             return false;
         }
     }

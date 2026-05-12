@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<host-apdu-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:description="@string/hce_service_description"
+    android:requireDeviceUnlock="false">
+
+    <!--
+        Test AID: F0 01 02 03 04 05 06
+
+        - Starts with F0 to mark this as a "proprietary" / non-registered AID
+          (per ISO 7816-5). Won't collide with any real registered AID.
+        - 7 bytes long, well within the 5-16 byte range allowed.
+        - category="other" because we're not implementing a payment card or
+          any standard category. "payment" requires special privileges and
+          would conflict with Google Wallet.
+    -->
+    <aid-group
+        android:description="@string/hce_aid_group_description"
+        android:category="other">
+        <aid-filter android:name="F0010203040506" />
+    </aid-group>
+
+</host-apdu-service>
