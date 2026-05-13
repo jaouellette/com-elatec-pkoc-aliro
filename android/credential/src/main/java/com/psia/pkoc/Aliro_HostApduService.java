@@ -12,6 +12,8 @@ import com.psia.pkoc.core.AliroDiagnosticLog;
 import com.psia.pkoc.core.AliroCryptoProvider;
 import com.psia.pkoc.core.AliroAccessDocument;
 import com.psia.pkoc.core.AliroProvisioningManager;
+import com.psia.pkoc.core.CaKeyStore;
+import com.psia.pkoc.core.PendingCertEnrollment;
 
 import com.upokecenter.cbor.CBORObject;
 
@@ -222,6 +224,43 @@ public class Aliro_HostApduService extends HostApduService
                                                                        // re-used to signal "enrollment mode is off"
 
     // -------------------------------------------------------------------------
+    // Cert-based enrollment (Flow #2) wire format constants
+    //
+    // Two new INSes, parallel to INS 0xE0, on the same enrollment AID:
+    //   INS 0xE2 (submit) — reader presents (reader_pub, reader_id); App side
+    //                       stages a user approval prompt, returns 9000 immediately.
+    //                       The session state is INTENTIONALLY left in
+    //                       ENROLLMENT_SELECTED across 0xE2 so that 0xE3 fetch
+    //                       polls don't need a fresh SELECT each time.
+    //   INS 0xE3 (fetch)  — reader polls for the result; returns 6985 while
+    //                       awaiting user decision, 9000 + TLV data once approved,
+    //                       6A82 if denied/expired/never-submitted.
+    //
+    // 0xE2 command data field (102 bytes):
+    //   byte 0:     version (currently 0x01)
+    //   byte 1..2:  TLV header 0x86 0x41
+    //   byte 3..67: 65-byte uncompressed reader public key (0x04 || X || Y)
+    //   byte 68..69: TLV header 0x4D 0x20
+    //   byte 70..101: 32-byte reader_identifier (group_id(16) || sub_group_id(16))
+    //
+    // 0xE3 response data field on success: TLV-encoded cert + CA pub key,
+    //   built by CertEnrollConfirmActivity at approve time and staged in
+    //   PendingCertEnrollment for delivery here.
+    //
+    // See Gate 1 wire spec doc for the complete protocol.
+    // -------------------------------------------------------------------------
+    private static final byte ENROLLMENT_INS_CERT_SUBMIT = (byte)0xE2;
+    private static final byte ENROLLMENT_INS_CERT_FETCH  = (byte)0xE3;
+    private static final int  ENROLLMENT_CERT_SUBMIT_LEN = 102;
+
+    /** SharedPreferences keys for configurable timeouts (Settings → Enrollment). */
+    private static final String PREFS_APP_NAME                   = "AliroAppPrefs";
+    private static final String PREF_ENROLL_PENDING_TIMEOUT_SEC  = "enroll_pending_timeout_sec";
+    private static final String PREF_ENROLL_GRACE_WINDOW_SEC     = "enroll_grace_window_sec";
+    private static final int    DEFAULT_PENDING_TIMEOUT_SEC      = 60;
+    private static final int    DEFAULT_GRACE_WINDOW_SEC         = 30;
+
+    // -------------------------------------------------------------------------
     // Per-transaction state (reset on deactivation)
     // -------------------------------------------------------------------------
     private enum State { IDLE, SELECTED, AUTH0_DONE, CERT_LOADED, AUTH1_DONE, EXCHANGE_DONE, ENROLLMENT_SELECTED }
@@ -236,6 +275,21 @@ public class Aliro_HostApduService extends HostApduService
     private byte[]  auth0Flag;            // command_parameters || authentication_policy from AUTH0
     private byte[]  readerStaticPubKeyX;  // 32-byte reader static public key X (from LOAD CERT tag 85)
     private byte[]  readerStaticPubKey;   // 65-byte uncompressed reader public key 04||X||Y (from LOAD CERT tag 85)
+
+    // reader_group_identifier_key per Aliro §6.2 — bound to the
+    // reader_group_identifier and SHALL refer to exactly one of:
+    //   (a) the public key of the Reader System Issuer CA of the reader_Cert
+    //   (b) the public key of the reader key pair of that Reader
+    //
+    // For Flow #1 self-signed enrollment (a) and (b) are the same key, so
+    // sessionRgiKey == readerStaticPubKey. For Flow #2 cert-based enrollment
+    // they differ: sessionRgiKey holds the CA pub key (option a) used as
+    // (1) HKDF salt material per §8.3.1.13, and (2) the cert verification
+    // key per §8.3.3.4.5 when a cert is presented in AUTH1 or LOAD CERT.
+    // readerStaticPubKey separately holds the reader's own pub key used to
+    // verify the reader signature per §8.3.3.4.5.
+    private byte[]  sessionRgiKey;        // 65-byte uncompressed reader_group_identifier_key
+    private byte[]  sessionRgiKeyX;       // 32-byte x coordinate of sessionRgiKey (HKDF salt input)
     private byte[]  skReader;             // ExpeditedSKReader (32 bytes) — for decrypting EXCHANGE
     private byte[]  skDevice;             // ExpeditedSKDevice (32 bytes) — for encrypting AUTH1 response
     private byte[]  stepUpSK;             // StepUpSK (32 bytes) at HKDF offset 64 — for ENVELOPE session
@@ -416,7 +470,9 @@ public class Aliro_HostApduService extends HostApduService
             case (byte)0x3C: return handleControlFlow(apdu);
             case (byte)0xC3: return handleEnvelope(apdu);   // Step-Up ENVELOPE
             case (byte)0xC0: return handleGetResponse(apdu); // Step-Up GET RESPONSE
-            case ENROLLMENT_INS_WRITE: return handleEnrollmentWrite(apdu);
+            case ENROLLMENT_INS_WRITE:        return handleEnrollmentWrite(apdu);
+            case ENROLLMENT_INS_CERT_SUBMIT:  return handleCertEnrollSubmit(apdu);
+            case ENROLLMENT_INS_CERT_FETCH:   return handleCertEnrollFetch(apdu);
             default:
                 AliroDiagnosticLog.w(TAG, "Unknown INS: " + String.format("%02X", ins));
                 return SW_ERROR;
@@ -620,6 +676,209 @@ public class Aliro_HostApduService extends HostApduService
     }
 
     // -------------------------------------------------------------------------
+    // CERT-BASED ENROLLMENT SUBMIT (INS E2) — Flow #2 phase 1
+    //
+    // Wire format (after the 5-byte APDU header CLA INS P1 P2 Lc):
+    //   byte 0:     version (must equal 0x01)
+    //   byte 1..2:  0x86 0x41   (TLV: 65-byte reader pub key follows)
+    //   byte 3..67: 65-byte uncompressed reader pub key (0x04 || X || Y)
+    //   byte 68..69: 0x4D 0x20  (TLV: 32-byte reader_identifier follows)
+    //   byte 70..101: 32-byte reader_identifier (group(16) || subGroup(16))
+    //
+    // Total payload: 102 bytes.
+    //
+    // Acknowledgement model: validate format synchronously, stage the
+    // request in PendingCertEnrollment, launch the confirmation activity,
+    // return 9000 immediately. Actual signing + storing happens after the
+    // user approves on the phone. State is left in ENROLLMENT_SELECTED so
+    // the reader can poll 0xE3 without re-SELECTing.
+    // -------------------------------------------------------------------------
+
+    private byte[] handleCertEnrollSubmit(byte[] apdu)
+    {
+        // Gate 1: enrollment mode must be enabled.
+        if (!AliroProvisioningManager.isEnrollmentMode(this))
+        {
+            AliroDiagnosticLog.w(TAG, "0xE2: enrollment mode disabled");
+            return SW_ERROR; // 6A82
+        }
+        // Gate 2: must be in ENROLLMENT_SELECTED state (post-SELECT).
+        if (state != State.ENROLLMENT_SELECTED)
+        {
+            AliroDiagnosticLog.w(TAG, "0xE2: wrong state " + state + " (need ENROLLMENT_SELECTED)");
+            return SW_CONDITIONS; // 6985
+        }
+        // Gate 3: Lc must be exactly 102.
+        if (apdu.length < 5)
+        {
+            return SW_WRONG_LENGTH;
+        }
+        int lc = apdu[4] & 0xFF;
+        if (lc != ENROLLMENT_CERT_SUBMIT_LEN)
+        {
+            AliroDiagnosticLog.w(TAG, "0xE2: bad Lc=" + lc + " (expected " + ENROLLMENT_CERT_SUBMIT_LEN + ")");
+            return SW_WRONG_LENGTH; // 6700
+        }
+        if (apdu.length < 5 + lc)
+        {
+            AliroDiagnosticLog.w(TAG, "0xE2: payload truncated, got " + (apdu.length - 5) + " bytes");
+            return SW_WRONG_LENGTH;
+        }
+
+        // Gate 4: version byte.
+        byte version = apdu[5];
+        if (version != ENROLLMENT_VERSION)
+        {
+            AliroDiagnosticLog.w(TAG, "0xE2: unsupported version 0x"
+                    + String.format("%02X", version));
+            return new byte[] { (byte)0x6A, (byte)0x86 };
+        }
+
+        // Gate 5: TLV header for reader pub key at offset 1: 0x86 0x41
+        if ((apdu[6]  & 0xFF) != 0x86 || (apdu[7]  & 0xFF) != 0x41)
+        {
+            AliroDiagnosticLog.w(TAG, "0xE2: bad TLV header for reader pub key");
+            return new byte[] { (byte)0x6A, (byte)0x80 };
+        }
+        // Gate 6: reader pub key must be uncompressed.
+        if (apdu[8] != 0x04)
+        {
+            AliroDiagnosticLog.w(TAG, "0xE2: pub key must start with 0x04 (uncompressed)");
+            return new byte[] { (byte)0x6A, (byte)0x80 };
+        }
+        // Gate 7: TLV header for reader_identifier at offset 68: 0x4D 0x20
+        if ((apdu[73] & 0xFF) != 0x4D || (apdu[74] & 0xFF) != 0x20)
+        {
+            AliroDiagnosticLog.w(TAG, "0xE2: bad TLV header for reader_identifier");
+            return new byte[] { (byte)0x6A, (byte)0x80 };
+        }
+
+        byte[] readerPub = Arrays.copyOfRange(apdu, 8,  8 + 65);
+        byte[] readerId  = Arrays.copyOfRange(apdu, 75, 75 + 32);
+
+        AliroDiagnosticLog.i(TAG, "0xE2 submit: pub=" + Hex.toHexString(readerPub).substring(0, 16)
+                + "..., readerId=" + Hex.toHexString(readerId).substring(0, 16) + "...");
+
+        // Stage the request. Any prior pending or staged-result state is overwritten
+        // by a fresh 0xE2 per Gate 2 "single slot, no handle" decision.
+        try
+        {
+            PendingCertEnrollment.submit(readerPub, readerId);
+        }
+        catch (IllegalArgumentException ex)
+        {
+            AliroDiagnosticLog.e(TAG, "0xE2: PendingCertEnrollment.submit rejected payload", ex);
+            return new byte[] { (byte)0x6A, (byte)0x80 };
+        }
+
+        // Launch the confirmation activity. Reuses the same full-screen-intent
+        // pattern as EnrollmentConfirmActivity (heads-up notification fallback
+        // when direct activity launch is blocked by the background-launch
+        // policy on Android 14+).
+        try
+        {
+            CertEnrollConfirmActivity.launch(getApplicationContext());
+        }
+        catch (Throwable t)
+        {
+            AliroDiagnosticLog.e(TAG, "0xE2: failed to launch confirmation activity", t);
+            // Don't fail the wire — the user just won't see a prompt and the
+            // next 0xE3 fetch will time out, leaving the slot in NONE.
+        }
+
+        // Intentionally DO NOT call resetState() here. The session remains in
+        // ENROLLMENT_SELECTED across 0xE2 so that 0xE3 fetch polls don't need
+        // a fresh SELECT each time. See Gate 1 wire spec §3 / §6.
+        return SW_OK;
+    }
+
+    // -------------------------------------------------------------------------
+    // CERT-BASED ENROLLMENT FETCH (INS E3) — Flow #2 phase 2
+    //
+    // Polled by the reader after 0xE2 until a terminal result is returned.
+    // Possible outcomes:
+    //   9000 + data    — user approved, data = TLV(0x90 cert, 0x85 caPub)
+    //   61 xx          — partial result, reader should issue GET RESPONSE 0xC0
+    //   6985           — user has not yet decided
+    //   6A82           — denied, expired, or never submitted
+    // -------------------------------------------------------------------------
+
+    private byte[] handleCertEnrollFetch(byte[] apdu)
+    {
+        // Must be in ENROLLMENT_SELECTED state (preserved across 0xE2).
+        if (state != State.ENROLLMENT_SELECTED)
+        {
+            AliroDiagnosticLog.w(TAG, "0xE3: wrong state " + state + " (need ENROLLMENT_SELECTED)");
+            return SW_CONDITIONS; // 6985
+        }
+
+        // Apply timeout transitions before reading phase.
+        long pendingTimeoutMs = getConfiguredEnrollPendingTimeoutMs();
+        long graceMs          = getConfiguredEnrollGraceWindowMs();
+        PendingCertEnrollment.tickAndMaybeExpire(pendingTimeoutMs, graceMs);
+
+        PendingCertEnrollment.Phase phase = PendingCertEnrollment.getPhase();
+        switch (phase)
+        {
+            case AWAITING_USER:
+                AliroDiagnosticLog.d(TAG, "0xE3: AWAITING_USER, returning 6985");
+                return SW_CONDITIONS; // 6985
+
+            case RESULT_READY:
+            {
+                byte[] payload = PendingCertEnrollment.peekResult();
+                if (payload == null)
+                {
+                    // Race: tick said RESULT_READY but peekResult returned null.
+                    // Treat as no-result.
+                    AliroDiagnosticLog.w(TAG, "0xE3: phase=RESULT_READY but peekResult=null; returning 6A82");
+                    return SW_ERROR;
+                }
+                AliroDiagnosticLog.i(TAG, "0xE3: returning " + payload.length + "-byte response");
+
+                // If the payload fits in a single APDU response, return it directly.
+                // Otherwise stage it for GET RESPONSE chunking via the existing
+                // pendingGetResponse infrastructure (same as Step-Up uses).
+                if (payload.length <= GET_RESPONSE_CHUNK)
+                {
+                    byte[] resp = new byte[payload.length + 2];
+                    System.arraycopy(payload, 0, resp, 0, payload.length);
+                    resp[payload.length]     = (byte)0x90;
+                    resp[payload.length + 1] = 0x00;
+                    return resp;
+                }
+                pendingGetResponse    = payload;
+                pendingGetResponseOff = 0;
+                return nextGetResponseChunk();
+            }
+
+            case DENIED:
+            case NONE:
+            default:
+                AliroDiagnosticLog.d(TAG, "0xE3: phase=" + phase + ", returning 6A82");
+                return SW_ERROR; // 6A82
+        }
+    }
+
+    /** Read configured pending-request timeout (seconds) from app prefs, return ms. */
+    private long getConfiguredEnrollPendingTimeoutMs()
+    {
+        int sec = getSharedPreferences(PREFS_APP_NAME, Context.MODE_PRIVATE)
+                .getInt(PREF_ENROLL_PENDING_TIMEOUT_SEC, DEFAULT_PENDING_TIMEOUT_SEC);
+        if (sec <= 0) sec = DEFAULT_PENDING_TIMEOUT_SEC;
+        return ((long) sec) * 1000L;
+    }
+
+    /** Read configured re-fetch grace window (seconds) from app prefs, return ms. */
+    private long getConfiguredEnrollGraceWindowMs()
+    {
+        int sec = getSharedPreferences(PREFS_APP_NAME, Context.MODE_PRIVATE)
+                .getInt(PREF_ENROLL_GRACE_WINDOW_SEC, DEFAULT_GRACE_WINDOW_SEC);
+        if (sec <= 0) sec = DEFAULT_GRACE_WINDOW_SEC;
+        return ((long) sec) * 1000L;
+    }
+
+    // -------------------------------------------------------------------------
     // AUTH0 (INS 80)
     // -------------------------------------------------------------------------
 
@@ -759,11 +1018,66 @@ public class Aliro_HostApduService extends HostApduService
                         {
                             readerStaticPubKey = provKey;
                             readerStaticPubKeyX = Arrays.copyOfRange(provKey, 1, 33);
+                            // For Flow #1 self-signed, reader pub == CA pub, so the
+                            // rgi key equals readerStaticPubKey. We track it
+                            // separately anyway to keep HKDF salt selection uniform
+                            // with Flow #2 below.
+                            sessionRgiKey  = provKey;
+                            sessionRgiKeyX = readerStaticPubKeyX;
                             AliroDiagnosticLog.d(TAG, "AUTH0: provisioned reader key matched for group_id=" + groupIdHex
                                     + " -> pubKeyX=" + Hex.toHexString(readerStaticPubKeyX));
                         }
                     }
-                    if (readerStaticPubKey == null)
+                    // CaKeyStore match (Flow #2 — cert-based enrollment).
+                    //
+                    // Per Aliro §6.2 option (a), the reader_group_identifier_key
+                    // for a cert-enrolled reader is the Reader System Issuer CA
+                    // public key. We stash that in sessionRgiKey for use as:
+                    //   - HKDF salt material per §8.3.1.13, and
+                    //   - the cert-verification key per §8.3.3.4.5 if a cert
+                    //     arrives later in AUTH1 (tag 0x90) or LOAD CERT.
+                    //
+                    // Separately, the reader's OWN public key (captured at 0xE2
+                    // enrollment time and stored on the CaKeyStore entry) is
+                    // what we need to verify the reader signature at AUTH1 per
+                    // §8.3.3.4.5 no-cert branch ("look up the reader public key
+                    // using the reader_group_identifier"). If the cert IS
+                    // included in AUTH1, parseReaderCertForPubKey() will
+                    // overwrite readerStaticPubKey with the cert subject pub
+                    // key (intermediate_reader_PubK), which the spec also allows.
+                    if (sessionRgiKey == null)
+                    {
+                        CaKeyStore.CaKeyEntry caEntry = CaKeyStore.getCAKey(this, groupIdBytes);
+                        if (caEntry != null && caEntry.caPub != null
+                                && caEntry.caPub.length == 65 && caEntry.caPub[0] == 0x04)
+                        {
+                            sessionRgiKey  = caEntry.caPub;
+                            sessionRgiKeyX = Arrays.copyOfRange(caEntry.caPub, 1, 33);
+                            AliroDiagnosticLog.d(TAG, "AUTH0: CaKeyStore matched for group_id=" + groupIdHex
+                                    + " -> CA pubKeyX (rgi key)=" + Hex.toHexString(sessionRgiKeyX));
+
+                            // If the stored entry has the reader's own pub key,
+                            // populate readerStaticPubKey for the AUTH1 no-cert
+                            // verification path. May still be overridden by a
+                            // cert in AUTH1 / LOAD CERT, which is fine.
+                            if (readerStaticPubKey == null
+                                    && caEntry.readerPub != null
+                                    && caEntry.readerPub.length == 65
+                                    && caEntry.readerPub[0] == 0x04)
+                            {
+                                readerStaticPubKey  = caEntry.readerPub;
+                                readerStaticPubKeyX = Arrays.copyOfRange(caEntry.readerPub, 1, 33);
+                                AliroDiagnosticLog.d(TAG, "AUTH0: CaKeyStore supplied readerPubX="
+                                        + Hex.toHexString(readerStaticPubKeyX));
+                            }
+                            else if (caEntry.readerPub == null)
+                            {
+                                AliroDiagnosticLog.d(TAG, "AUTH0: CaKeyStore entry has no readerPub; "
+                                        + "reader must include cert in AUTH1 (tag 0x90) or via LOAD CERT");
+                            }
+                        }
+                    }
+                    if (readerStaticPubKey == null && sessionRgiKey == null)
                     {
                         AliroDiagnosticLog.d(TAG, "AUTH0: group_id=" + groupIdHex + " not in multi-group map (will use config/LOAD CERT key)");
                     }
@@ -785,34 +1099,57 @@ public class Aliro_HostApduService extends HostApduService
             // matches one of the credential's allowed sub-groups, even if the reader's
             // group_id differs. The group_id is used in HKDF salt but NOT as an accept/reject
             // gate when the sub_group_id matches.
-            if (AliroProvisioningManager.isStrictMode(this) && AliroProvisioningManager.isProvisioned(this))
+            //
+            // Strict mode also applies to Flow #2 cert-based enrollment: if any CA key
+            // is present in the CaKeyStore the credential is "provisioned" for the
+            // purposes of strict mode, and the received group_id must match either the
+            // legacy single-credential provisioning or some entry in the CaKeyStore.
+            boolean haveLegacyProvisioning = AliroProvisioningManager.isProvisioned(this);
+            boolean haveCaKeyStoreEntries  = !CaKeyStore.listAll(this).isEmpty();
+            if (AliroProvisioningManager.isStrictMode(this)
+                    && (haveLegacyProvisioning || haveCaKeyStoreEntries))
             {
-                byte[] authorizedGroupId = AliroProvisioningManager.getAuthorizedReaderGroupId(this);
-                if (authorizedGroupId != null)
+                // readerIdBytes = group_identifier(16) || sub_group_identifier(16)
+                byte[] receivedGroupId    = Arrays.copyOfRange(readerIdBytes, 0, 16);
+                byte[] receivedSubGroupId = (readerIdBytes.length >= 32)
+                        ? Arrays.copyOfRange(readerIdBytes, 16, 32) : null;
+
+                boolean groupMatch    = false;
+                boolean subGroupMatch = false;
+                String  matchSource   = null;
+
+                // Check against legacy single-credential provisioning (Flow #1).
+                if (haveLegacyProvisioning)
                 {
-                    // readerIdBytes = group_identifier(16) || sub_group_identifier(16)
-                    byte[] receivedGroupId    = Arrays.copyOfRange(readerIdBytes, 0, 16);
-                    byte[] receivedSubGroupId = (readerIdBytes.length >= 32)
-                            ? Arrays.copyOfRange(readerIdBytes, 16, 32) : null;
-
-                    boolean groupMatch    = Arrays.equals(receivedGroupId, authorizedGroupId);
-                    // sub_group_id match: compare against the credential's own group_id
-                    // (the credential's sub_group_id is stored as the second half of its
-                    //  provisioned group_identifier, or equivalently equals authorizedGroupId
-                    //  for credentials that use the group_id as sub_group_id).
-                    boolean subGroupMatch = (receivedSubGroupId != null)
-                            && Arrays.equals(receivedSubGroupId, authorizedGroupId);
-
-                    if (!groupMatch && !subGroupMatch)
+                    byte[] authorizedGroupId = AliroProvisioningManager.getAuthorizedReaderGroupId(this);
+                    if (authorizedGroupId != null)
                     {
-                        AliroDiagnosticLog.w(TAG, "Strict mode: Reader group ID and sub_group_id both mismatch — rejecting");
-                        return SW_CONDITIONS; // 6985
+                        groupMatch    = Arrays.equals(receivedGroupId, authorizedGroupId);
+                        // sub_group_id match: compare against the credential's own group_id
+                        // (the credential's sub_group_id is stored as the second half of its
+                        //  provisioned group_identifier, or equivalently equals authorizedGroupId
+                        //  for credentials that use the group_id as sub_group_id).
+                        subGroupMatch = (receivedSubGroupId != null)
+                                && Arrays.equals(receivedSubGroupId, authorizedGroupId);
+                        if (groupMatch)         matchSource = "legacy provisioning (group)";
+                        else if (subGroupMatch) matchSource = "legacy provisioning (sub_group)";
                     }
-                    if (groupMatch)
-                        AliroDiagnosticLog.d(TAG, "Strict mode: Reader group ID verified (exact match)");
-                    else
-                        AliroDiagnosticLog.d(TAG, "Strict mode: Reader sub_group_id verified (group_id differs, sub_group_id matches)");
                 }
+
+                // Check against CaKeyStore (Flow #2 cert-based enrollment) if no legacy match.
+                if (!groupMatch && !subGroupMatch
+                        && CaKeyStore.getCAPubKeyForGroupId(this, receivedGroupId) != null)
+                {
+                    groupMatch  = true;
+                    matchSource = "CaKeyStore";
+                }
+
+                if (!groupMatch && !subGroupMatch)
+                {
+                    AliroDiagnosticLog.w(TAG, "Strict mode: Reader group ID not found in legacy provisioning or CaKeyStore — rejecting");
+                    return SW_CONDITIONS; // 6985
+                }
+                AliroDiagnosticLog.d(TAG, "Strict mode: Reader accepted via " + matchSource);
             }
 
             // Generate UD ephemeral keypair
@@ -866,15 +1203,20 @@ public class Aliro_HostApduService extends HostApduService
                             ? Arrays.copyOfRange(credPubKeyBytes, 1, 33)
                             : new byte[32]; // fallback: 32 zero bytes
 
-                    // Need reader's static public key X for derivation.
+                    // Need reader_group_identifier_key.x for the salt.
                     // Per §8.3.1.12 the salt_fast MUST contain the x coordinate
-                    // of the reader_group_identifier_key. If neither LOAD CERT
-                    // nor a stored reader key is available we cannot derive
-                    // correct fast session keys; rather than substitute the
-                    // ephemeral key X and silently desync, fall back to a
-                    // normal STANDARD transaction by omitting the cryptogram
-                    // from the AUTH0 response.
-                    byte[] fastReaderPubKeyX = readerStaticPubKeyX;
+                    // of the reader_group_identifier_key. Use sessionRgiKeyX
+                    // (the spec-correct key, populated from CaKeyStore or
+                    // legacy provisioning above) in preference to
+                    // readerStaticPubKeyX (which only equals the rgi key for
+                    // Flow #1 self-signed). If neither is available we
+                    // cannot derive correct fast session keys; rather than
+                    // substitute the ephemeral key X and silently desync,
+                    // fall back to a normal STANDARD transaction by omitting
+                    // the cryptogram from the AUTH0 response.
+                    byte[] fastReaderPubKeyX = (sessionRgiKeyX != null)
+                            ? sessionRgiKeyX
+                            : readerStaticPubKeyX;
                     if (fastReaderPubKeyX == null)
                     {
                         byte[] testKey = AliroProvisioningManager.getTestHarnessReaderPubKey(this);
@@ -1232,8 +1574,15 @@ public class Aliro_HostApduService extends HostApduService
             return SW_CONDITIONS;
         }
 
-        // Strict mode: verify reader certificate against stored Issuer CA public key
-        if (AliroProvisioningManager.isStrictMode(this) && AliroProvisioningManager.isProvisioned(this))
+        // Strict mode: verify reader certificate against stored Issuer CA public key.
+        // For Flow #2 (cert-based enrollment) the CA pub key was stashed in
+        // sessionRgiKey during AUTH0 from the CaKeyStore entry. For Flow #1
+        // (self-signed enrollment) it's in the legacy single-credential prefs.
+        // Try sessionRgiKey first (the spec-correct, group_id-bound key per
+        // §8.3.3.4.5), otherwise fall back to legacy.
+        boolean haveLegacy   = AliroProvisioningManager.isProvisioned(this);
+        boolean haveCaStore  = !CaKeyStore.listAll(this).isEmpty();
+        if (AliroProvisioningManager.isStrictMode(this) && (haveLegacy || haveCaStore))
         {
             try
             {
@@ -1241,17 +1590,31 @@ public class Aliro_HostApduService extends HostApduService
                 int dataLen    = getDataLength(apdu);
                 if (dataOffset >= 0 && dataLen > 0)
                 {
-                    byte[] certData    = Arrays.copyOfRange(apdu, dataOffset, dataOffset + dataLen);
-                    byte[] issuerPubKey = AliroProvisioningManager.getIssuerCAPubKey(this);
+                    byte[] certData = Arrays.copyOfRange(apdu, dataOffset, dataOffset + dataLen);
+
+                    byte[] issuerPubKey = null;
+                    String issuerSource = null;
+                    if (sessionRgiKey != null)
+                    {
+                        issuerPubKey = sessionRgiKey;
+                        issuerSource = "sessionRgiKey (group_id-bound CA)";
+                    }
+                    else if (haveLegacy)
+                    {
+                        issuerPubKey = AliroProvisioningManager.getIssuerCAPubKey(this);
+                        if (issuerPubKey != null) issuerSource = "legacy provisioning";
+                    }
+
                     if (issuerPubKey != null)
                     {
                         boolean certValid = AliroProvisioningManager.verifyProfile0000Cert(certData, issuerPubKey);
                         if (!certValid)
                         {
-                            AliroDiagnosticLog.w(TAG, "Strict mode: Reader certificate verification FAILED");
+                            AliroDiagnosticLog.w(TAG, "Strict mode: Reader certificate verification FAILED against "
+                                    + issuerSource);
                             return SW_SECURITY; // 6982
                         }
-                        AliroDiagnosticLog.d(TAG, "Strict mode: Reader certificate verified against Issuer CA");
+                        AliroDiagnosticLog.d(TAG, "Strict mode: Reader certificate verified against " + issuerSource);
                     }
                 }
             }
@@ -1354,10 +1717,80 @@ public class Aliro_HostApduService extends HostApduService
                 i = valOff + len;
             }
 
-            // If reader cert was included in AUTH1 (instead of LOAD CERT), parse it
-            if (auth1ReaderCert != null && readerStaticPubKey == null)
+            // If reader cert was included in AUTH1, verify and apply it per
+            // Aliro §8.3.3.4.5 ("If a reader certificate is present in the
+            // AUTH1 command, the User Device SHALL: Decompress and verify
+            // the reader certificate as per section 6.3.1 using a locally
+            // stored Reader System Issuer CA public key associated to the
+            // reader_group_identifier received in the AUTH0 command. Set
+            // a session-bound field intermediate_reader_PubK containing
+            // the subject public key present in the reader certificate
+            // if the reader certificate was successfully verified.")
+            //
+            // The cert subject pub key overrides any reader pub key we
+            // may have populated from CaKeyStore at AUTH0 time, since
+            // §8.3.3.4.5 directs the signature verification to use
+            // intermediate_reader_PubK (cert subject) when a cert is
+            // present.
+            if (auth1ReaderCert != null)
             {
+                // Verify cert if we have a sessionRgiKey (CA pub bound to
+                // group_id) or a legacy issuer CA pub key to verify against.
+                byte[] certIssuerPub = sessionRgiKey;
+                String certIssuerSrc = "sessionRgiKey";
+                if (certIssuerPub == null && AliroProvisioningManager.isProvisioned(this))
+                {
+                    certIssuerPub = AliroProvisioningManager.getIssuerCAPubKey(this);
+                    certIssuerSrc = "legacy provisioning";
+                }
+                if (certIssuerPub != null)
+                {
+                    try
+                    {
+                        boolean certOk = AliroProvisioningManager.verifyProfile0000Cert(
+                                auth1ReaderCert, certIssuerPub);
+                        if (!certOk)
+                        {
+                            AliroDiagnosticLog.w(TAG, "AUTH1: reader cert verification FAILED against "
+                                    + certIssuerSrc + " — executing failure process per §8.3.3.4.5");
+                            zeroSessionKeys();
+                            return SW_SECURITY; // 6982
+                        }
+                        AliroDiagnosticLog.d(TAG, "AUTH1: reader cert verified against " + certIssuerSrc);
+                    }
+                    catch (Exception ex)
+                    {
+                        AliroDiagnosticLog.w(TAG, "AUTH1: cert verify error: " + ex.getMessage());
+                        zeroSessionKeys();
+                        return SW_SECURITY;
+                    }
+                }
+                else
+                {
+                    AliroDiagnosticLog.w(TAG, "AUTH1: no issuer CA pub key available to verify cert; "
+                            + "extracting subject pub anyway (legacy permissive behavior)");
+                }
+                // Extract intermediate_reader_PubK from the cert and use it
+                // as the signature verification key. This overrides any
+                // value set during AUTH0 from CaKeyStore.
+                byte[] priorReaderPub = readerStaticPubKey;
+                readerStaticPubKey  = null;
+                readerStaticPubKeyX = null;
                 parseReaderCertForPubKey(auth1ReaderCert);
+                if (readerStaticPubKey == null)
+                {
+                    // Parsing failed — restore the prior value so we have
+                    // some chance of verifying, and log the issue.
+                    readerStaticPubKey  = priorReaderPub;
+                    readerStaticPubKeyX = (priorReaderPub != null)
+                            ? Arrays.copyOfRange(priorReaderPub, 1, 33) : null;
+                    AliroDiagnosticLog.w(TAG, "AUTH1: failed to extract subject pub from cert; "
+                            + "falling back to AUTH0-populated reader pub");
+                }
+                else
+                {
+                    AliroDiagnosticLog.d(TAG, "AUTH1: intermediate_reader_PubK extracted from cert");
+                }
             }
 
             if (readerSig == null)
@@ -1431,30 +1864,59 @@ public class Aliro_HostApduService extends HostApduService
 
             // Derive session keys.
             // Per §8.3.1.13 the HKDF salt MUST contain the x coordinate of
-            // the reader_group_identifier_key (i.e. the reader's static public
-            // key, or the issuer CA public key bound to the group_id; these
-            // are equivalent under §6.2). We use the same key we just verified
-            // against. There is NO valid fallback to the ephemeral key X:
-            // substituting it would silently derive the wrong session keys.
+            // the reader_group_identifier_key. Per §6.2 the
+            // reader_group_identifier_key SHALL be either the Reader System
+            // Issuer CA pub key (option a, used by Flow #2 cert-based) or
+            // the reader's own pub key (option b, used by Flow #1 self-signed).
+            //
+            // We track this key separately as sessionRgiKey/X so we don't
+            // conflate it with the reader signature verification key
+            // (which is always the reader's own pub key per §8.3.3.4.5).
+            // For Flow #1 the two happen to be equal; for Flow #2 they
+            // diverge and the rgi key (CA pub) is what the salt needs.
             byte[] hkdfReaderPubKeyX;
             String hkdfSource;
-            if (readerStaticPubKeyX != null)
+            if (sessionRgiKeyX != null)
             {
+                hkdfReaderPubKeyX = sessionRgiKeyX;
+                hkdfSource = "reader_group_identifier_key (per §6.2/§8.3.1.13)";
+            }
+            else if (readerStaticPubKeyX != null)
+            {
+                // Fallback for the existing test-harness / LOAD-CERT-only paths
+                // that didn't go through AUTH0 rgi-key population.
                 hkdfReaderPubKeyX = readerStaticPubKeyX;
                 hkdfSource = (readerStaticPubKey == sigVerifyKey)
-                        ? "LOAD CERT / cert-in-AUTH1"
-                        : "reader_group_identifier lookup";
+                        ? "LOAD CERT / cert-in-AUTH1 (rgi key not set)"
+                        : "reader pub fallback (rgi key not set)";
             }
             else
             {
                 hkdfReaderPubKeyX = Arrays.copyOfRange(sigVerifyKey, 1, 33);
                 hkdfSource = "test-harness reader key";
             }
-            AliroDiagnosticLog.d(TAG, "AUTH1: using readerPubKeyX from " + hkdfSource
+            AliroDiagnosticLog.d(TAG, "AUTH1: HKDF salt source = " + hkdfSource
                     + " (X=" + Hex.toHexString(hkdfReaderPubKeyX) + ")");
 
             // Derive 96 bytes: ExpeditedSKReader[0..31], ExpeditedSKDevice[32..63],
             // StepUpSK[64..95] per Aliro §8.3.1.13
+            // Derive 96 bytes: ExpeditedSKReader[0..31], ExpeditedSKDevice[32..63],
+            // StepUpSK[64..95] per Aliro §8.3.1.13
+            // Diagnostic dump of all salt and info components so the reader-side
+            // and credential-side computations can be compared byte-for-byte
+            // when a GCM auth tag mismatch is observed at EXCHANGE time.
+            AliroDiagnosticLog.d(TAG, "AUTH1 salt diag: rgi_key.x=" + Hex.toHexString(hkdfReaderPubKeyX));
+            AliroDiagnosticLog.d(TAG, "AUTH1 salt diag: reader_id=" + Hex.toHexString(readerIdBytes));
+            AliroDiagnosticLog.d(TAG, "AUTH1 salt diag: interface_byte=5E (NFC)");
+            AliroDiagnosticLog.d(TAG, "AUTH1 salt diag: 5C 02 + protocol_version=" + Hex.toHexString(selectedProtocol));
+            AliroDiagnosticLog.d(TAG, "AUTH1 salt diag: reader_eph_pub.x=" + Hex.toHexString(readerEphPubX));
+            AliroDiagnosticLog.d(TAG, "AUTH1 salt diag: transaction_id=" + Hex.toHexString(transactionId));
+            AliroDiagnosticLog.d(TAG, "AUTH1 salt diag: flag (cmd_params||auth_policy from AUTH0)=" + Hex.toHexString(auth0Flag));
+            AliroDiagnosticLog.d(TAG, "AUTH1 salt diag: A5 TLV (incl A5 hdr, " + PROPRIETARY_TLV.length + " bytes)=" + Hex.toHexString(PROPRIETARY_TLV));
+            AliroDiagnosticLog.d(TAG, "AUTH1 info diag: ud_eph_pub.x=" + Hex.toHexString(udEphPubX));
+            AliroDiagnosticLog.d(TAG, "AUTH1 info diag: auth0_cmd_vendor_ext=" + (auth0CmdVendorExt == null ? "null" : Hex.toHexString(auth0CmdVendorExt)));
+            AliroDiagnosticLog.d(TAG, "AUTH1 info diag: auth0_rsp_vendor_ext=" + (auth0RspVendorExt == null ? "null" : Hex.toHexString(auth0RspVendorExt)));
+
             long tDk0 = android.os.SystemClock.elapsedRealtime();
             byte[] keybuf = AliroCryptoProvider.deriveKeys(
                     udEphKP.getPrivate(),
@@ -1473,6 +1935,16 @@ public class Aliro_HostApduService extends HostApduService
                     auth0Flag);
             long tDk1 = android.os.SystemClock.elapsedRealtime();
             AliroDiagnosticLog.d(TAG, "AUTH1: deriveKeys elapsed=" + (tDk1 - tDk0) + "ms");
+
+            // Log derived keys (first 8 bytes only, for diagnostic comparison
+            // against the reader side without exposing full session keys).
+            if (keybuf != null && keybuf.length >= 96)
+            {
+                String skReaderPrefix = Hex.toHexString(Arrays.copyOfRange(keybuf, 0, 8));
+                String skDevicePrefix = Hex.toHexString(Arrays.copyOfRange(keybuf, 32, 40));
+                AliroDiagnosticLog.d(TAG, "AUTH1 keys diag: ExpeditedSKReader[0..7]=" + skReaderPrefix
+                        + " ExpeditedSKDevice[0..7]=" + skDevicePrefix);
+            }
 
             if (keybuf == null)
             {
@@ -3207,6 +3679,8 @@ public class Aliro_HostApduService extends HostApduService
         auth1CmdParams       = 0x00;
         readerStaticPubKeyX  = null;
         readerStaticPubKey   = null;
+        sessionRgiKey        = null;
+        sessionRgiKeyX       = null;
         // Zero session keys before nulling per section 8.3.3.1
         zeroSessionKeys();
         if (stepUpSK  != null) { Arrays.fill(stepUpSK,  (byte)0); stepUpSK  = null; }

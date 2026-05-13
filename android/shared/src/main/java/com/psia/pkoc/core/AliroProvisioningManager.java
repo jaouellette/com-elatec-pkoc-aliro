@@ -749,6 +749,178 @@ public class AliroProvisioningManager
     }
 
     // =========================================================================
+    // Cert-based enrollment (Flow #2) — on-demand cert signing
+    // =========================================================================
+
+    /**
+     * Sign a profile0000 compressed Reader certificate (Aliro §13.3) for an
+     * external Reader public key, using a caller-supplied CA keypair.
+     *
+     * Used by Flow #2 (cert-based enrollment over NFC): the Reader side
+     * presents its pub key + reader_id via INS 0xE2; the App side acts as
+     * the Reader System Issuer CA and signs a cert binding that pub key.
+     * The signed cert + CA pub key are returned to the reader, which stores
+     * them and later presents the cert during LOAD CERT or AUTH1.
+     *
+     * The cert content matches §13.2 (version, serial, issuer, validity,
+     * subject, public key, AKI, BasicConstraints, KeyUsage, ECDSA-with-SHA256)
+     * and the compressed encoding follows §13.3 (profile0000). Fields whose
+     * values match the §13.3 defaults are omitted from the compressed form;
+     * the verifier reconstructs them on validation.
+     *
+     * Validity handling:
+     *   - notBefore/notAfter both null → use §13.3 defaults (notBefore=2020-01-01,
+     *     notAfter=2049-01-01). The TBS is signed against these defaults so the
+     *     signature validates after reconstruction.
+     *   - Either non-null → both must be non-null. Encoded as UTCTime in the
+     *     TBS and (if non-default) emitted as a field in the compressed form.
+     *
+     * @param readerPubUncomp65 the reader's P-256 public key in uncompressed
+     *                          form (0x04 || X(32) || Y(32)). Must be 65 bytes.
+     * @param caPrivRaw32       the CA private key as a 32-byte raw scalar
+     *                          (typically from CaKeyEntry.caPriv).
+     * @param caPubUncomp65     the matching CA public key in uncompressed form.
+     *                          Used for the AuthorityKeyIdentifier extension.
+     *                          Must be 65 bytes.
+     * @param notBeforeOrNull   start of validity, or null for §13.3 default.
+     * @param notAfterOrNull    end of validity, or null for §13.3 default.
+     *                          If one is non-null the other must also be non-null.
+     * @return compressed profile0000 cert bytes ready for transmission, never null.
+     * @throws IllegalArgumentException on bad input shape.
+     * @throws Exception on cryptographic or encoding failure.
+     */
+    public static byte[] signProfile0000ForExternalPubKey(
+            byte[] readerPubUncomp65,
+            byte[] caPrivRaw32,
+            byte[] caPubUncomp65,
+            Date   notBeforeOrNull,
+            Date   notAfterOrNull) throws Exception
+    {
+        // ---- input validation ------------------------------------------------
+        if (readerPubUncomp65 == null || readerPubUncomp65.length != 65
+                || readerPubUncomp65[0] != 0x04)
+        {
+            throw new IllegalArgumentException(
+                    "readerPubUncomp65 must be 65-byte uncompressed (0x04 || X || Y)");
+        }
+        if (caPrivRaw32 == null || caPrivRaw32.length != 32)
+        {
+            throw new IllegalArgumentException("caPrivRaw32 must be 32 bytes");
+        }
+        if (caPubUncomp65 == null || caPubUncomp65.length != 65
+                || caPubUncomp65[0] != 0x04)
+        {
+            throw new IllegalArgumentException(
+                    "caPubUncomp65 must be 65-byte uncompressed (0x04 || X || Y)");
+        }
+        if ((notBeforeOrNull == null) != (notAfterOrNull == null))
+        {
+            throw new IllegalArgumentException(
+                    "notBefore and notAfter must both be null or both non-null");
+        }
+
+        // ---- assemble the fields the TBS and compressed cert both need ------
+
+        // Random 4-byte serial number, same convention as provisionCredential().
+        byte[] serialNumber = new byte[4];
+        new SecureRandom().nextBytes(serialNumber);
+
+        // AuthorityKeyIdentifier = SHA-1 of the issuer (CA) public key, per
+        // RFC 5280 §4.2.1.1 and Aliro §13.3.
+        byte[] authorityKeyId = computeAuthorityKeyId(caPubUncomp65);
+
+        // Subject: keep "ELATEC-Reader" — matches provisionCredential() and is
+        // omitted from the compressed cert (won't match DEFAULT_SUBJECT="subject",
+        // so it IS included; that's fine and matches the existing behaviour).
+        byte[] subject = "ELATEC-Reader".getBytes("UTF-8");
+
+        // publicKey field in profile0000: 0x00 || 0x04 || X(32) || Y(32) = 66 bytes.
+        // Leading 0x00 = unused-bits byte for the BIT STRING encoding.
+        byte[] pubKeyField = new byte[66];
+        pubKeyField[0] = 0x00;
+        pubKeyField[1] = 0x04;
+        System.arraycopy(readerPubUncomp65, 1, pubKeyField, 2, 64);
+
+        // Validity bytes for the TBS. Always uses concrete byte arrays — X.509
+        // mandates the field. When the caller passed null, we use the §13.3
+        // default byte strings so that the omitted-from-compressed-form view
+        // reconstructs to the same TBS the verifier will compute.
+        byte[] notBeforeBytes;
+        byte[] notAfterBytes;
+        if (notBeforeOrNull == null)
+        {
+            notBeforeBytes = DEFAULT_NOT_BEFORE;
+            notAfterBytes  = DEFAULT_NOT_AFTER;
+        }
+        else
+        {
+            SimpleDateFormat utcFmt = new SimpleDateFormat("yyMMddHHmmss'Z'", Locale.US);
+            utcFmt.setTimeZone(TimeZone.getTimeZone("UTC"));
+            notBeforeBytes = utcFmt.format(notBeforeOrNull).getBytes("ASCII");
+            notAfterBytes  = utcFmt.format(notAfterOrNull ).getBytes("ASCII");
+        }
+
+        // ---- TBS construction and signing -----------------------------------
+
+        byte[] tbsDer = buildReferenceTBS(
+                serialNumber,
+                DEFAULT_ISSUER,        // omitted from compressed form; TBS uses default CN
+                notBeforeBytes,
+                notAfterBytes,
+                subject,
+                pubKeyField,
+                authorityKeyId);
+
+        PrivateKey caPrivKey = rawScalarToEcPrivateKey(caPrivRaw32);
+        byte[] sigDer = signEcdsaSha256(caPrivKey, tbsDer);
+
+        // signature field: 0x00 (unused-bits byte) || DER-encoded ECDSA-Sig-Value.
+        byte[] signatureField = new byte[1 + sigDer.length];
+        signatureField[0] = 0x00;
+        System.arraycopy(sigDer, 0, signatureField, 1, sigDer.length);
+
+        // ---- compressed cert assembly ---------------------------------------
+        // Pass null for date fields when caller wanted defaults — buildProfile0000
+        // omits null fields from the compressed encoding.
+        byte[] notBeforeCompressed = (notBeforeOrNull == null) ? null : notBeforeBytes;
+        byte[] notAfterCompressed  = (notAfterOrNull  == null) ? null : notAfterBytes;
+
+        byte[] readerCertBytes = buildProfile0000(
+                serialNumber,
+                null,                  // issuer: null = omit, defaults to "issuer"
+                notBeforeCompressed,
+                notAfterCompressed,
+                subject,
+                pubKeyField,
+                signatureField);
+
+        AliroDiagnosticLog.d(TAG, "signProfile0000ForExternalPubKey: signed "
+                + readerCertBytes.length + "-byte cert for reader pub starting "
+                + Hex.toHexString(readerPubUncomp65, 0, 8) + "...");
+
+        return readerCertBytes;
+    }
+
+    /**
+     * Reconstruct a Java {@link PrivateKey} from a raw 32-byte P-256 scalar.
+     * Mirrors the pattern used in AliroBleReaderService, AliroSelfTestEngine,
+     * and HomeFragment so the project converges on a single convention.
+     */
+    private static PrivateKey rawScalarToEcPrivateKey(byte[] rawScalar32) throws Exception
+    {
+        BigInteger s = new BigInteger(1, rawScalar32);
+        org.bouncycastle.jce.spec.ECNamedCurveParameterSpec bcSpec =
+                org.bouncycastle.jce.ECNamedCurveTable.getParameterSpec("secp256r1");
+        org.bouncycastle.jce.spec.ECNamedCurveSpec spec =
+                new org.bouncycastle.jce.spec.ECNamedCurveSpec(
+                        "secp256r1", bcSpec.getCurve(), bcSpec.getG(), bcSpec.getN());
+        java.security.spec.ECPrivateKeySpec keySpec =
+                new java.security.spec.ECPrivateKeySpec(s, spec);
+        KeyFactory kf = KeyFactory.getInstance("EC", new BouncyCastleProvider());
+        return kf.generatePrivate(keySpec);
+    }
+
+    // =========================================================================
     // Reader-side import helper
     // =========================================================================
 

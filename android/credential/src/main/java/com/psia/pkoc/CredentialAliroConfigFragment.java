@@ -35,9 +35,14 @@ import androidx.fragment.app.Fragment;
 import com.psia.pkoc.core.AliroAccessDocument;
 import com.psia.pkoc.core.AliroMailbox;
 import com.psia.pkoc.core.AliroProvisioningManager;
+import com.psia.pkoc.core.CaKeyStore;
+
+import org.bouncycastle.util.encoders.Hex;
 
 import java.security.KeyStore;
 import java.security.interfaces.ECPublicKey;
+import java.util.Date;
+import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -67,6 +72,11 @@ public class CredentialAliroConfigFragment extends Fragment
     private Button      btnImportProvisioning;
     private Button      btnViewDiagnosticLog;
     private androidx.appcompat.widget.SwitchCompat switchEnrollmentMode;
+
+    // CA Keystore section (Flow #2 cert-based enrollment).
+    private TextView    txtCaKeysEmpty;
+    private LinearLayout caKeysList;
+    private Button      btnClearAllCaKeys;
 
     // Test Harness section views
     private EditText    editTestHarnessGroupId;
@@ -262,6 +272,16 @@ public class CredentialAliroConfigFragment extends Fragment
                     AliroProvisioningManager.setEnrollmentMode(requireContext(), checked));
         }
 
+        // CA Keystore section (Flow #2 cert-based enrollment).
+        txtCaKeysEmpty    = view.findViewById(R.id.txtCaKeysEmpty);
+        caKeysList        = view.findViewById(R.id.caKeysList);
+        btnClearAllCaKeys = view.findViewById(R.id.btnClearAllCaKeys);
+        if (btnClearAllCaKeys != null)
+        {
+            btnClearAllCaKeys.setOnClickListener(v -> confirmClearAllCaKeys());
+        }
+        refreshCaKeysList();
+
         // Test Harness section
         editTestHarnessGroupId      = view.findViewById(R.id.editTestHarnessGroupId);
         editTestHarnessIssuerCa     = view.findViewById(R.id.editTestHarnessIssuerCa);
@@ -305,6 +325,7 @@ public class CredentialAliroConfigFragment extends Fragment
     {
         super.onResume();
         refreshMailboxViewer();
+        refreshCaKeysList();
     }
 
     @Override
@@ -1614,5 +1635,176 @@ public class CredentialAliroConfigFragment extends Fragment
             }
         }
         return null;
+    }
+
+    // =========================================================================
+    // CA Keystore management UI (Flow #2 cert-based enrollment)
+    // =========================================================================
+
+    /**
+     * Rebuild the CA keys list from {@link CaKeyStore#listAll}. Called on
+     * onCreateView, onResume, and after any mutation (label edit, delete,
+     * clear-all) so the displayed list always matches storage.
+     */
+    private void refreshCaKeysList()
+    {
+        if (caKeysList == null) return;
+
+        caKeysList.removeAllViews();
+        List<CaKeyStore.CaKeyEntry> entries = CaKeyStore.listAll(requireContext());
+
+        boolean empty = entries.isEmpty();
+        if (txtCaKeysEmpty != null)
+        {
+            txtCaKeysEmpty.setVisibility(empty ? View.VISIBLE : View.GONE);
+        }
+        if (btnClearAllCaKeys != null)
+        {
+            btnClearAllCaKeys.setEnabled(!empty);
+            btnClearAllCaKeys.setAlpha(empty ? 0.5f : 1.0f);
+        }
+        if (empty) return;
+
+        for (CaKeyStore.CaKeyEntry entry : entries)
+        {
+            caKeysList.addView(buildCaKeyRow(entry));
+        }
+    }
+
+    /** Build a single row for one CaKeyEntry. */
+    private View buildCaKeyRow(CaKeyStore.CaKeyEntry entry)
+    {
+        // Container with a subtle box around each row.
+        LinearLayout row = new LinearLayout(requireContext());
+        row.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout.LayoutParams rowLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT);
+        rowLp.bottomMargin = 12;
+        row.setLayoutParams(rowLp);
+        row.setPadding(16, 12, 16, 12);
+        row.setBackgroundColor(0x11000000);  // very light grey wash
+
+        // Label (inline-editable).
+        EditText labelEdit = new EditText(requireContext());
+        labelEdit.setText(entry.label != null ? entry.label : "");
+        labelEdit.setTextSize(13f);
+        labelEdit.setSingleLine(true);
+        labelEdit.setHint("Label");
+        labelEdit.setBackground(null);
+        LinearLayout.LayoutParams labelLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT);
+        labelEdit.setLayoutParams(labelLp);
+        // Persist on focus loss.
+        final byte[] rowGroupId = entry.groupId;
+        labelEdit.setOnFocusChangeListener((v, hasFocus) -> {
+            if (!hasFocus)
+            {
+                String newLabel = labelEdit.getText() == null
+                        ? "" : labelEdit.getText().toString().trim();
+                CaKeyStore.setLabel(requireContext(), rowGroupId, newLabel);
+            }
+        });
+        row.addView(labelEdit);
+
+        // Group ID (read-only, mono).
+        TextView groupIdLine = new TextView(requireContext());
+        groupIdLine.setText("Group ID: " + Hex.toHexString(entry.groupId));
+        groupIdLine.setTextSize(10f);
+        groupIdLine.setTypeface(android.graphics.Typeface.MONOSPACE);
+        groupIdLine.setTextColor(0xFF555555);
+        row.addView(groupIdLine);
+
+        // CA pub key (read-only, mono, truncated for display, tap-to-copy).
+        String caPubHex = Hex.toHexString(entry.caPub);
+        String caPubShort = caPubHex.length() > 32 ? caPubHex.substring(0, 32) + "…" : caPubHex;
+        TextView caPubLine = new TextView(requireContext());
+        caPubLine.setText("CA pub: " + caPubShort);
+        caPubLine.setTextSize(10f);
+        caPubLine.setTypeface(android.graphics.Typeface.MONOSPACE);
+        caPubLine.setTextColor(0xFF555555);
+        caPubLine.setOnClickListener(v -> {
+            ClipboardManager clipboard = (ClipboardManager)
+                    requireContext().getSystemService(Context.CLIPBOARD_SERVICE);
+            if (clipboard != null)
+            {
+                clipboard.setPrimaryClip(ClipData.newPlainText("CA pub key", caPubHex));
+                android.widget.Toast.makeText(requireContext(),
+                        "CA pub key copied", android.widget.Toast.LENGTH_SHORT).show();
+            }
+        });
+        row.addView(caPubLine);
+
+        // Created date.
+        CharSequence created = android.text.format.DateFormat.format(
+                "yyyy-MM-dd HH:mm", new Date(entry.createdAtMs));
+        TextView createdLine = new TextView(requireContext());
+        createdLine.setText("Created: " + created);
+        createdLine.setTextSize(10f);
+        createdLine.setTextColor(0xFF555555);
+        row.addView(createdLine);
+
+        // Delete button.
+        Button deleteBtn = new Button(requireContext());
+        deleteBtn.setText("Delete");
+        deleteBtn.setTextSize(10f);
+        deleteBtn.setAllCaps(false);
+        deleteBtn.setBackgroundTintList(android.content.res.ColorStateList.valueOf(0xFFB33A3A));
+        deleteBtn.setTextColor(android.graphics.Color.WHITE);
+        LinearLayout.LayoutParams delLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT);
+        delLp.topMargin = 4;
+        deleteBtn.setLayoutParams(delLp);
+        deleteBtn.setOnClickListener(v -> confirmDeleteCaKey(entry));
+        row.addView(deleteBtn);
+
+        return row;
+    }
+
+    /** Confirmation dialog before deleting one entry. */
+    private void confirmDeleteCaKey(CaKeyStore.CaKeyEntry entry)
+    {
+        String label = (entry.label != null && !entry.label.isEmpty())
+                ? entry.label : entry.groupIdHex().substring(0, 8);
+        new AlertDialog.Builder(requireContext())
+                .setTitle("Delete CA Key")
+                .setMessage("Delete the CA keypair for '" + label + "'?\n\n"
+                        + "After deletion, the credential will no longer be able to verify "
+                        + "transactions from readers in this group_id until the reader is "
+                        + "re-enrolled.")
+                .setPositiveButton("Delete", (d, w) -> {
+                    boolean removed = CaKeyStore.delete(requireContext(), entry.groupId);
+                    if (removed)
+                    {
+                        android.widget.Toast.makeText(requireContext(),
+                                "CA key deleted", android.widget.Toast.LENGTH_SHORT).show();
+                    }
+                    refreshCaKeysList();
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    /** Confirmation dialog before wiping every entry. */
+    private void confirmClearAllCaKeys()
+    {
+        int count = CaKeyStore.listAll(requireContext()).size();
+        if (count == 0) return;
+        new AlertDialog.Builder(requireContext())
+                .setTitle("Clear All CA Keys")
+                .setMessage("Delete all " + count + " CA keypair(s)?\n\n"
+                        + "This cannot be undone. After clearing, the credential will not "
+                        + "be able to verify transactions from any readers that were "
+                        + "enrolled via cert-based enrollment until each is re-enrolled.")
+                .setPositiveButton("Clear All", (d, w) -> {
+                    CaKeyStore.clearAll(requireContext());
+                    android.widget.Toast.makeText(requireContext(),
+                            "All CA keys cleared", android.widget.Toast.LENGTH_SHORT).show();
+                    refreshCaKeysList();
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
     }
 }

@@ -1,6 +1,10 @@
 package com.psia.pkoc;
 
 import android.app.AlertDialog;
+import android.content.ClipData;
+import android.content.ClipboardManager;
+import android.content.Context;
+import android.content.Intent;
 import android.os.Bundle;
 import android.text.TextUtils;
 import android.view.LayoutInflater;
@@ -13,6 +17,7 @@ import androidx.annotation.Nullable;
 import androidx.fragment.app.Fragment;
 import androidx.recyclerview.widget.LinearLayoutManager;
 
+import com.psia.pkoc.core.CaKeyStore;
 import com.psia.pkoc.databinding.FragmentDataManagementBinding;
 
 import org.bouncycastle.util.encoders.Hex;
@@ -92,9 +97,21 @@ public class DataManagementFragment extends Fragment
             ReaderEditDialogFragment.newInstance(null, null)
                                     .show(getChildFragmentManager(), "add_reader"));
 
+        // CA Keystore export.
+        binding.btnCopyCaKeystoreJson.setOnClickListener(v -> copyCaKeystoreJson());
+        binding.btnShareCaKeystoreJson.setOnClickListener(v -> shareCaKeystoreJson());
+        refreshCaKeystoreCount();
+
         reloadAll();
 
         return binding.getRoot();
+    }
+
+    @Override
+    public void onResume()
+    {
+        super.onResume();
+        refreshCaKeystoreCount();
     }
 
     @Override
@@ -252,5 +269,53 @@ public class DataManagementFragment extends Fragment
     {
         if (!isAdded()) return;
         requireActivity().runOnUiThread(r);
+    }
+
+    // =========================================================================
+    // CA Keystore export (Flow #2 cert-based enrollment)
+    // =========================================================================
+
+    private void refreshCaKeystoreCount()
+    {
+        if (binding == null) return;
+        int n = CaKeyStore.listAll(requireContext()).size();
+        binding.txtCaKeystoreCount.setText(n == 1 ? "1 entry" : (n + " entries"));
+        boolean empty = (n == 0);
+        binding.btnCopyCaKeystoreJson.setEnabled(!empty);
+        binding.btnShareCaKeystoreJson.setEnabled(!empty);
+        binding.btnCopyCaKeystoreJson.setAlpha(empty ? 0.5f : 1.0f);
+        binding.btnShareCaKeystoreJson.setAlpha(empty ? 0.5f : 1.0f);
+    }
+
+    private void copyCaKeystoreJson()
+    {
+        String json = CaKeyStore.exportJson(requireContext());
+        if (json == null)
+        {
+            toast("Export failed — see diagnostic log");
+            return;
+        }
+        ClipboardManager cb = (ClipboardManager)
+                requireContext().getSystemService(Context.CLIPBOARD_SERVICE);
+        if (cb != null)
+        {
+            cb.setPrimaryClip(ClipData.newPlainText("Aliro CA keystore", json));
+            toast("Copied " + json.length() + " chars to clipboard");
+        }
+    }
+
+    private void shareCaKeystoreJson()
+    {
+        String json = CaKeyStore.exportJson(requireContext());
+        if (json == null)
+        {
+            toast("Export failed — see diagnostic log");
+            return;
+        }
+        Intent send = new Intent(Intent.ACTION_SEND);
+        send.setType("application/json");
+        send.putExtra(Intent.EXTRA_SUBJECT, "Aliro CA keystore");
+        send.putExtra(Intent.EXTRA_TEXT, json);
+        startActivity(Intent.createChooser(send, "Share CA keystore"));
     }
 }

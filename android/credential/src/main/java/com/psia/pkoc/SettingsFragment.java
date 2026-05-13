@@ -23,6 +23,23 @@ public class SettingsFragment extends Fragment
     private FragmentSettingsBinding binding;
     private SharedPreferences sharedPrefs;
 
+    // -------------------------------------------------------------------------
+    // Enrollment prefs (separate file from the activity-default sharedPrefs).
+    // Keys MUST match those used by Aliro_HostApduService (Piece 5) and
+    // CertEnrollConfirmActivity (Piece 3) — those classes read from the same
+    // SharedPreferences file so the values written here take effect at the
+    // next 0xE3 fetch / 0xE2 approve respectively.
+    // -------------------------------------------------------------------------
+    private static final String PREFS_APP_NAME                  = "AliroAppPrefs";
+    private static final String PREF_ENROLL_PENDING_TIMEOUT_SEC = "enroll_pending_timeout_sec";
+    private static final String PREF_ENROLL_GRACE_WINDOW_SEC    = "enroll_grace_window_sec";
+    private static final String PREF_ENROLL_CERT_VALIDITY_DAYS  = "enroll_cert_validity_days";
+    private static final int    DEFAULT_PENDING_TIMEOUT_SEC     = 60;
+    private static final int    DEFAULT_GRACE_WINDOW_SEC        = 30;
+    private static final int    DEFAULT_CERT_VALIDITY_DAYS      = 0;  // 0 = §13.3 defaults
+
+    private SharedPreferences enrollmentPrefs;
+
     private void persistSiteIfValid()
     {
         String siteUuidStr = safeText(binding.siteIdentifierInput);
@@ -260,6 +277,8 @@ public class SettingsFragment extends Fragment
                 .edit()
                 .putBoolean(PKOC_Preferences.DisplayMAC, isChecked)
                 .apply());
+
+        configureEnrollmentListeners();
     }
 
     private void initializeComponents()
@@ -331,6 +350,8 @@ public class SettingsFragment extends Fragment
         {
             loadAndDisplayEcdheConfig();
         }
+
+        initializeEnrollmentSettings();
     }
 
 
@@ -450,8 +471,91 @@ public class SettingsFragment extends Fragment
         super.onViewCreated(view, savedInstanceState);
 
         sharedPrefs = requireActivity().getPreferences(Context.MODE_PRIVATE);
+        enrollmentPrefs = requireContext().getSharedPreferences(PREFS_APP_NAME, Context.MODE_PRIVATE);
         initializeComponents();
         configureListeners();
+    }
+
+    // =========================================================================
+    // Enrollment settings (Aliro reader enrollment over NFC)
+    // =========================================================================
+
+    /** Load configured enrollment values into the three EditTexts. */
+    private void initializeEnrollmentSettings()
+    {
+        int pendingSec   = enrollmentPrefs.getInt(PREF_ENROLL_PENDING_TIMEOUT_SEC, DEFAULT_PENDING_TIMEOUT_SEC);
+        int graceSec     = enrollmentPrefs.getInt(PREF_ENROLL_GRACE_WINDOW_SEC,    DEFAULT_GRACE_WINDOW_SEC);
+        int validityDays = enrollmentPrefs.getInt(PREF_ENROLL_CERT_VALIDITY_DAYS,  DEFAULT_CERT_VALIDITY_DAYS);
+
+        binding.enrollmentPendingTimeoutInput.setText(String.valueOf(pendingSec));
+        binding.enrollmentGraceWindowInput.setText(String.valueOf(graceSec));
+        binding.enrollmentCertValidityInput.setText(String.valueOf(validityDays));
+    }
+
+    /** Wire up debounced text watchers so changes persist as the user types. */
+    private void configureEnrollmentListeners()
+    {
+        DebouncedTextWatcher.attach(binding.enrollmentPendingTimeoutInput, 300, t ->
+                writeEnrollmentIntPref(PREF_ENROLL_PENDING_TIMEOUT_SEC,
+                        binding.enrollmentPendingTimeoutInput,
+                        DEFAULT_PENDING_TIMEOUT_SEC,
+                        1, 3600));   // 1 s to 1 h
+
+        DebouncedTextWatcher.attach(binding.enrollmentGraceWindowInput, 300, t ->
+                writeEnrollmentIntPref(PREF_ENROLL_GRACE_WINDOW_SEC,
+                        binding.enrollmentGraceWindowInput,
+                        DEFAULT_GRACE_WINDOW_SEC,
+                        1, 3600));   // 1 s to 1 h
+
+        DebouncedTextWatcher.attach(binding.enrollmentCertValidityInput, 300, t ->
+                writeEnrollmentIntPref(PREF_ENROLL_CERT_VALIDITY_DAYS,
+                        binding.enrollmentCertValidityInput,
+                        DEFAULT_CERT_VALIDITY_DAYS,
+                        0, 36500));  // 0 = defaults, up to 100 years
+    }
+
+    /**
+     * Parse the EditText as an integer in [min,max] and persist; on bad input
+     * clear the field's error indicator and write the default instead.
+     */
+    private void writeEnrollmentIntPref(String key, android.widget.EditText input,
+                                        int defaultValue, int min, int max)
+    {
+        String raw = safeText(input);
+        int value  = defaultValue;
+        boolean valid = true;
+        if (raw.isEmpty())
+        {
+            // Empty field — persist default but don't flag an error.
+            value = defaultValue;
+        }
+        else
+        {
+            try
+            {
+                int parsed = Integer.parseInt(raw);
+                if (parsed < min || parsed > max)
+                {
+                    valid = false;
+                }
+                else
+                {
+                    value = parsed;
+                }
+            }
+            catch (NumberFormatException nfe)
+            {
+                valid = false;
+            }
+        }
+
+        if (!valid)
+        {
+            setError(input, "Enter " + min + ".." + max);
+            return;
+        }
+        clearError(input);
+        enrollmentPrefs.edit().putInt(key, value).apply();
     }
 
     @Override
