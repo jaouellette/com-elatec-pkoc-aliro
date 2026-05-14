@@ -136,10 +136,27 @@ public final class CaKeyStore
      * If a {@code readerPub} is provided, it is stored alongside the CA
      * keypair so the App side can later verify the reader signature at
      * AUTH1 time per §8.3.3.4.5 without requiring the cert in every
-     * transaction. If an entry already exists for this group_id and the
-     * caller provides a {@code readerPub}, the stored reader pub is
-     * UPDATED to the new value (most-recently-enrolled wins). Pass null
-     * for {@code readerPub} to leave any stored value untouched.
+     * transaction.
+     *
+     * Re-enrollment behavior (group_id already known): when the caller
+     * provides a {@code readerPub} that differs from the stored value, this
+     * is treated as a fresh enrollment for the same group_id — the existing
+     * entry is REPLACED in full: a new CA keypair is generated and the
+     * stored reader pub is updated to the new value. Most-recently-enrolled
+     * wins for both fields, not just readerPub. This matches user
+     * expectation that re-running the cert-enrollment flow on a reader
+     * whose keys have rotated produces a clean state on the credential.
+     *
+     * Spec note: Aliro §6.2 explicitly places "provisioning operations
+     * including lifecycle management" out of scope, so the spec does not
+     * constrain re-enrollment semantics. Hostile-overwrite risk is
+     * mitigated by the EnrollmentConfirmActivity user-approval gate: every
+     * 0xE2 enrollment requires explicit user approval before reaching this
+     * method, so a rogue reader cannot silently displace stored keys.
+     *
+     * Pass null for {@code readerPub} (or use the no-readerPub overload)
+     * to keep the legacy "lookup or create, do not modify existing"
+     * behavior — used by paths that don't have the reader pub on hand.
      *
      * @param context  Android context (any).
      * @param groupId  16-byte reader_group_identifier.
@@ -162,22 +179,34 @@ public final class CaKeyStore
         CaKeyEntry existing = getCAKeyInternal(context, groupId);
         if (existing != null)
         {
-            // If caller provided a reader pub and it differs from what's
-            // stored, update the stored value (most-recently-enrolled wins).
-            // This is fine for single-reader-per-group_id deployments; in
-            // fleet deployments where multiple readers share a group_id the
-            // stored reader pub becomes ambiguous and the App side will
-            // need to rely on cert-in-AUTH1 instead (which is unaffected
-            // by the value stored here).
+            // Re-enrollment with a different reader pub for the same group_id:
+            // treat as a fresh enrollment and replace the whole entry,
+            // including the CA keypair. Without this, the credential keeps
+            // using the original CA pub key as the HKDF salt rgi_key while
+            // the reader (which rotated its CA on re-enrollment) uses the
+            // new one — SKDevice diverges and AUTH1 GCM fails on the reader
+            // side. See §6.2 note in the method javadoc for spec compliance.
             if (readerPub != null && !java.util.Arrays.equals(readerPub, existing.readerPub))
             {
-                CaKeyEntry updated = new CaKeyEntry(
-                        existing.groupId, existing.caPriv, existing.caPub,
-                        readerPub.clone(), existing.createdAtMs, existing.label);
-                persistReplace(context, updated);
-                AliroDiagnosticLog.d(TAG, "getOrCreateCAKey: updated readerPub on existing entry for groupId="
-                        + Hex.toHexString(groupId).substring(0, 8) + "...");
-                return updated;
+                KeyPair  newKp     = generateP256KeyPair();
+                byte[]   newCaPub  = uncompressedPub(newKp);
+                byte[]   newCaPriv = privateScalar(newKp);
+                long     now       = System.currentTimeMillis();
+
+                CaKeyEntry replaced = new CaKeyEntry(
+                        existing.groupId,
+                        newCaPriv,
+                        newCaPub,
+                        readerPub.clone(),
+                        now,
+                        existing.label);    // preserve user-facing label
+                persistReplace(context, replaced);
+                AliroDiagnosticLog.i(TAG, "getOrCreateCAKey: re-enrollment for groupId="
+                        + Hex.toHexString(groupId).substring(0, 8) + "..."
+                        + " — replaced CA keypair and readerPub"
+                        + " (oldCaPubX=" + Hex.toHexString(existing.caPub).substring(2, 18) + "..."
+                        + ", newCaPubX=" + Hex.toHexString(newCaPub).substring(2, 18) + "...)");
+                return replaced;
             }
             AliroDiagnosticLog.d(TAG, "getOrCreateCAKey: existing entry for groupId="
                     + Hex.toHexString(groupId).substring(0, 8) + "...");
