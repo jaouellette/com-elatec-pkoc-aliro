@@ -127,6 +127,60 @@ public class AliroAccessDocumentVerifier {
         revokedKeyHashes.clear();
     }
 
+    // -------------------------------------------------------------------------
+    // Reader-intended capability (§7.3.3 Table 7-7)
+    //
+    // An AccessRule's Capabilities bitmask declares which interaction modes
+    // the rule authorizes; the verifier rejects rules that don't authorize
+    // the mode this reader is currently performing. For an Aliro NFC/BLE tap
+    // (AUTH0/AUTH1 secure channel + EXCHANGE) that mode is Secure (bit 0) —
+    // the entire transaction runs inside the derived session keys. Unsecure
+    // (bit 1) covers legacy/proximity-only operation without a secure session;
+    // Momentary_Unsecure (bit 3) is the brief-unlock variant of Unsecure.
+    //
+    // The reader simulator only performs Secure taps today, so that's the
+    // default. The setter exists so the self-test harness (and any future
+    // mode-switch UI) can exercise rules gated on the other capability bits.
+    // -------------------------------------------------------------------------
+    /** Capability bit 0 — Secure (secure-channel transaction; default for taps). */
+    public static final int CAP_SECURE             = 0x01;
+    /** Capability bit 1 — Unsecure (no secure session; legacy proximity). */
+    public static final int CAP_UNSECURE           = 0x02;
+    /** Capability bit 3 — Momentary_Unsecure (brief unsecure unlock). */
+    public static final int CAP_MOMENTARY_UNSECURE = 0x08;
+
+    /**
+     * The capability bit this reader is asking the credential to authorize.
+     * Default {@link #CAP_SECURE} matches the only mode an Aliro tap can
+     * actually run today. Self-tests and future UI may flip it via
+     * {@link #setIntendedCapability(int)}.
+     */
+    private static int intendedCapability = CAP_SECURE;
+
+    /**
+     * Override the reader's intended capability bit used during AccessRule
+     * evaluation. Pass one of {@link #CAP_SECURE}, {@link #CAP_UNSECURE},
+     * or {@link #CAP_MOMENTARY_UNSECURE}.
+     */
+    public static void setIntendedCapability(int capabilityBit) {
+        intendedCapability = capabilityBit;
+    }
+
+    /** Return the currently configured reader-intended capability bit. */
+    public static int getIntendedCapability() {
+        return intendedCapability;
+    }
+
+    /** Human-readable name of a single capability bit, for log messages. */
+    private static String capabilityName(int capabilityBit) {
+        switch (capabilityBit) {
+            case CAP_SECURE:             return "Secure";
+            case CAP_UNSECURE:           return "Unsecure";
+            case CAP_MOMENTARY_UNSECURE: return "Momentary_Unsecure";
+            default: return "0x" + Integer.toHexString(capabilityBit);
+        }
+    }
+
     /**
      * Check if a public key is revoked.
      * @param pubKey Uncompressed public key (04 || x || y), 65 bytes.
@@ -1307,7 +1361,11 @@ public class AliroAccessDocumentVerifier {
      *
      * <p>An AccessRule is valid if NONE of the checks below invalidate it:
      * <ul>
-     *   <li>Capabilities (key 0): invalid if our intended action bit (Unsecure=bit 1) is NOT set.</li>
+     *   <li>Capabilities (key 0): invalid if the reader's intended capability bit
+     *       (see {@link #intendedCapability}, default {@link #CAP_SECURE}) is NOT
+     *       set in the rule's bitmask. An Aliro tap is a Secure transaction by
+     *       construction (AUTH0/AUTH1 derive session keys; EXCHANGE is encrypted),
+     *       so a rule that only authorizes Secure correctly authorizes a tap.</li>
      *   <li>AllowScheduleIds (key 1): invalid if none of the referenced schedules is in-range.</li>
      *   <li>DenyScheduleIds (key 2): invalid if ANY of the referenced schedules is in-range.</li>
      *   <li>If Allow/Deny present and timeVerificationRequired=true and Reader cannot validate
@@ -1402,17 +1460,23 @@ public class AliroAccessDocumentVerifier {
 
         boolean ruleValid = true;
 
-        // Check Capabilities (key 0)
-        // Our Reader intends "Unsecure" (bit 1) — a standard door unlock
+        // Check Capabilities (key 0) — §7.3.3 Table 7-7
+        // A rule authorizes the reader's transaction only if the rule's
+        // Capabilities bitmask includes the bit the reader is currently
+        // running as. For an Aliro tap that's CAP_SECURE; see the
+        // intendedCapability field comment for why.
         CBORObject capsObj = rule.get(CBORObject.FromObject(0));
         if (capsObj != null) {
             int caps = capsObj.AsInt32();
+            int required = intendedCapability;
             Log.d(TAG, "Step 8: AccessRule[" + ruleIndex + "] Capabilities=0x"
-                    + Integer.toHexString(caps));
-            boolean unsecureBitSet = (caps & (1 << 1)) != 0;
-            if (!unsecureBitSet) {
+                    + Integer.toHexString(caps)
+                    + " readerIntends=" + capabilityName(required)
+                    + " (0x" + Integer.toHexString(required) + ")");
+            if ((caps & required) == 0) {
                 Log.d(TAG, "Step 8: AccessRule[" + ruleIndex
-                        + "] Capabilities does not include Unsecure (bit 1) — rule invalid");
+                        + "] Capabilities does not include "
+                        + capabilityName(required) + " — rule invalid");
                 ruleValid = false;
             }
         }

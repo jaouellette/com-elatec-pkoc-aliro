@@ -560,6 +560,12 @@ public class Aliro_HostApduService extends HostApduService
         state = State.SELECTED;
         AliroDiagnosticLog.d(TAG, "SELECT OK");
 
+        // Transaction has begun — show the "reading" feedback now so the user
+        // knows the tap registered and to hold the phone still through the
+        // multi-second exchange. Safe to call on every SELECT in a tap (the
+        // activity is single-top; repeats just re-assert the reading state).
+        AliroTransactionFeedback.notifyTransactionStarted(this);
+
         // Response: SELECT_RESPONSE + SW 9000
         byte[] response = new byte[SELECT_RESPONSE.length + 2];
         System.arraycopy(SELECT_RESPONSE, 0, response, 0, SELECT_RESPONSE.length);
@@ -2919,9 +2925,16 @@ public class Aliro_HostApduService extends HostApduService
                     return SW_ERROR;
                 }
                 byte[] encryptedRequest = dataIn.GetByteString();
-                // Decrypt with suSKReader (reader→credential, same IV as §8.3.1.9)
+                // Decrypt with suSKReader (reader→credential).
+                // Per ISO 18013-5 §9.1.1.5: the message counter is per-session-key
+                // and advances across every encryption with that key. StepUpSKReader
+                // is shared between step-up ENVELOPE and step-up EXCHANGE, so they
+                // share the same counter sequence. Use the running stepUpReaderCounter
+                // with post-increment (starts at 1, advances on each use).
+                int envReaderCounter = stepUpReaderCounter++;
+                AliroDiagnosticLog.d(TAG, "ENVELOPE: decrypting DeviceRequest with stepUpReaderCounter=" + envReaderCounter);
                 byte[] deviceRequest = com.psia.pkoc.core.AliroCryptoProvider
-                        .decryptReaderGcm(suSKReader, encryptedRequest);
+                        .decryptReaderGcm(suSKReader, encryptedRequest, envReaderCounter);
                 if (deviceRequest == null)
                 {
                     AliroDiagnosticLog.e(TAG, "ENVELOPE: DeviceRequest AES-GCM authentication failed — failure process");
@@ -2940,10 +2953,16 @@ public class Aliro_HostApduService extends HostApduService
                     return SW_ERROR;
                 }
 
-                // Step 4: Encrypt DeviceResponse with suSKDevice and wrap in SessionData
-                //   Device encrypts with SKDevice, IV=0x00000000_00000001_00000001
+                // Step 4: Encrypt DeviceResponse with suSKDevice and wrap in SessionData.
+                // Per ISO 18013-5 §9.1.1.5: the message counter is per-session-key
+                // and advances across every encryption with that key. StepUpSKDevice
+                // is shared between step-up ENVELOPE response and step-up EXCHANGE
+                // response, so they share the same counter sequence. Use the running
+                // stepUpDeviceCounter with post-increment.
+                int envDeviceCounter = stepUpDeviceCounter++;
+                AliroDiagnosticLog.d(TAG, "ENVELOPE: encrypting DeviceResponse with stepUpDeviceCounter=" + envDeviceCounter);
                 byte[] encryptedResponse = com.psia.pkoc.core.AliroCryptoProvider
-                        .encryptDeviceGcm(suSKDevice, deviceResponse);
+                        .encryptDeviceGcm(suSKDevice, deviceResponse, envDeviceCounter);
                 if (encryptedResponse == null)
                 {
                     AliroDiagnosticLog.e(TAG, "ENVELOPE: DeviceResponse encryption failed — failure process");
@@ -2985,18 +3004,22 @@ public class Aliro_HostApduService extends HostApduService
                 }
                 AliroDiagnosticLog.d(TAG, "ENVELOPE: response wrapped in tag 0x53 (" + wrapped.length + " bytes total)");
 
-                // Step 6b: Save step-up session keys for subsequent EXCHANGE commands.
+// Step 6b: Save step-up session keys for subsequent EXCHANGE commands.
                 // Per Aliro §8.3.3.5: "The EXCHANGE command uses ... StepUpSKDevice
                 // and StepUpSKReader when in the step-up phase."
                 // These keys are derived from StepUpSK with HKDF info="SKReader"/"SKDevice".
                 stepUpSKReader = Arrays.copyOf(suSKReader, suSKReader.length);
                 stepUpSKDevice = Arrays.copyOf(suSKDevice, suSKDevice.length);
                 inStepUpPhase = true;
-                // Step-up EXCHANGE counters start fresh at 1.
-                // ENVELOPE uses counter 1 for both directions, so EXCHANGE starts at 2.
-                stepUpReaderCounter = 2;
-                stepUpDeviceCounter = 2;
-                AliroDiagnosticLog.d(TAG, "ENVELOPE: step-up phase keys saved for subsequent EXCHANGE");
+                // Counters are NOT reset here. Per ISO 18013-5 §9.1.1.5 the
+                // message counter is per session key and a value shall never
+                // be reused with the same key. ENVELOPE just consumed and
+                // incremented stepUpReaderCounter and stepUpDeviceCounter;
+                // the subsequent step-up EXCHANGE (or a further step-up ENVELOPE
+                // in Flow 0) continues from the next value in the same sequence.
+                AliroDiagnosticLog.d(TAG, "ENVELOPE: step-up phase keys saved for subsequent EXCHANGE"
+                        + " (next stepUpReaderCounter=" + stepUpReaderCounter
+                        + ", next stepUpDeviceCounter=" + stepUpDeviceCounter + ")");
 
                 // Step 7: Prepare chunked GET RESPONSE
                 pendingGetResponse    = wrapped;

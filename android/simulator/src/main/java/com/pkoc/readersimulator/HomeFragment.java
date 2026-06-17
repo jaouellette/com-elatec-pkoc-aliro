@@ -1429,6 +1429,7 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                 Log.i(TAG, "Version: " + Arrays.toString(version));
                 byte[] readerId = UuidConverters.fromUuid(readerUUID);
                 byte[] siteId = UuidConverters.fromUuid(siteUUID);
+                Log.d(TAG, "Site ID bytes on wire: " + org.bouncycastle.util.encoders.Hex.toHexString(siteId));
 
                 byte[] versionTLV = TLVProvider.GetBleTLV(BLE_PacketType.ProtocolVersion, version);
                 byte[] transientPublicKeyTLV = TLVProvider.GetBleTLV(BLE_PacketType.CompressedTransientPublicKey, compressedTransientPublicKey);

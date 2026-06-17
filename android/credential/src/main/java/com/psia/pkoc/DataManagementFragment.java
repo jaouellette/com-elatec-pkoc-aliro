@@ -7,6 +7,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.os.Bundle;
 import android.text.TextUtils;
+import android.util.Log;
 import android.view.LayoutInflater;
 import android.view.View;
 import android.view.ViewGroup;
@@ -129,6 +130,8 @@ public class DataManagementFragment extends Fragment
         }
 
         byte[] siteId = UuidConverters.fromUuid(UUID.fromString(siteUuidString));
+        Log.d("SiteDB", "Site ID bytes stored: " + org.bouncycastle.util.encoders.Hex.toHexString(siteId));
+
         byte[] pubKey = Hex.decode(pubKeyHex);
 
         PKOC_Application.getDb().getQueryExecutor().execute(() ->

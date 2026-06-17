@@ -40,8 +40,10 @@ import java.security.KeyPairGenerator;
 import java.security.KeyStore;
 import java.security.MessageDigest;
 import java.security.PrivateKey;
+import java.security.PublicKey;
 import java.security.Signature;
 import java.security.cert.Certificate;
+import java.security.interfaces.ECPublicKey;
 import java.security.spec.ECGenParameterSpec;
 import java.security.spec.ECPublicKeySpec;
 import java.util.Objects;
@@ -413,6 +415,35 @@ public class CryptoProvider
             KeyStore ks = KeyStore.getInstance(AndroidKeyStore);
             ks.load(null);
             KeyStore.Entry entry = ks.getEntry(PKOC_Preferences.PKOC_CredentialSet, null);
+
+            // Diagnostic: dump the public key that corresponds to the private key
+            // we're about to sign with. This tells us, from the signing side,
+            // exactly which key to put in the verifier's Site Public Key field.
+            try
+            {
+                PublicKey pub = ((KeyStore.PrivateKeyEntry) entry).getCertificate().getPublicKey();
+                if (pub instanceof ECPublicKey)
+                {
+                    ECPublicKey ec = (ECPublicKey) pub;
+                    BigInteger x = ec.getW().getAffineX();
+                    BigInteger y = ec.getW().getAffineY();
+                    byte[] xb = BigIntegers.asUnsignedByteArray(32, x);
+                    byte[] yb = BigIntegers.asUnsignedByteArray(32, y);
+                    byte[] enc = new byte[65];
+                    enc[0] = 0x04;
+                    arraycopy(xb, 0, enc, 1, 32);
+                    arraycopy(yb, 0, enc, 33, 32);
+                    Log.d(TAG, "Signing with pubKey=" + Hex.toHexString(enc));
+                }
+                else
+                {
+                    Log.d(TAG, "Signing with non-EC public key: " + pub);
+                }
+            }
+            catch (Exception diag)
+            {
+                Log.w(TAG, "Could not dump signing public key", diag);
+            }
 
             Signature s = Signature.getInstance(KeyAndHashAlgorithm);
             s.initSign(((KeyStore.PrivateKeyEntry) entry).getPrivateKey());

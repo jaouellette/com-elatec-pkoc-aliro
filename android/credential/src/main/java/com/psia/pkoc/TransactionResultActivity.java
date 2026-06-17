@@ -3,6 +3,7 @@ package com.psia.pkoc;
 import android.app.Activity;
 import android.app.KeyguardManager;
 import android.content.Context;
+import android.content.Intent;
 import android.graphics.Color;
 import android.os.Build;
 import android.os.Bundle;
@@ -14,44 +15,74 @@ import android.view.ViewGroup;
 import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.LinearLayout;
+import android.widget.ProgressBar;
 import android.widget.TextView;
 
 /**
- * Full-screen result display for a completed Aliro credential transaction.
+ * Full-screen display for an Aliro credential transaction.
  *
- * Launched two ways:
+ * Two phases are shown by the same activity instance:
  *
- *   1. Tap on the heads-up notification — normal activity start.
- *   2. Full-screen intent from {@link AliroTransactionFeedback} — Android
- *      auto-launches this activity over the lock screen if USE_FULL_SCREEN_INTENT
- *      is granted. This is the path that gives the user the "phone in pocket,
- *      tap to reader, screen lights up showing GRANTED/DENIED" experience.
+ *   1. IN PROGRESS ("reading") — launched by
+ *      {@link AliroTransactionFeedback#notifyTransactionStarted(Context)} the
+ *      moment the reader SELECTs the credential. A neutral screen with a
+ *      spinner and "Hold your phone on the reader" tells the user the tap was
+ *      detected and to keep still. This is the feedback that was previously
+ *      missing during the multi-second exchange.
  *
- * The activity dismisses itself after a few seconds, but the user can also
- * tap anywhere or use the Dismiss button to close immediately.
+ *   2. RESULT (granted / denied) — the existing completion path
+ *      ({@link AliroTransactionFeedback#notifyTransactionComplete}) re-launches
+ *      this activity (SINGLE_TOP) with the result extras. Because the activity
+ *      is already on top showing "reading", that arrives via {@link #onNewIntent}
+ *      and flips the same screen to GRANTED/DENIED in place — no second window.
  *
- * UI is built in code rather than XML so we don't introduce another resource
- * file. The visual is intentionally simple: full-screen colored background
- * with a large text label.
+ * Launched the same two ways as before (notification tap, or full-screen intent
+ * over the lock screen). UI is built in code to avoid adding a resource file.
+ *
+ * One physical tap can produce several SELECTs (e.g. a primary-identity reject
+ * followed by a secondary-identity retry). Each fires notifyTransactionStarted,
+ * but since the activity is single-top those just re-render the same "reading"
+ * state, so there is no flicker or relaunch.
  */
 public class TransactionResultActivity extends Activity
 {
-    /** Boolean extra: true if access was granted. */
+    /** Boolean extra: true if access was granted (result phase). */
     public static final String EXTRA_GRANTED       = "granted";
     /** Int extra: reader state byte from the 0x97 status TLV (or -1 if absent). */
     public static final String EXTRA_READER_STATE  = "readerState";
+    /** Boolean extra: true while the transaction is still running (reading phase). */
+    public static final String EXTRA_IN_PROGRESS   = "inProgress";
 
-    /** Auto-dismiss timeout — long enough to read, short enough to be unobtrusive. */
-    private static final long AUTO_DISMISS_MS = 4000L;
+    /**
+     * The RESULT phase does NOT auto-dismiss. It stays until the user closes it
+     * (tap, Dismiss button, or system finish), so the reader re-initiating the
+     * next transaction can't flash the Admit/Deny result away. While a result
+     * is up, {@link AliroTransactionFeedback} suppresses the next reading
+     * screen; closing this window re-arms it via
+     * {@link AliroTransactionFeedback#onResultDismissed()}.
+     */
+    /**
+     * Safety timeout for the IN-PROGRESS phase. If no result arrives within
+     * this window (e.g. the user pulled the phone away before the read
+     * completed, so the reader never sent a status), dismiss rather than
+     * leaving a spinner on screen forever. Generous enough to cover a slow
+     * double step-up plus a re-tap.
+     */
+    private static final long PROGRESS_TIMEOUT_MS = 12000L;
+
+    private final Handler handler = new Handler(Looper.getMainLooper());
+
+    /** True when the currently shown phase is a result (granted/denied). */
+    private boolean showingResult = false;
 
     @Override
     protected void onCreate(Bundle savedInstanceState)
     {
         super.onCreate(savedInstanceState);
 
-        // Show this activity over the lock screen and turn the screen on.
-        // Required for the full-screen intent path to actually be visible
-        // when the phone was in the user's pocket at tap time.
+        // Show over the lock screen and turn the screen on, so both the
+        // "reading" and result phases are visible when the phone was idle at
+        // tap time.
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1)
         {
             setShowWhenLocked(true);
@@ -67,24 +98,96 @@ public class TransactionResultActivity extends Activity
                   | WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         }
 
-        boolean granted     = getIntent().getBooleanExtra(EXTRA_GRANTED, false);
-        int     readerState = getIntent().getIntExtra(EXTRA_READER_STATE, -1);
+        render(getIntent());
+    }
 
-        // Build the layout programmatically.
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setGravity(Gravity.CENTER);
-        // Green for granted, red for denied. Strong/saturated tones to be
-        // unambiguous at a glance.
-        root.setBackgroundColor(granted ? 0xFF1B7F38 : 0xFFB31B1B);
-        root.setPadding(48, 48, 48, 48);
-        root.setLayoutParams(new ViewGroup.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT));
-        // Tap-anywhere to dismiss.
+    /**
+     * A new intent for the already-showing activity (single-top). This is how
+     * the result phase replaces the reading phase, and how repeated SELECTs in
+     * one tap re-assert the reading phase without spawning a new window.
+     */
+    @Override
+    protected void onNewIntent(Intent intent)
+    {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        render(intent);
+    }
+
+    /** (Re)build the screen for whichever phase the intent describes. */
+    private void render(Intent intent)
+    {
+        // Drop any pending dismiss from a previous phase before scheduling the
+        // one that matches the phase we're about to show.
+        handler.removeCallbacksAndMessages(null);
+
+        boolean inProgress = intent != null && intent.getBooleanExtra(EXTRA_IN_PROGRESS, false);
+        if (inProgress)
+        {
+            showingResult = false;
+            renderProgress();
+            // Don't linger forever if the read is abandoned mid-flight.
+            handler.postDelayed(this::finishAndRemoveTask, PROGRESS_TIMEOUT_MS);
+            return;
+        }
+
+        showingResult = true;
+        boolean granted     = intent != null && intent.getBooleanExtra(EXTRA_GRANTED, false);
+        int     readerState = intent != null ? intent.getIntExtra(EXTRA_READER_STATE, -1) : -1;
+        renderResult(granted, readerState);
+        // No auto-dismiss: the result stays until the user closes it (see
+        // onDestroy, which re-arms the reading screen for the next tap).
+    }
+
+    // -------------------------------------------------------------------------
+    // Reading phase
+    // -------------------------------------------------------------------------
+
+    private void renderProgress()
+    {
+        LinearLayout root = newRoot(0xFF1F3A5F); // deep neutral blue — clearly "working", not a verdict
+
+        ProgressBar spinner = new ProgressBar(this);
+        spinner.setIndeterminate(true);
+        LinearLayout.LayoutParams spLp = new LinearLayout.LayoutParams(120, 120);
+        spLp.bottomMargin = 36;
+        spinner.setLayoutParams(spLp);
+        root.addView(spinner);
+
+        TextView title = new TextView(this);
+        title.setText("READING\u2026");
+        title.setTextSize(36f);
+        title.setTextColor(Color.WHITE);
+        title.setGravity(Gravity.CENTER);
+        title.setTypeface(title.getTypeface(), android.graphics.Typeface.BOLD);
+        root.addView(title);
+
+        TextView sub = new TextView(this);
+        sub.setText("Hold your phone on the reader");
+        sub.setTextSize(16f);
+        sub.setTextColor(0xCCFFFFFF);
+        sub.setGravity(Gravity.CENTER);
+        LinearLayout.LayoutParams subLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        subLp.topMargin = 24;
+        sub.setLayoutParams(subLp);
+        root.addView(sub);
+
+        // No Dismiss button and no tap-to-dismiss here: dismissing mid-read
+        // would defeat the purpose. The safety timeout handles abandonment.
+        setContentView(root);
+    }
+
+    // -------------------------------------------------------------------------
+    // Result phase
+    // -------------------------------------------------------------------------
+
+    private void renderResult(boolean granted, int readerState)
+    {
+        LinearLayout root = newRoot(granted ? 0xFF1B7F38 : 0xFFB31B1B);
+        // Tap-anywhere to dismiss, as before.
         root.setOnClickListener(v -> finishAndRemoveTask());
 
-        // Main label.
         TextView title = new TextView(this);
         title.setText(granted ? "ACCESS GRANTED" : "ACCESS DENIED");
         title.setTextSize(40f);
@@ -93,37 +196,52 @@ public class TransactionResultActivity extends Activity
         title.setTypeface(title.getTypeface(), android.graphics.Typeface.BOLD);
         root.addView(title);
 
-        // Sub-label with reader state if we have one.
         TextView sub = new TextView(this);
         sub.setText(buildSubtitle(granted, readerState));
         sub.setTextSize(16f);
-        sub.setTextColor(0xCCFFFFFF); // 80% white
+        sub.setTextColor(0xCCFFFFFF);
         sub.setGravity(Gravity.CENTER);
         LinearLayout.LayoutParams subLp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT);
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         subLp.topMargin = 24;
         sub.setLayoutParams(subLp);
         root.addView(sub);
 
-        // Dismiss button. Big and obvious. The auto-dismiss timer will also
-        // close the activity, so this is just for users who want it gone now.
         Button dismiss = new Button(this);
         dismiss.setText("DISMISS");
         dismiss.setOnClickListener(v -> finishAndRemoveTask());
         LinearLayout.LayoutParams btnLp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT);
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         btnLp.topMargin = 48;
         dismiss.setLayoutParams(btnLp);
         root.addView(dismiss);
 
         setContentView(root);
+    }
 
-        // Auto-dismiss after AUTO_DISMISS_MS unless the user interacts with
-        // the dismiss button first. finishAndRemoveTask() is safe to call
-        // even if the activity is already finishing.
-        new Handler(Looper.getMainLooper()).postDelayed(this::finishAndRemoveTask, AUTO_DISMISS_MS);
+    private LinearLayout newRoot(int bgColor)
+    {
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setGravity(Gravity.CENTER);
+        root.setBackgroundColor(bgColor);
+        root.setPadding(48, 48, 48, 48);
+        root.setLayoutParams(new ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        return root;
+    }
+
+    @Override
+    protected void onDestroy()
+    {
+        handler.removeCallbacksAndMessages(null);
+        // If the user is closing a result window (not a config-change recreate,
+        // and not the reading phase), re-arm the reading screen for the next tap.
+        if (isFinishing() && showingResult)
+        {
+            AliroTransactionFeedback.onResultDismissed();
+        }
+        super.onDestroy();
     }
 
     private static String buildSubtitle(boolean granted, int readerState)

@@ -14,6 +14,8 @@ import android.os.Looper;
 
 import com.psia.pkoc.core.AliroDiagnosticLog;
 
+import java.util.concurrent.atomic.AtomicBoolean;
+
 /**
  * Post-transaction user feedback for Aliro credential exchanges.
  *
@@ -66,6 +68,25 @@ public final class AliroTransactionFeedback
     private static final int TONE_HIGH = ToneGenerator.TONE_PROP_BEEP;
     private static final int TONE_LOW  = ToneGenerator.TONE_PROP_BEEP2;
 
+    /**
+     * True while a RESULT (granted/denied) screen is up and not yet dismissed
+     * by the user. While set, we suppress the "reading" screen for any new
+     * transaction the reader starts, so the Admit/Deny result stays put instead
+     * of being flashed away by the next read. Cleared by
+     * {@link #onResultDismissed()} when the user closes the result window.
+     */
+    private static final AtomicBoolean sResultOnScreen = new AtomicBoolean(false);
+
+    /**
+     * Called by {@link TransactionResultActivity} when the user closes a result
+     * screen (tap, Dismiss button, or the activity otherwise finishing). Re-arms
+     * the reading screen for the next tap.
+     */
+    public static void onResultDismissed()
+    {
+        sResultOnScreen.set(false);
+    }
+
     private AliroTransactionFeedback() { /* static-only */ }
 
     /**
@@ -82,6 +103,10 @@ public final class AliroTransactionFeedback
     {
         if (ctx == null) return;
         final Context appCtx = ctx.getApplicationContext();
+
+        // A result is now on screen; keep it there (suppress the next reading
+        // screen) until the user dismisses it.
+        sResultOnScreen.set(true);
 
         // Posting tone playback to a worker thread keeps the HCE main thread
         // free. Even if ToneGenerator allocation only takes a few ms, that's
@@ -115,6 +140,61 @@ public final class AliroTransactionFeedback
             catch (Throwable t)
             {
                 AliroDiagnosticLog.w(TAG, "visual feedback failed", t);
+            }
+        });
+    }
+
+    /**
+     * Show the "reading" feedback the moment a transaction begins (the reader
+     * SELECTs the credential), so the user knows the tap registered and to keep
+     * the phone still during the multi-second exchange. The result phase
+     * ({@link #notifyTransactionComplete}) later flips the same activity to
+     * GRANTED / DENIED.
+     *
+     * Safe to call from the HCE service thread and safe to call repeatedly
+     * within one tap (the activity is single-top, so repeat calls just re-show
+     * the reading state). No tone here — the tone belongs to the result.
+     *
+     * Best-effort: if a direct activity launch is blocked (app fully in the
+     * background, screen off in a pocket), we simply skip the progress screen;
+     * the result phase still fires normally on completion. We deliberately do
+     * NOT post a progress notification, to avoid notification churn for a state
+     * that lasts only a couple of seconds.
+     *
+     * @param ctx any Context (application context is used)
+     */
+    public static void notifyTransactionStarted(Context ctx)
+    {
+        if (ctx == null) return;
+        final Context appCtx = ctx.getApplicationContext();
+
+        // If a result (Admit/Deny) is still on screen and the user hasn't
+        // closed it yet, do NOT replace it with a reading screen for the next
+        // transaction. The reader re-initiates as long as the phone is near it,
+        // and without this the result would flash past into the next "reading".
+        if (sResultOnScreen.get())
+        {
+            AliroDiagnosticLog.d(TAG, "Reading-phase suppressed: result still on screen (awaiting dismiss)");
+            return;
+        }
+
+        new Handler(Looper.getMainLooper()).post(() ->
+        {
+            try
+            {
+                Intent progressIntent = new Intent(appCtx, TransactionResultActivity.class);
+                progressIntent.putExtra(TransactionResultActivity.EXTRA_IN_PROGRESS, true);
+                progressIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
+                                      | Intent.FLAG_ACTIVITY_CLEAR_TOP
+                                      | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+                appCtx.startActivity(progressIntent);
+                AliroDiagnosticLog.d(TAG, "TransactionResultActivity launched (reading phase)");
+            }
+            catch (Throwable t)
+            {
+                // Background-start restrictions land here; not fatal — the
+                // result phase will still display when the read completes.
+                AliroDiagnosticLog.d(TAG, "Reading-phase launch skipped: " + t.getMessage());
             }
         });
     }

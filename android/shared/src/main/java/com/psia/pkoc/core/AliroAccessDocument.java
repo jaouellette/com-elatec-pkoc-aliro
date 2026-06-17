@@ -7,13 +7,29 @@ import android.util.Log;
 
 import com.upokecenter.cbor.CBORObject;
 
+import org.bouncycastle.asn1.ASN1EncodableVector;
+import org.bouncycastle.asn1.ASN1Integer;
+import org.bouncycastle.asn1.ASN1ObjectIdentifier;
+import org.bouncycastle.asn1.DERBitString;
+import org.bouncycastle.asn1.DERSequence;
+import org.bouncycastle.asn1.x500.X500Name;
+import org.bouncycastle.asn1.x509.AlgorithmIdentifier;
+import org.bouncycastle.asn1.x509.BasicConstraints;
+import org.bouncycastle.asn1.x509.Extension;
+import org.bouncycastle.asn1.x509.ExtensionsGenerator;
+import org.bouncycastle.asn1.x509.SubjectPublicKeyInfo;
+import org.bouncycastle.asn1.x509.TBSCertificate;
+import org.bouncycastle.asn1.x509.Time;
+import org.bouncycastle.asn1.x509.V3TBSCertificateGenerator;
 import org.bouncycastle.util.encoders.Hex;
 
+import java.math.BigInteger;
 import java.security.KeyFactory;
 import java.security.KeyPair;
 import java.security.MessageDigest;
 import java.security.PrivateKey;
 import java.security.PublicKey;
+import java.security.SecureRandom;
 import java.security.Signature;
 import java.security.interfaces.ECPublicKey;
 import java.security.spec.ECParameterSpec;
@@ -23,6 +39,7 @@ import java.security.spec.PKCS8EncodedKeySpec;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Date;
 import java.util.List;
 
 /**
@@ -112,6 +129,22 @@ public class AliroAccessDocument
     public static final String KEY_REVOC_ISSUER_PRIV_KEY = "aliro_revoc_doc_issuer_priv_key"; // PKCS#8 hex
     public static final String KEY_REVOC_ELEMENT_ID     = "aliro_revoc_doc_element_id";     // first element (back-compat)
     public static final String KEY_REVOC_ELEMENT_IDS    = "aliro_revoc_doc_element_ids";    // CSV of all elements
+
+    // Well-known issuer keypair (top-level, not per-document).
+    //
+    // Every Access Document the credential generates uses this same keypair
+    // as its Credential Issuer key, so the issuer public key (and therefore
+    // the kid and any x5chain cert subject key) stays stable across document
+    // regenerations. A reader provisioned with this public key as its trust
+    // anchor continues to accept new documents without re-provisioning.
+    //
+    // The keypair is created lazily on the first call to {@link #createNewDocument}
+    // and reused thereafter. It survives {@link #clearAllDocuments}; it is
+    // wiped only by Android-level "clear app data" or an explicit call to
+    // {@link #rotateWellKnownIssuerKeypair}.
+    public static final String KEY_WELLKNOWN_ISSUER_PUB_KEY  = "aliro_wellknown_issuer_pub_key";   // hex (65-byte uncompressed)
+    public static final String KEY_WELLKNOWN_ISSUER_PRIV_KEY = "aliro_wellknown_issuer_priv_key";  // PKCS#8 hex
+    public static final String KEY_WELLKNOWN_ISSUER_CREATED  = "aliro_wellknown_issuer_created_at"; // ISO-8601
 
     // Aliro doc type and namespace constants
     public static final String DOCTYPE_ACCESS      = "aliro-a";
@@ -382,6 +415,179 @@ public class AliroAccessDocument
         ed.apply();
     }
 
+    // =========================================================================
+    // Well-known issuer keypair (shared across all generated documents)
+    // =========================================================================
+
+    /**
+     * Get the well-known issuer keypair, creating and persisting one if it
+     * doesn't yet exist.
+     *
+     * <p>The well-known keypair is shared by every Access Document this
+     * credential generates. This keeps the issuer public key (and therefore
+     * the kid, and any x5chain cert subject key) stable across document
+     * regenerations, so a reader provisioned with this credential's issuer
+     * key does not need re-provisioning when the user taps Generate Test
+     * Document or Load Sample Document.
+     *
+     * <p>The keypair lives in the credential's SharedPreferences (top-level,
+     * not per-document), so it survives {@link #clearAllDocuments}. It is
+     * cleared only by an Android-level "clear app data" or by explicit
+     * {@link #rotateWellKnownIssuerKeypair}.
+     *
+     * @return the keypair, or {@code null} if generation/load failed
+     */
+    public static synchronized KeyPair getOrCreateWellKnownIssuerKeypair(Context context)
+    {
+        SharedPreferences prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+        String privHex = prefs.getString(KEY_WELLKNOWN_ISSUER_PRIV_KEY, "");
+        String pubHex  = prefs.getString(KEY_WELLKNOWN_ISSUER_PUB_KEY,  "");
+
+        // Try to reconstitute first.
+        if (!privHex.isEmpty() && !pubHex.isEmpty())
+        {
+            KeyPair kp = decodePersistedKeypair(privHex, pubHex);
+            if (kp != null) return kp;
+            Log.w(TAG, "Well-known issuer keypair on disk could not be decoded; regenerating.");
+        }
+
+        // Generate and persist.
+        try
+        {
+            KeyPair kp = AliroCryptoProvider.generateEphemeralKeypair();
+            if (kp == null)
+            {
+                Log.e(TAG, "Well-known issuer keypair: generator returned null");
+                return null;
+            }
+            byte[] pubBytes = uncompressedPoint((ECPublicKey) kp.getPublic());
+            String createdAt = Instant.now().toString();
+
+            prefs.edit()
+                    .putString(KEY_WELLKNOWN_ISSUER_PUB_KEY,  Hex.toHexString(pubBytes))
+                    .putString(KEY_WELLKNOWN_ISSUER_PRIV_KEY, Hex.toHexString(kp.getPrivate().getEncoded()))
+                    .putString(KEY_WELLKNOWN_ISSUER_CREATED,  createdAt)
+                    .apply();
+
+            Log.i(TAG, "Well-known issuer keypair created at " + createdAt
+                    + " kid=" + computeKidHex(pubBytes));
+            return kp;
+        }
+        catch (Exception e)
+        {
+            Log.e(TAG, "Well-known issuer keypair generation failed", e);
+            return null;
+        }
+    }
+
+    /**
+     * Returns the well-known issuer public key as 130-char uncompressed hex,
+     * or an empty string if the keypair has not been created yet. Does NOT
+     * lazily create — UI code can call this to display "not yet generated"
+     * without side effects.
+     */
+    public static String getWellKnownIssuerPublicKeyHex(Context context)
+    {
+        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .getString(KEY_WELLKNOWN_ISSUER_PUB_KEY, "");
+    }
+
+    /**
+     * Returns the well-known issuer kid (8-byte hex) per §7.2.1, or an
+     * empty string if the keypair has not been created yet.
+     */
+    public static String getWellKnownIssuerKidHex(Context context)
+    {
+        String hex = getWellKnownIssuerPublicKeyHex(context);
+        if (hex.isEmpty()) return "";
+        try { return computeKidHex(Hex.decode(hex)); }
+        catch (Exception e) { return ""; }
+    }
+
+    /**
+     * Returns the ISO-8601 timestamp at which the well-known issuer keypair
+     * was first generated, or empty if it has not been created yet.
+     */
+    public static String getWellKnownIssuerCreatedAt(Context context)
+    {
+        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .getString(KEY_WELLKNOWN_ISSUER_CREATED, "");
+    }
+
+    /**
+     * Force-regenerate the well-known issuer keypair. Use only for testing
+     * multi-issuer scenarios or for deliberately invalidating prior
+     * documents — readers provisioned with the previous public key will
+     * stop accepting documents generated after this call until they are
+     * re-provisioned with the new one.
+     *
+     * <p>Existing stored documents keep working: they were stored with their
+     * own per-document copy of the (then-current) issuer keypair, so their
+     * signatures and kids remain self-consistent. Only NEW documents created
+     * after this call will use the new keypair.
+     *
+     * @return new uncompressed public key hex (130 chars), or {@code null} on failure
+     */
+    public static synchronized String rotateWellKnownIssuerKeypair(Context context)
+    {
+        try
+        {
+            KeyPair kp = AliroCryptoProvider.generateEphemeralKeypair();
+            if (kp == null) return null;
+            byte[] pubBytes = uncompressedPoint((ECPublicKey) kp.getPublic());
+            String createdAt = Instant.now().toString();
+            String pubHex = Hex.toHexString(pubBytes);
+
+            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+                    .putString(KEY_WELLKNOWN_ISSUER_PUB_KEY,  pubHex)
+                    .putString(KEY_WELLKNOWN_ISSUER_PRIV_KEY, Hex.toHexString(kp.getPrivate().getEncoded()))
+                    .putString(KEY_WELLKNOWN_ISSUER_CREATED,  createdAt)
+                    .apply();
+
+            Log.i(TAG, "Well-known issuer keypair rotated at " + createdAt
+                    + " new kid=" + computeKidHex(pubBytes));
+            return pubHex;
+        }
+        catch (Exception e)
+        {
+            Log.e(TAG, "rotateWellKnownIssuerKeypair failed", e);
+            return null;
+        }
+    }
+
+    /**
+     * Reconstruct a {@link KeyPair} from PKCS#8 private-key hex + uncompressed
+     * public-key hex. Returns null on any decoding error.
+     */
+    private static KeyPair decodePersistedKeypair(String privHex, String pubHex)
+    {
+        try
+        {
+            byte[] privBytes = Hex.decode(privHex);
+            byte[] pubBytes  = Hex.decode(pubHex);
+            if (pubBytes.length != 65 || pubBytes[0] != 0x04) return null;
+
+            KeyFactory kf = KeyFactory.getInstance("EC");
+            PrivateKey priv = kf.generatePrivate(new PKCS8EncodedKeySpec(privBytes));
+
+            java.security.interfaces.ECPrivateKey ecPriv =
+                    (java.security.interfaces.ECPrivateKey) priv;
+            ECParameterSpec params = ecPriv.getParams();
+
+            byte[] x = Arrays.copyOfRange(pubBytes, 1, 33);
+            byte[] y = Arrays.copyOfRange(pubBytes, 33, 65);
+            ECPoint w = new ECPoint(new java.math.BigInteger(1, x),
+                                     new java.math.BigInteger(1, y));
+            PublicKey pub = kf.generatePublic(new ECPublicKeySpec(w, params));
+            return new KeyPair(pub, priv);
+        }
+        catch (Exception e)
+        {
+            Log.w(TAG, "decodePersistedKeypair failed: " + e.getMessage());
+            return null;
+        }
+    }
+
     /**
      * Mint a new document slot with a fresh issuer keypair. The slot starts
      * empty (no elements). Use {@link #addAccessElement(Context, byte[], String, String, int, AccessDocConfig)}
@@ -395,18 +601,28 @@ public class AliroAccessDocument
         try
         {
             migrateLegacyIfNeeded(context);
-            // Generate a fresh issuer keypair for THIS document. The keypair
-            // is what makes the document distinct from every other stored doc
-            // — its kid is derived from the public key, and that kid is what
-            // the reader uses to bind the document to a configured trust
-            // root.
-            KeyPair issuerKP = AliroCryptoProvider.generateEphemeralKeypair();
+            // Use (or lazily create) the well-known issuer keypair shared by
+            // every document this credential generates. Reusing one keypair
+            // means the kid stays the same across regenerations, so a reader
+            // provisioned with this credential's issuer public key keeps
+            // accepting documents without re-provisioning.
+            //
+            // Per Aliro 1.0 §7.7 a credential MAY carry documents from
+            // multiple issuers (different kids), but in this build all
+            // self-generated documents use the same one. If a caller wants
+            // to simulate a different issuer, use rotateWellKnownIssuerKeypair()
+            // first to spin a fresh well-known keypair.
+            KeyPair issuerKP = getOrCreateWellKnownIssuerKeypair(context);
             if (issuerKP == null) return null;
             byte[] issuerPubBytes = uncompressedPoint((ECPublicKey) issuerKP.getPublic());
 
             String docId = allocateDocId();
             SharedPreferences.Editor ed = context
                     .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit();
+            // Still write the per-document copy of the keypair so existing
+            // call sites (loadIssuerKeypair, getIssuerPubKeyHex, etc.) keep
+            // working unchanged. The values are identical across documents
+            // by design.
             ed.putString(docKey(KEY_ISSUER_PUB_KEY,  docId), Hex.toHexString(issuerPubBytes));
             ed.putString(docKey(KEY_ISSUER_PRIV_KEY, docId),
                          Hex.toHexString(issuerKP.getPrivate().getEncoded()));
@@ -717,7 +933,12 @@ public class AliroAccessDocument
                 .getString(docKey(KEY_DOC_MODE, docId), "");
     }
 
-    /** Clear every stored document and all per-document state. */
+    /** Clear every stored document and all per-document state. The
+     *  well-known issuer keypair is intentionally NOT cleared here — its
+     *  whole purpose is to outlive document churn so a reader provisioned
+     *  with its public key keeps working. Use
+     *  {@link #rotateWellKnownIssuerKeypair} to spin a fresh one, or
+     *  Android-level "clear app data" to wipe everything. */
     public static void clearAllDocuments(Context context)
     {
         for (String docId : getDocumentIds(context))
@@ -848,7 +1069,8 @@ public class AliroAccessDocument
             if (signature == null) return null;
 
             // 7. Build IssuerAuth = COSE_Sign1 array (NOT wrapped in CBOR tag 18)
-            CBORObject issuerAuth = buildCoseSign1(issuerPubBytes, msoBytes, signature);
+            CBORObject issuerAuth = buildCoseSign1(issuerPubBytes, issuerKP,
+                    now, until, msoBytes, signature);
 
             // 8. Build nameSpaces map: { "aliro-r": [#6.24(bstr(IssuerSignedItem))] }
             CBORObject nameSpaces = CBORObject.NewOrderedMap();
@@ -2003,7 +2225,8 @@ public class AliroAccessDocument
             byte[] signature = coseSign1(issuerKP.getPrivate(), msoBytes);
             if (signature == null) return null;
 
-            CBORObject issuerAuth = buildCoseSign1(issuerPubBytes, msoBytes, signature);
+            CBORObject issuerAuth = buildCoseSign1(issuerPubBytes, issuerKP,
+                    validFrom, validUntil, msoBytes, signature);
 
             CBORObject nameSpaces = CBORObject.NewOrderedMap();
             nameSpaces.Add(CBORObject.FromObject(NAMESPACE_ACCESS), itemsArray);
@@ -2114,9 +2337,22 @@ public class AliroAccessDocument
 
     /**
      * Rebuild the paired Revocation Document for the named stored document
-     * so it has one revocation entry per Access element. Uses a persistent
-     * revocation-issuer keypair (separate from the access-doc issuer
-     * keypair, but stable across edits *for this docId*).
+     * so it has one revocation entry per Access element.
+     *
+     * <p>Signed with the well-known issuer keypair — the SAME key used to
+     * sign Access Documents. Per Aliro 1.0 §7.6, the Revocation Document
+     * "SHALL have the same structure, cryptographic and verification
+     * requirements as the Access Document" and is "Issued by the Credential
+     * Issuer" (singular). Readers track {@code RevocationIteration} per
+     * Credential Issuer (§7.2.3) and configure trust anchors per Credential
+     * Issuer (§6), so binding both documents to the same issuer key lets a
+     * reader verify both with a single trust anchor — which is what
+     * integrators reasonably expect.
+     *
+     * <p>The per-doc {@code KEY_REVOC_ISSUER_PUB_KEY:&lt;docId&gt;} /
+     * {@code KEY_REVOC_ISSUER_PRIV_KEY:&lt;docId&gt;} prefs entries continue
+     * to be written for back-compat with any caller that reads them; their
+     * values are now identical to the well-known issuer keypair.
      */
     private static String rebuildRevocationDocument(Context context,
                                                      String docId,
@@ -2126,13 +2362,11 @@ public class AliroAccessDocument
         try
         {
             if (docId == null) return null;
-            // Load or generate the revocation issuer keypair scoped to this doc.
-            KeyPair revocKP = loadIssuerKeypair(context, docId, true);
-            if (revocKP == null)
-            {
-                revocKP = AliroCryptoProvider.generateEphemeralKeypair();
-                if (revocKP == null) return null;
-            }
+            // Sign with the well-known (Credential Issuer) keypair so the
+            // Revocation Document chains to the same trust anchor as the
+            // Access Document. Lazy-creates the keypair on first use.
+            KeyPair revocKP = getOrCreateWellKnownIssuerKeypair(context);
+            if (revocKP == null) return null;
             byte[] revocPubBytes = uncompressedPoint((ECPublicKey) revocKP.getPublic());
 
             // For revocation docs, body is { 0: 1 } version-only per Aliro §7.6
@@ -2165,7 +2399,8 @@ public class AliroAccessDocument
             byte[] signature = coseSign1(revocKP.getPrivate(), msoBytes);
             if (signature == null) return null;
 
-            CBORObject issuerAuth = buildCoseSign1(revocPubBytes, msoBytes, signature);
+            CBORObject issuerAuth = buildCoseSign1(revocPubBytes, revocKP,
+                    now, until, msoBytes, signature);
             CBORObject nameSpaces = CBORObject.NewOrderedMap();
             nameSpaces.Add(CBORObject.FromObject(NAMESPACE_REVOCATION), itemsArray);
 
@@ -2424,19 +2659,25 @@ public class AliroAccessDocument
             {
                 // Legacy two-rule / two-schedule shape, byte-identical to
                 // buildRealisticAccessData() (when employeeId="ELATEC001").
+                // LEGACY_END_PERIOD is retained only for buildRealisticAccessData(), which
+
+                // preserves the exact byte sequence of pre-v11 stored docs in the field.
+                // All preset construction (including WEEKDAY_AND_WEEKEND) uses
+                // FAR_FUTURE_END_PERIOD; the byte-identical objective lapsed when
+                // LEGACY_END_PERIOD itself passed (2026-04-30).
                 CBORObject rule0 = newAccessRule(CAP_FULL,    0x01); // weekday: full caps
                 CBORObject rule1 = newAccessRule(CAP_SECURE,  0x02); // weekend: secure only
                 accessRules = newArray(rule0, rule1);
 
                 CBORObject sched0 = newSchedule(
                         1745996400L,            // 2025-04-30 07:00 UTC
-                        LEGACY_END_PERIOD,
+                        FAR_FUTURE_END_PERIOD,  // was LEGACY_END_PERIOD (2026-04-30) — now expired
                         12 * 3600,
                         DAY_MON_FRI,
                         true);
                 CBORObject sched1 = newSchedule(
                         1746003600L,            // 2025-04-30 09:00 UTC
-                        LEGACY_END_PERIOD,
+                        FAR_FUTURE_END_PERIOD,  // was LEGACY_END_PERIOD (2026-04-30) — now expired
                         8 * 3600,
                         DAY_SAT_SUN,
                         true);
@@ -2872,10 +3113,36 @@ public class AliroAccessDocument
 
     /**
      * Build COSE_Sign1 array: [protected_header, unprotected_header, payload, signature]
-     * Protected header: { 1: -7 }  (alg = ES256)
-     * Unprotected header: { 4: kid }  where kid = first 8 bytes of SHA-256("key-identifier" || 0x04 || issuerPubKey)
+     * Protected header:   { 1: -7 }  (alg = ES256)
+     * Unprotected header: { 4: kid, 33: x5chain }
+     *
+     * <p>Per Aliro §7.2.1, IssuerAuth SHALL contain at least one of x5chain
+     * or kid and MAY contain both. We emit both so the Reader can use
+     * whichever it prefers (per §7.2.1, "If both are present the Reader
+     * decides which fields to use"). The x5chain is a self-signed X.509
+     * certificate carrying the issuer public key; this gives readers that
+     * support the CA path a cert to verify even when the credential acts
+     * as its own issuer.
+     *
+     * <p>kid is calculated per §7.2.1: first 8 bytes of
+     * SHA-256("key-identifier" || 0x04 || IssuerKey_PubK.x || IssuerKey_PubK.y).
+     *
+     * <p>x5chain (COSE header label 33, RFC 9360) is emitted as a single
+     * {@code bstr} containing the DER-encoded X.509 certificate. A single
+     * cert MAY be expressed as either a bstr or a one-element array; we use
+     * bstr for compact encoding. The reader-side verifier accepts both forms.
+     *
+     * @param issuerPubBytes  65-byte uncompressed issuer public key (used for kid)
+     * @param issuerKP        Issuer keypair (used to sign the self-signed cert)
+     * @param msoValidFrom    MSO validFrom — cert notBefore is set to slightly before this
+     * @param msoValidUntil   MSO validUntil — cert notAfter is set to slightly after this
+     * @param msoBytes        Encoded MobileSecurityObject (the COSE payload)
+     * @param signature       Raw 64-byte R||S ECDSA signature over the Sig_structure
      */
     private static CBORObject buildCoseSign1(byte[] issuerPubBytes,
+                                              KeyPair issuerKP,
+                                              Instant msoValidFrom,
+                                              Instant msoValidUntil,
                                               byte[] msoBytes,
                                               byte[] signature)
     {
@@ -2884,12 +3151,33 @@ public class AliroAccessDocument
         protectedHeader.Add(CBORObject.FromObject(1), CBORObject.FromObject(-7));
         byte[] protectedBytes = protectedHeader.EncodeToBytes();
 
-        // Unprotected header: kid per §7.2.1
-        byte[] kid = computeKid(issuerPubBytes);
+        // Unprotected header: kid (label 4) and x5chain (label 33) per §7.2.1.
+        // Emitting both is explicitly permitted; reader chooses.
         CBORObject unprotectedHeader = CBORObject.NewOrderedMap();
+
+        byte[] kid = computeKid(issuerPubBytes);
         if (kid != null)
         {
             unprotectedHeader.Add(CBORObject.FromObject(4), CBORObject.FromObject(kid));
+        }
+
+        // Cert validity is pinned to the MSO validity (with small skew margins),
+        // because the verifier (§7.4 step 5) checks that the MSO 'signed' date
+        // falls within the cert's notBefore/notAfter window.
+        Instant certNotBefore = msoValidFrom.minusSeconds(60);
+        Instant certNotAfter  = msoValidUntil.plusSeconds(60);
+        byte[] certDer = buildSelfSignedIssuerCert(issuerKP, issuerPubBytes,
+                certNotBefore, certNotAfter);
+        if (certDer != null)
+        {
+            // Single cert: emit as bstr (RFC 9360 permits bstr or array-of-bstr).
+            unprotectedHeader.Add(CBORObject.FromObject(33),
+                    CBORObject.FromObject(certDer));
+        }
+        else
+        {
+            Log.w(TAG, "buildCoseSign1: self-signed cert generation failed; "
+                    + "emitting kid-only (legacy behavior)");
         }
 
         // Per ISO 18013-5 §9.1.2.4, the payload is MobileSecurityObjectBytes =
@@ -2911,6 +3199,116 @@ public class AliroAccessDocument
         // Per ISO 18013-5, COSE_Sign1 tag is optional when type is known from context.
         return coseSign1;
     }
+
+    // OIDs used to build the self-signed issuer certificate.
+    private static final ASN1ObjectIdentifier OID_ECDSA_SHA256 =
+            new ASN1ObjectIdentifier("1.2.840.10045.4.3.2");
+    private static final ASN1ObjectIdentifier OID_EC_PUBLIC_KEY =
+            new ASN1ObjectIdentifier("1.2.840.10045.2.1");
+    private static final ASN1ObjectIdentifier OID_P256 =
+            new ASN1ObjectIdentifier("1.2.840.10045.3.1.7");
+
+    /**
+     * Build a self-signed X.509 v3 certificate wrapping the issuer public key.
+     * The cert is signed by the issuer's own private key (subject == issuer ==
+     * the Credential Issuer), so the same key acts as both leaf and CA. This
+     * lets readers that implement the CA-path (§7.4 step 1) verify the cert
+     * using the issuer public key they were provisioned with, then extract
+     * the same key from the cert and use it to verify the IssuerAuth signature.
+     *
+     * <p>The cert is intentionally minimal — single P-256 ECDSA signature
+     * algorithm, BasicConstraints(cA=false), and a random 16-byte serial.
+     * No intermediate certs are produced; this is a single-cert chain.
+     *
+     * @param issuerKP       Issuer keypair (both subject key and signing key)
+     * @param issuerPubBytes 65-byte uncompressed issuer public key
+     * @param notBefore      Cert validity start (must be <= MSO 'signed' date)
+     * @param notAfter       Cert validity end   (must be >= MSO 'signed' date)
+     * @return DER-encoded X.509 cert bytes, or null on failure
+     */
+    private static byte[] buildSelfSignedIssuerCert(KeyPair issuerKP,
+                                                     byte[] issuerPubBytes,
+                                                     Instant notBefore,
+                                                     Instant notAfter)
+    {
+        try
+        {
+            if (issuerKP == null || issuerKP.getPrivate() == null)
+            {
+                Log.w(TAG, "buildSelfSignedIssuerCert: no issuer KeyPair");
+                return null;
+            }
+            if (issuerPubBytes == null || issuerPubBytes.length != 65
+                    || issuerPubBytes[0] != 0x04)
+            {
+                Log.w(TAG, "buildSelfSignedIssuerCert: issuer public key is not "
+                        + "a 65-byte uncompressed P-256 point");
+                return null;
+            }
+
+            // Self-signed: subject == issuer. Use the kid in the CN to make
+            // the cert distinguishable across regenerations.
+            String kidHex = computeKidHex(issuerPubBytes);
+            String dn = "CN=Aliro Credential Issuer " + (kidHex != null ? kidHex : "");
+            X500Name subjectAndIssuer = new X500Name(dn);
+
+            // Random 16-byte positive serial.
+            SecureRandom rng = new SecureRandom();
+            byte[] serialBytes = new byte[16];
+            rng.nextBytes(serialBytes);
+            BigInteger serial = new BigInteger(1, serialBytes);
+
+            // SubjectPublicKeyInfo for the issuer's P-256 key.
+            AlgorithmIdentifier spkiAlg =
+                    new AlgorithmIdentifier(OID_EC_PUBLIC_KEY, OID_P256);
+            SubjectPublicKeyInfo spki = new SubjectPublicKeyInfo(spkiAlg, issuerPubBytes);
+
+            // Build TBSCertificate.
+            V3TBSCertificateGenerator tbsGen = new V3TBSCertificateGenerator();
+            tbsGen.setSerialNumber(new ASN1Integer(serial));
+            tbsGen.setSignature(new AlgorithmIdentifier(OID_ECDSA_SHA256));
+            tbsGen.setIssuer(subjectAndIssuer);
+            tbsGen.setStartDate(new Time(Date.from(notBefore)));
+            tbsGen.setEndDate(new Time(Date.from(notAfter)));
+            tbsGen.setSubject(subjectAndIssuer);
+            tbsGen.setSubjectPublicKeyInfo(spki);
+
+            // BasicConstraints: cA=false. Per §7.2.1 the cert is the
+            // Credential Issuer certificate; with a single-cert chain there
+            // is nothing below it, so it acts as an end-entity cert.
+            ExtensionsGenerator extGen = new ExtensionsGenerator();
+            extGen.addExtension(Extension.basicConstraints, false,
+                    new BasicConstraints(false));
+            tbsGen.setExtensions(extGen.generate());
+
+            TBSCertificate tbsCert = tbsGen.generateTBSCertificate();
+
+            // Sign the TBS with the issuer private key (ECDSA-SHA-256).
+            byte[] tbsDER = tbsCert.getEncoded();
+            Signature sig = Signature.getInstance("SHA256withECDSA");
+            sig.initSign(issuerKP.getPrivate());
+            sig.update(tbsDER);
+            byte[] sigDER = sig.sign();
+
+            // Assemble Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signatureValue }.
+            ASN1EncodableVector certVec = new ASN1EncodableVector();
+            certVec.add(tbsCert);
+            certVec.add(new AlgorithmIdentifier(OID_ECDSA_SHA256));
+            certVec.add(new DERBitString(sigDER));
+            byte[] certDer = new DERSequence(certVec).getEncoded();
+
+            Log.d(TAG, "buildSelfSignedIssuerCert: " + certDer.length
+                    + " bytes, subject=" + dn
+                    + " notBefore=" + notBefore + " notAfter=" + notAfter);
+            return certDer;
+        }
+        catch (Exception e)
+        {
+            Log.e(TAG, "buildSelfSignedIssuerCert failed", e);
+            return null;
+        }
+    }
+
 
     /**
      * Sign MobileSecurityObject bytes with ECDSA SHA-256 (ES256).

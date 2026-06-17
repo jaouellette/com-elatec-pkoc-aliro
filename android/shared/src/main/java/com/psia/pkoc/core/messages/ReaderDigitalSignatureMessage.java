@@ -88,6 +88,10 @@ public class ReaderDigitalSignatureMessage implements TransactionMessage<BLE_Pac
             return new SuccessResult();
         }
 
+        Log.d(TAG, "Verifying with sitePublicKey=" + org.bouncycastle.util.encoders.Hex.toHexString(sitePublicKey));
+        Log.d(TAG, "Verifying originalMessage  =" + org.bouncycastle.util.encoders.Hex.toHexString(originalMessage));
+        Log.d(TAG, "Verifying signature       =" + org.bouncycastle.util.encoders.Hex.toHexString(readerSignaturePacket.encode()));
+
         boolean readerValid = CryptoProvider.validateSignedMessage(
                 sitePublicKey,
                 originalMessage,
