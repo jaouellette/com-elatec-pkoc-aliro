@@ -50,7 +50,6 @@ public class DisplayPublicKeyFragment extends Fragment
             binding.keyOptionSpinner.setVisibility(View.INVISIBLE);
             binding.customKeyLengthInput.setVisibility(View.INVISIBLE);
             binding.publicKeyTextView.setVisibility(View.INVISIBLE);
-            binding.copyKeyButton.setVisibility(View.INVISIBLE);
             binding.instructionalTextForReader.setVisibility(View.VISIBLE);
 
             var publicKey = CryptoProvider.getUncompressedPublicKeyBytes();
@@ -61,8 +60,33 @@ public class DisplayPublicKeyFragment extends Fragment
                 obj.put("siteUuid", siteUUID);
                 obj.put("readerUuid", readerUUID);
                 obj.put("publicKey", Hex.toHexString(publicKey));
-                String jsonBlob = obj.toString();
+
+                // PKOC BLE ECDHE per-reader trust (v2.0.1 §7): include the Site
+                // Issuer key (and reader certificate) when provisioned, so the
+                // credential app can trust this reader by scanning this QR.
+                byte[] siteIssuerKey = PkocBleReaderCredential.getSiteIssuerPublicKey(requireContext());
+                if (siteIssuerKey != null)
+                {
+                    obj.put("siteIssuerKey", Hex.toHexString(siteIssuerKey));
+                }
+                byte[] cert = PkocBleReaderCredential.getReaderCertificateBytes(requireContext());
+                if (cert != null)
+                {
+                    obj.put("cert", Hex.toHexString(cert));
+                }
+
+                final String jsonBlob = obj.toString();
                 updateQRCode(jsonBlob);
+
+                // "Export" affordance: copy the full provisioning bundle.
+                binding.copyKeyButton.setVisibility(View.VISIBLE);
+                binding.copyKeyButton.setText("Copy provisioning bundle");
+                binding.copyKeyButton.setOnClickListener(v ->
+                {
+                    ClipboardManager clipboard = (ClipboardManager) requireContext().getSystemService(Context.CLIPBOARD_SERVICE);
+                    clipboard.setPrimaryClip(ClipData.newPlainText("PKOC provisioning", jsonBlob));
+                    Toast.makeText(requireContext(), "Provisioning bundle copied", Toast.LENGTH_SHORT).show();
+                });
             }
             catch (Exception e)
             {

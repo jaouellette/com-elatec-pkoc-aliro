@@ -15,6 +15,11 @@ public enum BLE_PacketType
     ProtocolVersion ((byte) 0x0C),
     ReaderLocationIdentifier ((byte) 0x0D),
     SiteIdentifier ((byte) 0x0E),
+    // PKOC BLE Transport Profile 2.0.1 §5.4 / §7.1: Site Issuer-signed Reader
+    // Certificate binding a Reader Public Key to a Reader Location Identifier.
+    // Present only on the per-reader (Validated) ECDHE path; a legacy reader
+    // omits it and the device falls back to the shared-Site-Key path (App. B).
+    ReaderCertificate ((byte) 0x10),
     EncryptedDataFollows ((byte) 0x40),
     ManufacturerSpecificData ((byte) 0x80);
 

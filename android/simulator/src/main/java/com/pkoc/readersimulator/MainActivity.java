@@ -57,6 +57,17 @@ public class MainActivity extends AppCompatActivity
     }
 
     @Override
+    public boolean onPrepareOptionsMenu(Menu menu)
+    {
+        MenuItem it = menu.findItem(R.id.action_pkoc_perreader_toggle);
+        if (it != null)
+        {
+            it.setChecked(com.psia.pkoc.core.PkocBleReaderCredential.isEnabled(this));
+        }
+        return super.onPrepareOptionsMenu(menu);
+    }
+
+    @Override
     public boolean onOptionsItemSelected(MenuItem item)
     {
         NavHostFragment navHostFragment = (NavHostFragment) getSupportFragmentManager().findFragmentById(R.id.nav_host_fragment);
@@ -95,6 +106,17 @@ public class MainActivity extends AppCompatActivity
         if (item.getItemId() == R.id.action_leaf_self_test)
         {
             startActivity(new Intent(this, LeafSelfTestActivity.class));
+            return true;
+        }
+
+        if (item.getItemId() == R.id.action_pkoc_perreader_toggle)
+        {
+            boolean on = !com.psia.pkoc.core.PkocBleReaderCredential.isEnabled(this);
+            com.psia.pkoc.core.PkocBleReaderCredential.setEnabled(this, on);
+            item.setChecked(on);
+            android.widget.Toast.makeText(this,
+                    "PKOC per-reader " + (on ? "ON (open Display Public Key to self-provision)" : "OFF"),
+                    android.widget.Toast.LENGTH_SHORT).show();
             return true;
         }
 

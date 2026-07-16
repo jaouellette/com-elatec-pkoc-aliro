@@ -72,6 +72,9 @@ import com.psia.pkoc.core.PKOC_TransmissionType;
 import com.psia.pkoc.core.ReaderDto;
 import com.psia.pkoc.core.SiteDto;
 import com.psia.pkoc.databinding.FragmentSendCredentialBinding;
+import com.psia.pkoc.core.PkocBleReaderCredential;
+import com.psia.pkoc.core.PkocBlePreferences;
+import com.psia.pkoc.core.PkocBleTrustStore;
 
 /**
  * Send credential fragment
@@ -1099,6 +1102,36 @@ public class SendCredentialFragment extends Fragment
 
             ArrayList<SiteDto> siteDtos = (ArrayList<SiteDto>) PKOC_Application.getDb().siteDao().list().stream().map(SiteModel::toDto).collect(Collectors.toList());
             ArrayList<ReaderDto> readerDtos = (ArrayList<ReaderDto>) PKOC_Application.getDb().readerDao().list().stream().map(ReaderModel::toDto).collect(Collectors.toList());
+            // Apply any per-reader Site Issuer anchors imported by scanning a reader's QR.
+            // Ungated: a scanned anchor means the device should trust that reader on the
+            // per-reader ECDHE path. Harmless otherwise (only used when a cert is presented).
+            for (SiteDto s : siteDtos)
+            {
+                byte[] scannedIssuer = PkocBleTrustStore.getSiteIssuerKey(requireContext(), s.siteUUID);
+                if (scannedIssuer != null)
+                {
+                    s.siteIssuerPublicKey = scannedIssuer;
+                }
+            }
+
+            if (PkocBleReaderCredential.isEnabled(requireContext()))
+            {
+                byte[] siteIssuerKey = PkocBleReaderCredential.getSiteIssuerPublicKey(requireContext());
+                String boundHex = requireContext()
+                        .getSharedPreferences(PkocBlePreferences.PREFS_NAME, Context.MODE_PRIVATE)
+                        .getString(PkocBlePreferences.BOUND_SITE_ID, "");
+                if (siteIssuerKey != null && !boundHex.isEmpty())
+                {
+                    byte[] boundSiteId = org.bouncycastle.util.encoders.Hex.decode(boundHex);
+                    for (SiteDto s : siteDtos)
+                    {
+                        if (java.util.Arrays.equals(s.siteUUID, boundSiteId) && s.siteIssuerPublicKey == null)
+                        {
+                            s.siteIssuerPublicKey = siteIssuerKey;
+                        }
+                    }
+                }
+            }
 
             PKOC_BluetoothCallbackGatt callback = new PKOC_BluetoothCallbackGatt(requireActivity(), finalToFlow, updateUIHandler, siteDtos, readerDtos);
 

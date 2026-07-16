@@ -10,6 +10,7 @@ import com.psia.pkoc.core.TLVProvider;
 import com.psia.pkoc.core.ValidationResult;
 import com.psia.pkoc.core.interfaces.TransactionMessage;
 import com.psia.pkoc.core.packets.NfcProtocolVersionPacket;
+import com.psia.pkoc.core.packets.ReaderCertificatePacket;
 import com.psia.pkoc.core.packets.ReaderNoncePacket;
 import com.psia.pkoc.core.validations.SuccessResult;
 import com.psia.pkoc.core.packets.ProtocolVersionPacket;
@@ -29,6 +30,10 @@ public class ReaderIdentifierMessage<TPacket> implements TransactionMessage<TPac
     private ReaderIdentifierPacket readerLocationId;
     private SiteIdentifierPacket siteId;
     private ReaderNoncePacket readerNonce;
+    // PKOC BLE Transport Profile 2.0.1 §7.1: optional per-reader Reader
+    // Certificate (TLV 0x10). Present only on the per-reader (Validated) path;
+    // absent on the legacy shared-Site-Key path (Appendix B).
+    private ReaderCertificatePacket readerCertificate;
 
     public ReaderIdentifierMessage()
     {
@@ -72,6 +77,18 @@ public class ReaderIdentifierMessage<TPacket> implements TransactionMessage<TPac
     public ReaderNoncePacket getReaderNonce()
     {
         return readerNonce;
+    }
+
+    /** The Reader Certificate presented by the reader, or {@code null} on the legacy path. */
+    public ReaderCertificatePacket getReaderCertificate()
+    {
+        return readerCertificate;
+    }
+
+    /** Attach a Reader Certificate to be emitted on the per-reader path (reader side). */
+    public void setReaderCertificate(ReaderCertificatePacket _readerCertificate)
+    {
+        readerCertificate = _readerCertificate;
     }
 
     private ValidationResult handleProtocolVersion(byte[] data)
@@ -129,6 +146,17 @@ public class ReaderIdentifierMessage<TPacket> implements TransactionMessage<TPac
         return vr;
     }
 
+    private ValidationResult handleReaderCertificate(byte[] data)
+    {
+        var obj = new ReaderCertificatePacket(data);
+        ValidationResult vr = obj.validate();
+        if (vr instanceof SuccessResult)
+        {
+            readerCertificate = obj;
+        }
+        return vr;
+    }
+
     public ValidationResult processNewPacket(TPacket packet)
     {
         ValidationResult vr = new UnexpectedPacketResult();
@@ -149,6 +177,9 @@ public class ReaderIdentifierMessage<TPacket> implements TransactionMessage<TPac
 
                 case SiteIdentifier:
                     return handleSiteIdentifier(blePacket.Data);
+
+                case ReaderCertificate:
+                    return handleReaderCertificate(blePacket.Data);
             }
         }
         else if (packet instanceof NFC_Packet)
@@ -215,6 +246,15 @@ public class ReaderIdentifierMessage<TPacket> implements TransactionMessage<TPac
         var siteIdData = siteId.encode();
         var siteIdTlv = TLVProvider.GetBleTLV(BLE_PacketType.SiteIdentifier, siteIdData);
 
-        return Arrays.concatenate(protocolVersionTlv, compressedKeyTlv, readerLocationIdTlv, siteIdTlv);
+        byte[] encoded = Arrays.concatenate(protocolVersionTlv, compressedKeyTlv, readerLocationIdTlv, siteIdTlv);
+
+        // Per-reader path: append the Reader Certificate (TLV 0x10) when present.
+        if (readerCertificate != null)
+        {
+            var certTlv = TLVProvider.GetBleTLV(BLE_PacketType.ReaderCertificate, readerCertificate.encode());
+            encoded = Arrays.concatenate(encoded, certTlv);
+        }
+
+        return encoded;
     }
 }

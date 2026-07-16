@@ -78,6 +78,8 @@ import com.psia.pkoc.core.transactions.NfcNormalFlowTransaction;
 import com.psia.pkoc.core.AliroCryptoProvider;
 import com.psia.pkoc.core.AliroMailbox;
 import com.psia.pkoc.core.LeafVerifiedManager;
+import com.psia.pkoc.core.PkocBleReaderCredential;
+import com.psia.pkoc.core.PkocBlePreferences;
 import java.security.KeyPair;
 import java.security.interfaces.ECPublicKey;
 
@@ -709,6 +711,20 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
 
         readerUUID = UUID.fromString(existingReader);
         siteUUID = UUID.fromString(existingSite);
+
+        if (PkocBleReaderCredential.isEnabled(requireContext()))
+        {
+            String mode = requireContext()
+                    .getSharedPreferences(PkocBlePreferences.PREFS_NAME, Context.MODE_PRIVATE)
+                    .getString(PkocBlePreferences.MODE, PkocBlePreferences.MODE_DEMO);
+            if (!PkocBlePreferences.MODE_IMPORT.equals(mode))
+            {
+                PkocBleReaderCredential.ensureDemoProvisioned(
+                        requireContext(),
+                        UuidConverters.fromUuid(siteUUID),
+                        UuidConverters.fromUuid(readerUUID));
+            }
+        }
     }
 
     @SuppressLint("MissingPermission")
@@ -1435,7 +1451,23 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                 byte[] transientPublicKeyTLV = TLVProvider.GetBleTLV(BLE_PacketType.CompressedTransientPublicKey, compressedTransientPublicKey);
                 byte[] readerTLV = TLVProvider.GetBleTLV(BLE_PacketType.ReaderLocationIdentifier, readerId);
                 byte[] siteTLV = TLVProvider.GetBleTLV(BLE_PacketType.SiteIdentifier, siteId);
-                byte[] toSend = org.bouncycastle.util.Arrays.concatenate(versionTLV, transientPublicKeyTLV, readerTLV, siteTLV);
+                byte[] toSend = org.bouncycastle.util.Arrays.concatenate(versionTLV, transientPublicKeyTLV, readerTLV);
+
+                // PKOC BLE v2.0.1 §7: present the Reader Certificate (TLV 0x10) BEFORE
+                // the SiteIdentifier so the device processes it before the base fields
+                // complete (its state machine transitions as soon as SiteIdentifier lands).
+                if (PkocBleReaderCredential.isEnabled(requireContext()))
+                {
+                    byte[] certBytes = PkocBleReaderCredential.getReaderCertificateBytes(requireContext());
+                    if (certBytes != null)
+                    {
+                        byte[] certTLV = TLVProvider.GetBleTLV(BLE_PacketType.ReaderCertificate, certBytes);
+                        toSend = org.bouncycastle.util.Arrays.concatenate(toSend, certTLV);
+                    }
+                }
+
+                toSend = org.bouncycastle.util.Arrays.concatenate(toSend, siteTLV);
+
                 Log.d(TAG, "Check if we can connect");
                 boolean canConnect = false;
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
@@ -1664,19 +1696,39 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                     {
                         byte[] toSign = generateSignaturePackage(deviceModel);
 
-                        byte[] signatureASN = CryptoProvider.GetSignedMessage(toSign);
-                        if (signatureASN == null)
+                        byte[] signature;
+                        // Per-reader (PKOC BLE v2.0.1 §7): sign the ECDHE handshake with the
+                        // Reader Signing key (raw R||S) when per-reader is enabled and a
+                        // certificate is provisioned. Otherwise keep the legacy site/keystore
+                        // signature, byte-identical to before.
+                        if (PkocBleReaderCredential.isEnabled(requireContext())
+                                && PkocBleReaderCredential.getReaderCertificateBytes(requireContext()) != null)
                         {
-                            requireActivity().runOnUiThread(() -> Toast.makeText(requireContext(), "Error: Failed to sign message.", Toast.LENGTH_LONG).show());
-                            mBluetoothGattServer.sendResponse(device, requestId, BluetoothGatt.GATT_FAILURE, offset, null);
-                            timeoutHandler.removeCallbacks(timeoutRunnable);
-                            onGattOperationCompleted();
-                            return;
+                            signature = PkocBleReaderCredential.signHandshake(requireContext(), toSign);
+                            if (signature == null)
+                            {
+                                requireActivity().runOnUiThread(() -> Toast.makeText(requireContext(), "Error: Failed to sign message (reader key).", Toast.LENGTH_LONG).show());
+                                mBluetoothGattServer.sendResponse(device, requestId, BluetoothGatt.GATT_FAILURE, offset, null);
+                                timeoutHandler.removeCallbacks(timeoutRunnable);
+                                onGattOperationCompleted();
+                                return;
+                            }
+                        }
+                        else
+                        {
+                            byte[] signatureASN = CryptoProvider.GetSignedMessage(toSign);
+                            if (signatureASN == null)
+                            {
+                                requireActivity().runOnUiThread(() -> Toast.makeText(requireContext(), "Error: Failed to sign message.", Toast.LENGTH_LONG).show());
+                                mBluetoothGattServer.sendResponse(device, requestId, BluetoothGatt.GATT_FAILURE, offset, null);
+                                timeoutHandler.removeCallbacks(timeoutRunnable);
+                                onGattOperationCompleted();
+                                return;
+                            }
+                            Log.d(TAG, "Signature with ASN header: " + Hex.toHexString(signatureASN));
+                            signature = CryptoProvider.RemoveASNHeaderFromSignature(signatureASN);
                         }
 
-                        Log.d(TAG, "Signature with ASN header: " + Hex.toHexString(signatureASN));
-
-                        byte[] signature = CryptoProvider.RemoveASNHeaderFromSignature(signatureASN);
                         Log.d(TAG, "Signature generated: " + Hex.toHexString(signature));
 
                         byte[] signatureTLV = TLVProvider.GetBleTLV(BLE_PacketType.DigitalSignature, signature);
@@ -1729,7 +1781,12 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                         String connectionTypeText;
                         if (deviceModel.connectionType == PKOC_ConnectionType.ECHDE_Full)
                         {
-                            connectionTypeText = "PKOC BLE — ECDHE Perfect Secrecy";
+                            // Evidence of which spec/flow ran: 2.0.1 per-reader certificate
+                            // vs 1.0 shared-site-key ECDHE.
+                            boolean perReader = PkocBleReaderCredential.isEnabled(requireContext())
+                                    && PkocBleReaderCredential.getReaderCertificateBytes(requireContext()) != null;
+                            connectionTypeText = "PKOC BLE — ECDHE Perfect Secrecy ("
+                                    + (perReader ? "v2.0.1 · Per-Reader Cert" : "v1.0 · Shared Key") + ")";
                         }
                         else if (deviceModel.connectionType == PKOC_ConnectionType.Uncompressed)
                         {

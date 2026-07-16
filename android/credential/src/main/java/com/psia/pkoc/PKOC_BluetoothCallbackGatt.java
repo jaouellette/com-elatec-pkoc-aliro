@@ -21,6 +21,9 @@ import com.psia.pkoc.core.SiteDto;
 import com.psia.pkoc.core.interfaces.Transaction;
 import com.psia.pkoc.core.transactions.BleEcdheFlowTransaction;
 import com.psia.pkoc.core.transactions.BleNormalFlowTransaction;
+import com.psia.pkoc.PKOC_Application;
+import com.psia.pkoc.SiteModel;
+import com.psia.pkoc.ReaderModel;
 
 import java.util.ArrayList;
 
@@ -69,7 +72,15 @@ public class PKOC_BluetoothCallbackGatt extends BluetoothGattCallback
         }
         else if (toUse == PKOC_ConnectionType.ECHDE_Full)
         {
-            transaction = new BleEcdheFlowTransaction(true, siteDtos, readerDtos, mainActivity);
+            // Read the site/reader lists fresh from the DB at transaction-build time,
+            // so a key scanned after this callback was created is still picked up.
+            ArrayList<SiteDto> freshSites = (ArrayList<SiteDto>) PKOC_Application.getDb()
+                    .siteDao().list().stream().map(SiteModel::toDto)
+                    .collect(java.util.stream.Collectors.toList());
+            ArrayList<ReaderDto> freshReaders = (ArrayList<ReaderDto>) PKOC_Application.getDb()
+                    .readerDao().list().stream().map(ReaderModel::toDto)
+                    .collect(java.util.stream.Collectors.toList());
+            transaction = new BleEcdheFlowTransaction(true, freshSites, freshReaders, mainActivity);
         }
 
         uiHandler = updateUIHandler;

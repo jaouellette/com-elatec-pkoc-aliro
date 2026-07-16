@@ -36,4 +36,10 @@
         android:orderInCategory="350"
         app:showAsAction="never" />
 
+    <item
+        android:id="@+id/action_pkoc_perreader_toggle"
+        android:title="PKOC Per-Reader Cert (v2.0.1)"
+        android:orderInCategory="360"
+        android:checkable="true"
+        app:showAsAction="never" />
 </menu>

@@ -163,6 +163,29 @@ public class PKOCSelfTestEngine
         runAndReport(results, cb, this::testV311ProtocolVersion);
         runAndReport(results, cb, this::testV311SigInputSymmetry);
 
+        // Group 6: Core §4 Credentials & Derived Identifiers (4 tests)
+        runAndReport(results, cb, this::testCoreCredentialV1);
+        runAndReport(results, cb, this::testCoreDerivedIdentifier);
+        runAndReport(results, cb, this::testCoreDdtEncoding);
+        runAndReport(results, cb, this::testCoreDerivedIdBounds);
+
+        // Group 7: BLE Per-Reader Certificate — v2.0.1 §7 (6 tests)
+        runAndReport(results, cb, this::testBleCertRoundTrip);
+        runAndReport(results, cb, this::testBleCertWrongIssuer);
+        runAndReport(results, cb, this::testBleCertSubjectMismatch);
+        runAndReport(results, cb, this::testBleCertExpired);
+        runAndReport(results, cb, this::testBleCertRevocation);
+        runAndReport(results, cb, this::testBleReaderHandshakeSignature);
+
+        // Group 8: NFC SE V2 / PKOC-CVC / Validated Mode — v2.0.1 §5, §8 (7 tests)
+        runAndReport(results, cb, this::testCvcBuildParse);
+        runAndReport(results, cb, this::testCvcSignatureVerify);
+        runAndReport(results, cb, this::testCvcSignatureTampered);
+        runAndReport(results, cb, this::testSeV2InfoResponse);
+        runAndReport(results, cb, this::testSeV2CardHandlerAuth);
+        runAndReport(results, cb, this::testSeV2ReaderFlowValidated);
+        runAndReport(results, cb, this::testSeV2ReaderFlowUntrusted);
+
         if (cb != null) cb.onAllComplete(results);
         return results;
     }
@@ -2299,6 +2322,535 @@ public class PKOCSelfTestEngine
         {
             return result("V311_SIG_INPUT_SYMMETRY", "v3.1.1 Compliance",
                     "Signature input symmetry", false, e.toString(), start);
+        }
+    }
+
+    // =========================================================================
+    // GROUP 6: Core §4 Credentials & Derived Identifiers (4 tests)
+    // =========================================================================
+
+    // Core §4.7 worked example.
+    private static final byte[] CORE_EXAMPLE_PUBKEY = hexToBytes(
+            "04BEA02AA1320054CFF1DFD2F88FA583B5B059833BA87CEC415ABDAE0791F0EC66"
+                    + "A913C7104A725F6497B8C08FF91217B106FEF7B51ACD4ADF6645E765E4E88D84");
+
+    private TestResult testCoreCredentialV1()
+    {
+        long start = System.currentTimeMillis();
+        try
+        {
+            byte[] cred = PkocCredentialDerivation.deriveCredentialV1(CORE_EXAMPLE_PUBKEY);
+            String expected = "BEA02AA1320054CFF1DFD2F88FA583B5B059833BA87CEC415ABDAE0791F0EC66";
+            boolean ok = cred.length == 32 && Hex.toHexString(cred).equalsIgnoreCase(expected);
+            return result("CORE_CREDENTIAL_V1", "Core §4 Derivation",
+                    "PKOC Credential V1 = P-256 X coordinate", ok,
+                    ok ? "Matches Core §4.7 worked example" : "Got " + Hex.toHexString(cred), start);
+        }
+        catch (Exception e)
+        {
+            return result("CORE_CREDENTIAL_V1", "Core §4 Derivation", "PKOC Credential V1", false, e.toString(), start);
+        }
+    }
+
+    private TestResult testCoreDerivedIdentifier()
+    {
+        long start = System.currentTimeMillis();
+        try
+        {
+            byte[] cred = PkocCredentialDerivation.deriveCredentialV1(CORE_EXAMPLE_PUBKEY);
+            byte[] id8 = PkocCredentialDerivation.deriveIdentifier(cred, 8);
+            boolean ok = Hex.toHexString(id8).equalsIgnoreCase("5ABDAE0791F0EC66");
+            return result("CORE_DERIVED_ID", "Core §4 Derivation",
+                    "8-octet Derived Identifier (rightmost bytes)", ok,
+                    ok ? "5ABDAE0791F0EC66" : "Got " + Hex.toHexString(id8), start);
+        }
+        catch (Exception e)
+        {
+            return result("CORE_DERIVED_ID", "Core §4 Derivation", "Derived Identifier", false, e.toString(), start);
+        }
+    }
+
+    private TestResult testCoreDdtEncoding()
+    {
+        long start = System.currentTimeMillis();
+        try
+        {
+            byte[] cred = PkocCredentialDerivation.deriveCredentialV1(CORE_EXAMPLE_PUBKEY);
+            byte[] id8 = PkocCredentialDerivation.deriveIdentifier(cred, 8);
+            byte[] ddt = PkocCredentialDerivation.toDiscretionaryDataTemplate(
+                    PkocCredentialDerivation.OID_PKOC_DERIVED_IDENTIFIER, id8);
+            String expected = "7F4E16060A2B0601040183FC2F0C0253085ABDAE0791F0EC66";
+            boolean ok = Hex.toHexString(ddt).equalsIgnoreCase(expected);
+            return result("CORE_DDT", "Core §4 Derivation",
+                    "OID/Value Discretionary Data Template (7F4E)", ok,
+                    ok ? "Matches Core §4.2.5" : "Got " + Hex.toHexString(ddt), start);
+        }
+        catch (Exception e)
+        {
+            return result("CORE_DDT", "Core §4 Derivation", "DDT encoding", false, e.toString(), start);
+        }
+    }
+
+    private TestResult testCoreDerivedIdBounds()
+    {
+        long start = System.currentTimeMillis();
+        try
+        {
+            byte[] cred = PkocCredentialDerivation.deriveCredentialV1(CORE_EXAMPLE_PUBKEY);
+
+            boolean standardRejects4 = false;
+            try { PkocCredentialDerivation.deriveIdentifier(cred, 4); }
+            catch (IllegalArgumentException ex) { standardRejects4 = true; }
+
+            byte[] validated4 = PkocCredentialDerivation.deriveIdentifier(cred, 4, true);
+
+            boolean ok = standardRejects4 && validated4.length == 4;
+            return result("CORE_DERIVED_ID_BOUNDS", "Core §4 Derivation",
+                    "Standard 8–31 vs Validated 4–31 length bounds", ok,
+                    ok ? "4-octet rejected in Standard, allowed in Validated"
+                            : "standardRejects4=" + standardRejects4 + " validatedLen=" + validated4.length, start);
+        }
+        catch (Exception e)
+        {
+            return result("CORE_DERIVED_ID_BOUNDS", "Core §4 Derivation", "Derived id bounds", false, e.toString(), start);
+        }
+    }
+
+    // =========================================================================
+    // GROUP 7: BLE Per-Reader Certificate — v2.0.1 §7 (6 tests)
+    // =========================================================================
+
+    private TestResult testBleCertRoundTrip()
+    {
+        long start = System.currentTimeMillis();
+        try
+        {
+            KeyPair issuer = generateP256Keypair();
+            KeyPair reader = generateP256Keypair();
+            byte[] location = randomBytes(16);
+            byte[] site = randomBytes(16);
+            long now = System.currentTimeMillis() / 1000L;
+
+            ReaderCertificate cert = ReaderCertificate.buildAndSign(
+                    location, site, 0L, ReaderCertificate.NOT_AFTER_FOREVER,
+                    getUncompressedPubKey(reader), issuer.getPrivate());
+            if (cert == null)
+                return result("BLE_CERT_ROUNDTRIP", "BLE Per-Reader Cert", "Build/sign/verify", false, "build returned null", start);
+
+            ValidationResult vr = cert.verify(location, site, getUncompressedPubKey(issuer), now);
+            boolean fieldsOk = Arrays.equals(cert.getSubjectLocationId(), location)
+                    && Arrays.equals(cert.getIssuerId(), site)
+                    && cert.encode().length == ReaderCertificate.LENGTH;
+            boolean ok = vr.isValid && fieldsOk;
+            return result("BLE_CERT_ROUNDTRIP", "BLE Per-Reader Cert",
+                    "138-byte Reader Certificate build/sign/verify", ok,
+                    ok ? "Verified against Site Issuer key" : "vr=" + vr.message, start);
+        }
+        catch (Exception e)
+        {
+            return result("BLE_CERT_ROUNDTRIP", "BLE Per-Reader Cert", "Cert round-trip", false, e.toString(), start);
+        }
+    }
+
+    private TestResult testBleCertWrongIssuer()
+    {
+        long start = System.currentTimeMillis();
+        try
+        {
+            KeyPair issuer = generateP256Keypair();
+            KeyPair wrong  = generateP256Keypair();
+            KeyPair reader = generateP256Keypair();
+            byte[] location = randomBytes(16);
+            byte[] site = randomBytes(16);
+            long now = System.currentTimeMillis() / 1000L;
+
+            ReaderCertificate cert = ReaderCertificate.buildAndSign(
+                    location, site, 0L, ReaderCertificate.NOT_AFTER_FOREVER,
+                    getUncompressedPubKey(reader), issuer.getPrivate());
+
+            ValidationResult vr = cert.verify(location, site, getUncompressedPubKey(wrong), now);
+            boolean ok = !vr.isValid; // MUST reject
+            return result("BLE_CERT_WRONG_ISSUER", "BLE Per-Reader Cert",
+                    "Reject certificate signed by unknown issuer (0x07)", ok,
+                    ok ? "Rejected as expected" : "Accepted a bad signature", start);
+        }
+        catch (Exception e)
+        {
+            return result("BLE_CERT_WRONG_ISSUER", "BLE Per-Reader Cert", "Wrong issuer", false, e.toString(), start);
+        }
+    }
+
+    private TestResult testBleCertSubjectMismatch()
+    {
+        long start = System.currentTimeMillis();
+        try
+        {
+            KeyPair issuer = generateP256Keypair();
+            KeyPair reader = generateP256Keypair();
+            byte[] location = randomBytes(16);
+            byte[] site = randomBytes(16);
+            long now = System.currentTimeMillis() / 1000L;
+
+            ReaderCertificate cert = ReaderCertificate.buildAndSign(
+                    location, site, 0L, ReaderCertificate.NOT_AFTER_FOREVER,
+                    getUncompressedPubKey(reader), issuer.getPrivate());
+
+            ValidationResult vr = cert.verify(randomBytes(16), site, getUncompressedPubKey(issuer), now);
+            boolean ok = !vr.isValid; // subject != TLV 0x0D -> reject
+            return result("BLE_CERT_SUBJECT_MISMATCH", "BLE Per-Reader Cert",
+                    "Reject subject != Reader Location Identifier", ok,
+                    ok ? "Rejected as expected" : "Accepted a mismatched subject", start);
+        }
+        catch (Exception e)
+        {
+            return result("BLE_CERT_SUBJECT_MISMATCH", "BLE Per-Reader Cert", "Subject mismatch", false, e.toString(), start);
+        }
+    }
+
+    private TestResult testBleCertExpired()
+    {
+        long start = System.currentTimeMillis();
+        try
+        {
+            KeyPair issuer = generateP256Keypair();
+            KeyPair reader = generateP256Keypair();
+            byte[] location = randomBytes(16);
+            byte[] site = randomBytes(16);
+            long now = System.currentTimeMillis() / 1000L;
+
+            // Not-After 1000 seconds in the past.
+            ReaderCertificate cert = ReaderCertificate.buildAndSign(
+                    location, site, 0L, now - 1000L,
+                    getUncompressedPubKey(reader), issuer.getPrivate());
+
+            ValidationResult vr = cert.verify(location, site, getUncompressedPubKey(issuer), now);
+            boolean ok = !vr.isValid; // expired -> reject (0x09)
+            return result("BLE_CERT_EXPIRED", "BLE Per-Reader Cert",
+                    "Reject expired certificate (0x09)", ok,
+                    ok ? "Rejected as expired" : "Accepted an expired cert", start);
+        }
+        catch (Exception e)
+        {
+            return result("BLE_CERT_EXPIRED", "BLE Per-Reader Cert", "Expired cert", false, e.toString(), start);
+        }
+    }
+
+    private TestResult testBleCertRevocation()
+    {
+        long start = System.currentTimeMillis();
+        try
+        {
+            KeyPair issuer = generateP256Keypair();
+            byte[] site = randomBytes(16);
+            byte[] revokedLocation = randomBytes(16);
+            byte[] otherLocation = randomBytes(16);
+            long now = System.currentTimeMillis() / 1000L;
+
+            List<byte[]> revoked = new ArrayList<>();
+            revoked.add(revokedLocation);
+            long[] timestamps = new long[] { now };
+
+            ReaderRevocationList list = ReaderRevocationList.buildAndSign(
+                    site, now, revoked, timestamps, issuer.getPrivate());
+            if (list == null)
+                return result("BLE_CERT_REVOCATION", "BLE Per-Reader Cert", "Revocation list", false, "build null", start);
+
+            boolean sigOk = list.verifySignature(getUncompressedPubKey(issuer));
+            boolean revokedHit = list.isRevoked(revokedLocation);
+            boolean otherMiss = !list.isRevoked(otherLocation);
+
+            boolean ok = sigOk && revokedHit && otherMiss;
+            return result("BLE_CERT_REVOCATION", "BLE Per-Reader Cert",
+                    "Signed revocation list: signature + membership (0x08)", ok,
+                    ok ? "Signature ok, revoked hit, other miss"
+                            : "sig=" + sigOk + " hit=" + revokedHit + " miss=" + otherMiss, start);
+        }
+        catch (Exception e)
+        {
+            return result("BLE_CERT_REVOCATION", "BLE Per-Reader Cert", "Revocation", false, e.toString(), start);
+        }
+    }
+
+    private TestResult testBleReaderHandshakeSignature()
+    {
+        long start = System.currentTimeMillis();
+        try
+        {
+            KeyPair issuer = generateP256Keypair();
+            KeyPair reader = generateP256Keypair();
+            byte[] location = randomBytes(16);
+            byte[] site = randomBytes(16);
+
+            ReaderCertificate cert = ReaderCertificate.buildAndSign(
+                    location, site, 0L, ReaderCertificate.NOT_AFTER_FOREVER,
+                    getUncompressedPubKey(reader), issuer.getPrivate());
+
+            // Reader signs the 96-byte ECDHE handshake input with its signing key;
+            // the device verifies against the Reader Public Key from the certificate.
+            byte[] handshake = randomBytes(96);
+            byte[] sig = EcKeyUtil.signRaw(reader.getPrivate(), handshake);
+            boolean ok = sig != null && EcKeyUtil.verifyRaw(cert.getReaderPublicKeyUncompressed(), handshake, sig);
+
+            // And a different key must NOT verify.
+            byte[] badSig = EcKeyUtil.signRaw(generateP256Keypair().getPrivate(), handshake);
+            boolean rejectsBad = !EcKeyUtil.verifyRaw(cert.getReaderPublicKeyUncompressed(), handshake, badSig);
+
+            boolean pass = ok && rejectsBad;
+            return result("BLE_READER_HANDSHAKE_SIG", "BLE Per-Reader Cert",
+                    "Handshake verifies against cert Reader Public Key", pass,
+                    pass ? "Correct key verifies, wrong key rejected"
+                            : "ok=" + ok + " rejectsBad=" + rejectsBad, start);
+        }
+        catch (Exception e)
+        {
+            return result("BLE_READER_HANDSHAKE_SIG", "BLE Per-Reader Cert", "Handshake sig", false, e.toString(), start);
+        }
+    }
+
+    // =========================================================================
+    // GROUP 8: NFC SE V2 / PKOC-CVC / Validated Mode — v2.0.1 §5, §8 (7 tests)
+    // =========================================================================
+
+    private static final String CVC_TEST_IIR = "01000ELATEC00001";
+    private static final String CVC_TEST_SUBJECT = "CARD000000000001";
+
+    /** Build a demo CVC and return {cvc, issuerPub65, subjectPub65, subjectPrivKey}. */
+    private Object[] buildTestCvc() throws Exception
+    {
+        KeyPair issuer  = generateP256Keypair();
+        KeyPair subject = generateP256Keypair();
+        byte[] subjectPub = getUncompressedPubKey(subject);
+
+        List<PkocCvc.Extension> exts = new ArrayList<>();
+        exts.add(new PkocCvc.Extension(PkocCvc.OID_EXT_UUID, randomBytes(16)));
+
+        PkocCvc cvc = PkocCvc.buildAndSignEcP256(
+                CVC_TEST_IIR, subjectPub, CVC_TEST_SUBJECT, 20200101, 20400101, exts, issuer.getPrivate());
+        return new Object[] { cvc, getUncompressedPubKey(issuer), subjectPub, subject.getPrivate() };
+    }
+
+    private TestResult testCvcBuildParse()
+    {
+        long start = System.currentTimeMillis();
+        try
+        {
+            Object[] t = buildTestCvc();
+            PkocCvc built = (PkocCvc) t[0];
+            byte[] subjectPub = (byte[]) t[2];
+
+            PkocCvc cvc = PkocCvc.parse(built.encode());
+            boolean ok = cvc != null
+                    && CVC_TEST_IIR.equals(cvc.getIir())
+                    && CVC_TEST_SUBJECT.equals(cvc.getSubjectRef())
+                    && cvc.getValidFromYyyymmdd() == 20200101
+                    && cvc.getValidToYyyymmdd() == 20400101
+                    && cvc.isIirWellFormed()
+                    && Arrays.equals(cvc.getSubjectEcPublicKeyUncompressed(), subjectPub)
+                    && cvc.getExtension(PkocCvc.OID_EXT_UUID) != null;
+            return result("CVC_BUILD_PARSE", "NFC SE V2 / Validated",
+                    "PKOC-CVC (Core §5) build → parse round-trip", ok,
+                    ok ? "All fields + UUID extension parsed" : "field mismatch", start);
+        }
+        catch (Exception e)
+        {
+            return result("CVC_BUILD_PARSE", "NFC SE V2 / Validated", "CVC build/parse", false, e.toString(), start);
+        }
+    }
+
+    private TestResult testCvcSignatureVerify()
+    {
+        long start = System.currentTimeMillis();
+        try
+        {
+            Object[] t = buildTestCvc();
+            PkocCvc cvc = (PkocCvc) t[0];
+            byte[] issuerPub = (byte[]) t[1];
+
+            IssuerKey key = IssuerKey.ecP256(CVC_TEST_IIR, issuerPub);
+            boolean ok = key.verify(cvc.getCertificateBody(), cvc.getSignature());
+            return result("CVC_SIG_VERIFY", "NFC SE V2 / Validated",
+                    "PKOC-CVC signature verifies against Issuer Key (ES256)", ok,
+                    ok ? "Verified" : "Verification failed", start);
+        }
+        catch (Exception e)
+        {
+            return result("CVC_SIG_VERIFY", "NFC SE V2 / Validated", "CVC signature", false, e.toString(), start);
+        }
+    }
+
+    private TestResult testCvcSignatureTampered()
+    {
+        long start = System.currentTimeMillis();
+        try
+        {
+            Object[] t = buildTestCvc();
+            PkocCvc cvc = (PkocCvc) t[0];
+            byte[] issuerPub = (byte[]) t[1];
+
+            byte[] body = cvc.getCertificateBody();
+            byte[] tampered = body.clone();
+            tampered[tampered.length / 2] ^= 0x01; // flip one bit of the body
+
+            IssuerKey key = IssuerKey.ecP256(CVC_TEST_IIR, issuerPub);
+            boolean rejectsTamper = !key.verify(tampered, cvc.getSignature());
+            return result("CVC_SIG_TAMPERED", "NFC SE V2 / Validated",
+                    "Reject tampered PKOC-CVC body", rejectsTamper,
+                    rejectsTamper ? "Rejected as expected" : "Accepted a tampered body", start);
+        }
+        catch (Exception e)
+        {
+            return result("CVC_SIG_TAMPERED", "NFC SE V2 / Validated", "CVC tamper", false, e.toString(), start);
+        }
+    }
+
+    private TestResult testSeV2InfoResponse()
+    {
+        long start = System.currentTimeMillis();
+        try
+        {
+            byte[] info = NfcSeV2.buildInfoResponse();
+            boolean bytesOk = Hex.toHexString(info).equalsIgnoreCase("7F63045C0202009000");
+            boolean parsedSeV2 = NfcSeV2.parseInfoIsSeV2(info);
+            boolean ok = bytesOk && parsedSeV2;
+            return result("SEV2_INFO", "NFC SE V2 / Validated",
+                    "GET DATA (INFO) advertises SE V2 (02 00)", ok,
+                    ok ? "7F63045C0202009000" : "bytes=" + Hex.toHexString(info) + " parsed=" + parsedSeV2, start);
+        }
+        catch (Exception e)
+        {
+            return result("SEV2_INFO", "NFC SE V2 / Validated", "SE V2 INFO", false, e.toString(), start);
+        }
+    }
+
+    private TestResult testSeV2CardHandlerAuth()
+    {
+        long start = System.currentTimeMillis();
+        try
+        {
+            Object[] t = buildTestCvc();
+            PkocCvc cvc = (PkocCvc) t[0];
+            byte[] subjectPub = (byte[]) t[2];
+            PrivateKey subjectPriv = (PrivateKey) t[3];
+
+            // INTERNAL AUTHENTICATE round-trip through the card handler.
+            byte[] challenge = randomBytes(32);
+            byte[] authCmd = NfcSeV2.buildInternalAuthCommand(challenge);
+            byte[] authResp = NfcSeV2CardHandler.handle(authCmd, cvc.encode(), subjectPriv);
+
+            boolean success = authResp != null && NfcSeV2.isSuccess(authResp);
+            byte[] sig = NfcSeV2.extractInternalAuthSignature(authResp);
+            boolean sigVerifies = sig != null && EcKeyUtil.verifyRaw(subjectPub, challenge, sig);
+
+            // GET DATA (PKOC-CVC) through the handler returns the certificate.
+            byte[] cvcResp = NfcSeV2CardHandler.handle(NfcSeV2.GET_DATA_CVC_APDU, cvc.encode(), subjectPriv);
+            boolean cvcOk = cvcResp != null && Arrays.equals(NfcSeV2.extractCvc(cvcResp), cvc.encode());
+
+            boolean ok = success && sigVerifies && cvcOk;
+            return result("SEV2_CARD_HANDLER", "NFC SE V2 / Validated",
+                    "Card INTERNAL AUTHENTICATE + GET DATA (PKOC-CVC)", ok,
+                    ok ? "Signature verifies; CVC served" : "success=" + success + " sig=" + sigVerifies + " cvc=" + cvcOk, start);
+        }
+        catch (Exception e)
+        {
+            return result("SEV2_CARD_HANDLER", "NFC SE V2 / Validated", "SE V2 card handler", false, e.toString(), start);
+        }
+    }
+
+    private TestResult testSeV2ReaderFlowValidated()
+    {
+        long start = System.currentTimeMillis();
+        try
+        {
+            Object[] t = buildTestCvc();
+            PkocCvc cvc = (PkocCvc) t[0];
+            byte[] issuerPub = (byte[]) t[1];
+            byte[] subjectPub = (byte[]) t[2];
+            PrivateKey subjectPriv = (PrivateKey) t[3];
+
+            IssuerKeyStore store = new IssuerKeyStore();
+            store.put(IssuerKey.ecP256(CVC_TEST_IIR, issuerPub));
+
+            LoopbackSeV2Card card = new LoopbackSeV2Card(cvc.encode(), subjectPriv);
+            NfcSeV2ReaderFlow.Result r = NfcSeV2ReaderFlow.run(
+                    card, true, false, store,
+                    NfcSeV2ReaderFlow.OutputType.CREDENTIAL, 16, null);
+
+            byte[] expectedCred = PkocCredentialDerivation.deriveCredentialV1(subjectPub);
+            boolean ok = r.isSeV2 && r.success && r.validated
+                    && Arrays.equals(r.pkocCredential, expectedCred);
+            return result("SEV2_READER_VALIDATED", "NFC SE V2 / Validated",
+                    "Reader Validated-Mode end-to-end (detect→CVC→validate→auth→credential)", ok,
+                    ok ? "Validated + credential derived"
+                            : "isSeV2=" + r.isSeV2 + " success=" + r.success + " validated=" + r.validated + " err=" + r.error, start);
+        }
+        catch (Exception e)
+        {
+            return result("SEV2_READER_VALIDATED", "NFC SE V2 / Validated", "Reader validated flow", false, e.toString(), start);
+        }
+    }
+
+    private TestResult testSeV2ReaderFlowUntrusted()
+    {
+        long start = System.currentTimeMillis();
+        try
+        {
+            Object[] t = buildTestCvc();
+            PkocCvc cvc = (PkocCvc) t[0];
+            PrivateKey subjectPriv = (PrivateKey) t[3];
+
+            // Empty issuer store -> no key matches the IIR -> Validated Mode MUST fail,
+            // and the reader MUST NOT fall back to Standard (isSeV2 stays true).
+            IssuerKeyStore emptyStore = new IssuerKeyStore();
+
+            LoopbackSeV2Card card = new LoopbackSeV2Card(cvc.encode(), subjectPriv);
+            NfcSeV2ReaderFlow.Result r = NfcSeV2ReaderFlow.run(
+                    card, true, false, emptyStore,
+                    NfcSeV2ReaderFlow.OutputType.CREDENTIAL, 16, null);
+
+            boolean ok = r.isSeV2 && !r.success && !r.validated;
+            return result("SEV2_READER_UNTRUSTED", "NFC SE V2 / Validated",
+                    "Validated Mode fails on untrusted issuer, no SE V1 fallback", ok,
+                    ok ? "Failed closed as required (§2.1)"
+                            : "isSeV2=" + r.isSeV2 + " success=" + r.success + " err=" + r.error, start);
+        }
+        catch (Exception e)
+        {
+            return result("SEV2_READER_UNTRUSTED", "NFC SE V2 / Validated", "Reader untrusted flow", false, e.toString(), start);
+        }
+    }
+
+    // =========================================================================
+    // Helpers for the Stage 4 tests
+    // =========================================================================
+
+    private static byte[] randomBytes(int n)
+    {
+        byte[] b = new byte[n];
+        new SecureRandom().nextBytes(b);
+        return b;
+    }
+
+    /** In-memory SE V2 card for the reader-flow tests (implements the transceiver). */
+    private static final class LoopbackSeV2Card implements NfcSeV2ReaderFlow.ApduTransceiver
+    {
+        private final byte[] cvc;
+        private final PrivateKey seV2Key;
+
+        LoopbackSeV2Card(byte[] cvc, PrivateKey seV2Key)
+        {
+            this.cvc = cvc;
+            this.seV2Key = seV2Key;
+        }
+
+        @Override
+        public byte[] transceive(byte[] apdu)
+        {
+            if (NfcSeV2.isSelect(apdu))
+            {
+                return NfcSeV2.SW_SUCCESS; // baseline SELECT
+            }
+            byte[] r = NfcSeV2CardHandler.handle(apdu, cvc, seV2Key);
+            return (r != null) ? r : NfcSeV2.SW_GENERAL_ERROR;
         }
     }
 }

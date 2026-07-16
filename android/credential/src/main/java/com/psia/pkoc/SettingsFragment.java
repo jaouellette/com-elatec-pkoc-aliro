@@ -17,6 +17,8 @@ import com.psia.pkoc.core.PKOC_ConnectionType;
 import com.psia.pkoc.core.PKOC_Preferences;
 import com.psia.pkoc.core.PKOC_TransmissionType;
 import com.psia.pkoc.databinding.FragmentSettingsBinding;
+import com.psia.pkoc.core.PkocBleReaderCredential;
+import com.psia.pkoc.core.PkocBlePreferences;
 
 public class SettingsFragment extends Fragment
 {
@@ -40,8 +42,13 @@ public class SettingsFragment extends Fragment
 
     private SharedPreferences enrollmentPrefs;
 
+    // Guards against a programmatic setText() (config load) being treated as a
+    // user edit and persisting over a QR-scanned site key.
+    private boolean isLoadingEcdheConfig = false;
+
     private void persistSiteIfValid()
     {
+        if (isLoadingEcdheConfig) return;
         String siteUuidStr = safeText(binding.siteIdentifierInput);
         String pubKeyHex   = safeText(binding.sitePublicKeyInput);
 
@@ -72,13 +79,19 @@ public class SettingsFragment extends Fragment
         java.util.UUID siteUuid = java.util.UUID.fromString(siteUuidStr);
         byte[] sid = UuidConverters.fromUuid(siteUuid);
         byte[] pk  = org.bouncycastle.util.encoders.Hex.decode(pubKeyHex);
-
+        // Do NOT persist the default/placeholder site key — otherwise simply opening
+        // Settings in ECDHE mode overwrites a key provisioned by QR scan with the default.
+        if (pubKeyHex.isEmpty() || pubKeyHex.equalsIgnoreCase(PKOC_Preferences.DEFAULT_SITE_PUBLIC_KEY))
+        {
+            return;
+        }
         PKOC_Application.getDb().getQueryExecutor().execute(() ->
             PKOC_Application.getDb().siteDao().upsert(new SiteModel(sid, pk)));
     }
 
     private void persistReaderIfValid()
     {
+        if (isLoadingEcdheConfig) return;
         String readerUuidStr = safeText(binding.readerIdentifierInput);
         String siteUuidStr   = safeText(binding.siteIdentifierInput);
 
@@ -279,6 +292,55 @@ public class SettingsFragment extends Fragment
                 .apply());
 
         configureEnrollmentListeners();
+
+        // ---- PKOC BLE v2.0.1 per-reader certificate controls ----
+        binding.pkocPerreaderSwitch.setOnCheckedChangeListener((v, isChecked) ->
+        {
+            PkocBleReaderCredential.setEnabled(requireContext(), isChecked);
+            if (isChecked && !binding.pkocCertModeImport.isChecked())
+            {
+                provisionPkocDemo();
+            }
+            updatePkocPerReaderStatus();
+        });
+
+        binding.pkocCertModeGroup.setOnCheckedChangeListener((group, checkedId) ->
+        {
+            boolean importMode = checkedId == binding.pkocCertModeImport.getId();
+            binding.pkocImportGroup.setVisibility(importMode ? View.VISIBLE : View.GONE);
+            requireContext()
+                .getSharedPreferences(PkocBlePreferences.PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putString(PkocBlePreferences.MODE, importMode ? PkocBlePreferences.MODE_IMPORT : PkocBlePreferences.MODE_DEMO)
+                .apply();
+            if (!importMode && binding.pkocPerreaderSwitch.isChecked())
+            {
+                provisionPkocDemo();
+            }
+            updatePkocPerReaderStatus();
+        });
+
+        binding.pkocImportBtn.setOnClickListener(v ->
+        {
+            try
+            {
+                byte[] cert   = org.bouncycastle.util.encoders.Hex.decode(binding.pkocImportCertInput.getText().toString().trim());
+                byte[] issuer = org.bouncycastle.util.encoders.Hex.decode(binding.pkocImportIssuerInput.getText().toString().trim());
+                byte[] priv   = org.bouncycastle.util.encoders.Hex.decode(binding.pkocImportPrivInput.getText().toString().trim());
+                boolean ok = PkocBleReaderCredential.importProvisioned(requireContext(), cert, issuer, priv);
+                binding.pkocPerreaderStatus.setText(ok ? "Imported reader certificate OK." : "Import failed — check inputs.");
+            }
+            catch (Exception e)
+            {
+                binding.pkocPerreaderStatus.setText("Import failed: " + e.getMessage());
+            }
+        });
+        binding.pkocScanReaderQrBtn.setOnClickListener(v ->
+                androidx.navigation.fragment.NavHostFragment.findNavController(this)
+                        .navigate(R.id.action_settingsFragment_to_scanReaderQrFragment));
+        binding.scanSiteKeyQrBtn.setOnClickListener(v ->
+                androidx.navigation.fragment.NavHostFragment.findNavController(this)
+                        .navigate(R.id.action_settingsFragment_to_scanReaderQrFragment));
     }
 
     private void initializeComponents()
@@ -352,6 +414,16 @@ public class SettingsFragment extends Fragment
         }
 
         initializeEnrollmentSettings();
+
+        // ---- PKOC BLE v2.0.1 per-reader certificate state ----
+        binding.pkocPerreaderSwitch.setChecked(PkocBleReaderCredential.isEnabled(requireContext()));
+        String pkocMode = requireContext()
+            .getSharedPreferences(PkocBlePreferences.PREFS_NAME, Context.MODE_PRIVATE)
+            .getString(PkocBlePreferences.MODE, PkocBlePreferences.MODE_DEMO);
+        boolean pkocImportMode = PkocBlePreferences.MODE_IMPORT.equals(pkocMode);
+        binding.pkocCertModeGroup.check(pkocImportMode ? binding.pkocCertModeImport.getId() : binding.pkocCertModeDemo.getId());
+        binding.pkocImportGroup.setVisibility(pkocImportMode ? View.VISIBLE : View.GONE);
+        updatePkocPerReaderStatus();
     }
 
 
@@ -363,9 +435,10 @@ public class SettingsFragment extends Fragment
     /** Load ECDHE values from prefs (with defaults) and display them. */
     private void loadAndDisplayEcdheConfig()
     {
+        // Do NOT default to the device's own key — an empty field means "not set;
+        // scan a reader" and avoids persisting a bogus key over a scanned one.
         String siteKey  = sharedPrefs.getString(
-                PKOC_Preferences.ECDHE_SitePublicKey,
-                PKOC_Preferences.DEFAULT_SITE_PUBLIC_KEY);
+                PKOC_Preferences.ECDHE_SitePublicKey, "");
         String siteId   = sharedPrefs.getString(
                 PKOC_Preferences.ECDHE_SiteId,
                 PKOC_Preferences.DEFAULT_SITE_UUID);
@@ -373,27 +446,11 @@ public class SettingsFragment extends Fragment
                 PKOC_Preferences.ECDHE_ReaderId,
                 PKOC_Preferences.DEFAULT_READER_UUID);
 
-        // If site public key is empty, show the device's own PKOC public key
-        // as the default (self-signed demo mode).
-        if (siteKey == null || siteKey.isEmpty())
-        {
-            try
-            {
-                byte[] devicePub = CryptoProvider.getUncompressedPublicKeyBytes();
-                if (devicePub != null)
-                {
-                    siteKey = org.bouncycastle.util.encoders.Hex.toHexString(devicePub);
-                }
-            }
-            catch (Exception e)
-            {
-                Log.w("SettingsFragment", "Could not get device public key for default", e);
-            }
-        }
-
+        isLoadingEcdheConfig = true;
         binding.sitePublicKeyInput.setText(siteKey);
         binding.siteIdentifierInput.setText(siteId);
         binding.readerIdentifierInput.setText(readerId);
+        isLoadingEcdheConfig = false;
 
         updateEcdheStatusLabel();
     }
@@ -463,6 +520,31 @@ public class SettingsFragment extends Fragment
         android.widget.Toast.makeText(requireContext(),
                 "Enter your custom Site UUID, Reader UUID, and Site Public Key",
                 android.widget.Toast.LENGTH_SHORT).show();
+    }
+
+    // =========================================================================
+    // PKOC BLE v2.0.1 per-reader certificate helpers
+    // =========================================================================
+
+    /** Self-provision a demo Reader Signing key + self-signed Reader Certificate. */
+    private void provisionPkocDemo()
+    {
+        SharedPreferences p = requireActivity().getPreferences(Context.MODE_PRIVATE);
+        String siteStr   = p.getString(PKOC_Preferences.SiteUUID, PKOC_Preferences.DEFAULT_SITE_UUID);
+        String readerStr = p.getString(PKOC_Preferences.ReaderUUID, PKOC_Preferences.DEFAULT_READER_UUID);
+        byte[] siteId   = UuidConverters.fromUuid(java.util.UUID.fromString(siteStr));
+        byte[] readerId = UuidConverters.fromUuid(java.util.UUID.fromString(readerStr));
+        boolean ok = PkocBleReaderCredential.ensureDemoProvisioned(requireContext(), siteId, readerId);
+        binding.pkocPerreaderStatus.setText(ok ? "Demo reader certificate provisioned." : "Demo provisioning failed.");
+    }
+
+    /** Refresh the per-reader status line. */
+    private void updatePkocPerReaderStatus()
+    {
+        boolean enabled = PkocBleReaderCredential.isEnabled(requireContext());
+        boolean provisioned = PkocBleReaderCredential.isProvisioned(requireContext());
+        binding.pkocPerreaderStatus.setText(
+            "Per-reader: " + (enabled ? "ON" : "OFF") + (provisioned ? " \u00B7 certificate ready" : " \u00B7 not provisioned"));
     }
 
     @Override
