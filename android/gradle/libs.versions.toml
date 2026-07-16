@@ -1,7 +1,7 @@
 [versions]
 agp = "8.13.2"
 annotationsApi = "6.0.53"
-bcpkixJdk15to18 = "1.83"
+bcpkixJdk15to18 = "1.84"
 cbor            = "4.5.2"
 conscryptAndroid = "2.5.3"
 core = "3.5.4"
