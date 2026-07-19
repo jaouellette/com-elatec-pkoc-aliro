@@ -40,4 +40,10 @@
         android:label="LEAF Verified Config"
         tools:layout="@layout/fragment_leaf_config" />
 
+    <fragment
+        android:id="@+id/pkocNfcIssuerConfigFragment"
+        android:name="com.pkoc.readersimulator.PkocNfcIssuerConfigFragment"
+        android:label="PKOC Credential Suppliers"
+        tools:layout="@layout/fragment_pkoc_nfc_issuer_config" />
+
 </navigation>

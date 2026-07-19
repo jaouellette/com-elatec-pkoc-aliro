@@ -70,6 +70,8 @@ public class BleEcdheFlowTransaction extends BleNormalFlowTransaction
     private int counter = 1;
     private final Activity activity;
     private DeviceEphemeralPublicKeyPacket deviceEphemeralPublicKeyPacket;
+    // Which trust path accepted the reader this transaction (for the on-device demo indicator).
+    private String lastTrustDecision = null;
 
     public BleEcdheFlowTransaction(boolean _isDevice, ArrayList<SiteDto> _siteDtos, ArrayList<ReaderDto> _readerDtos, Activity _activity)
     {
@@ -282,6 +284,14 @@ public class BleEcdheFlowTransaction extends BleNormalFlowTransaction
                 if (messageValidation.isValid)
                 {
                     Log.i(TAG, "ReaderResponseMessage validated successfully. Transaction complete.");
+                    if (activity != null && lastTrustDecision != null)
+                    {
+                        final String trustMsg = lastTrustDecision;
+                        activity.runOnUiThread(() ->
+                                android.widget.Toast.makeText(activity,
+                                        "PKOC BLE \u2713 " + trustMsg,
+                                        android.widget.Toast.LENGTH_LONG).show());
+                    }
                     return new SuccessResult();
                 }
                 else if (messageValidation.cancelTransaction)
@@ -323,6 +333,7 @@ public class BleEcdheFlowTransaction extends BleNormalFlowTransaction
         if (PIN_CACHE.isPinned(cert, now))
         {
             Log.d(TAG, "Reader Certificate matched a pinned entry (discovery-and-pin).");
+            lastTrustDecision = "Reader trusted via pin (discovery-and-pin, \u00A77.2)";
             return new SuccessResult();
         }
 
@@ -332,7 +343,9 @@ public class BleEcdheFlowTransaction extends BleNormalFlowTransaction
         {
             return certResult;
         }
-
+        Log.i(TAG, "Reader Certificate chain-of-trust VERIFIED: Site Issuer signature valid over "
+                + "138-byte cert, issuer-ID bound to TLV 0x0E, within validity window (first contact — now pinning).");
+        lastTrustDecision = "Reader chain-of-trust VERIFIED against Site Issuer anchor (\u00A77.1) — first contact";
         // Pin for subsequent encounters.
         PIN_CACHE.put(cert);
         return new SuccessResult();

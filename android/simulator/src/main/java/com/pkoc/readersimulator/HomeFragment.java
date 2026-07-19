@@ -80,6 +80,8 @@ import com.psia.pkoc.core.AliroMailbox;
 import com.psia.pkoc.core.LeafVerifiedManager;
 import com.psia.pkoc.core.PkocBleReaderCredential;
 import com.psia.pkoc.core.PkocBlePreferences;
+import com.psia.pkoc.core.PkocNfcReaderConfig;
+import com.psia.pkoc.core.NfcSeV2ReaderFlow;
 import java.security.KeyPair;
 import java.security.interfaces.ECPublicKey;
 
@@ -1785,8 +1787,16 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                             // vs 1.0 shared-site-key ECDHE.
                             boolean perReader = PkocBleReaderCredential.isEnabled(requireContext())
                                     && PkocBleReaderCredential.getReaderCertificateBytes(requireContext()) != null;
-                            connectionTypeText = "PKOC BLE — ECDHE Perfect Secrecy ("
-                                    + (perReader ? "v2.0.1 · Per-Reader Cert" : "v1.0 · Shared Key") + ")";
+                            if (perReader)
+                            {
+                                connectionTypeText = "PKOC BLE — ECDHE Perfect Secrecy\n"
+                                        + "\u2713 VALIDATED MODE (v2.0.1 · Per-Reader Certificate)\n"
+                                        + "Reader presented a Site Issuer-signed certificate (TLV 0x10).";
+                            }
+                            else
+                            {
+                                connectionTypeText = "PKOC BLE — ECDHE Perfect Secrecy (v1.0 · Shared Key)";
+                            }
                         }
                         else if (deviceModel.connectionType == PKOC_ConnectionType.Uncompressed)
                         {
@@ -2024,6 +2034,16 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
 
     private void displayPublicKeyInfo(String publicKeyHex, String connectionTypeText)
     {
+        displayPublicKeyInfo(publicKeyHex, connectionTypeText, null, null);
+    }
+
+    /**
+     * @param outputLabel     SE V2 Reader-to-PACS output label (or null)
+     * @param outputValueHex  SE V2 Reader-to-PACS output value, hex (or null)
+     */
+    private void displayPublicKeyInfo(String publicKeyHex, String connectionTypeText,
+                                      String outputLabel, String outputValueHex)
+    {
         if (publicKeyHex.length() == 130)
         {
             String header = publicKeyHex.substring(0, 2);
@@ -2127,6 +2147,49 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                 connectionTypeSpannable.setSpan(new ForegroundColorSpan(Color.BLACK), 0, connectionTypeText.length(), Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
                 connectionTypeSpannable.setSpan(new AbsoluteSizeSpan(16, true), 0, connectionTypeText.length(), Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
                 formattedText.append(connectionTypeSpannable);
+            }
+
+            // -----------------------------------------------------------------
+            // SE V2 Reader -> PACS output (the value the reader emits to the panel).
+            // Shown above the subject public key because this is what the PACS receives.
+            // -----------------------------------------------------------------
+            if (outputLabel != null && outputValueHex != null)
+            {
+                SpannableString outHdr = new SpannableString("\n\nREADER \u2192 PACS OUTPUT\n");
+                outHdr.setSpan(new StyleSpan(Typeface.BOLD), 0, outHdr.length(), Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+                outHdr.setSpan(new ForegroundColorSpan(Color.parseColor("#1E7A4D")), 0, outHdr.length(), Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+                outHdr.setSpan(new AbsoluteSizeSpan(15, true), 0, outHdr.length(), Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+                formattedText.append(outHdr);
+
+                SpannableString outLbl = new SpannableString(outputLabel + "\n");
+                outLbl.setSpan(new StyleSpan(Typeface.BOLD), 0, outputLabel.length(), Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+                outLbl.setSpan(new ForegroundColorSpan(Color.BLACK), 0, outputLabel.length(), Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+                outLbl.setSpan(new AbsoluteSizeSpan(13, true), 0, outputLabel.length(), Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+                formattedText.append(outLbl);
+
+                SpannableString outHexHdr = new SpannableString("\nOutput (HEX):\n".toUpperCase());
+                outHexHdr.setSpan(new StyleSpan(Typeface.BOLD), 0, outHexHdr.length(), Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+                outHexHdr.setSpan(new ForegroundColorSpan(Color.BLACK), 0, outHexHdr.length(), Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+                outHexHdr.setSpan(new AbsoluteSizeSpan(13, true), 0, outHexHdr.length(), Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+                formattedText.append(outHexHdr);
+                formattedText.append(applyColorAndSize(outputValueHex.toUpperCase(), outputValueHex.length(),
+                        Color.parseColor("#9CC3C9"), Color.parseColor("BLACK"), true));
+
+                try
+                {
+                    String outDec = new java.math.BigInteger(outputValueHex, 16).toString(10);
+                    SpannableString outDecHdr = new SpannableString("\n\nOutput (Decimal):\n".toUpperCase());
+                    outDecHdr.setSpan(new StyleSpan(Typeface.BOLD), 0, outDecHdr.length(), Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+                    outDecHdr.setSpan(new ForegroundColorSpan(Color.BLACK), 0, outDecHdr.length(), Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+                    outDecHdr.setSpan(new AbsoluteSizeSpan(13, true), 0, outDecHdr.length(), Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+                    formattedText.append(outDecHdr);
+                    formattedText.append(applyColorAndSize(outDec, outDec.length(),
+                            Color.parseColor("#9CC3C9"), Color.parseColor("BLACK"), true));
+                }
+                catch (Exception ignored) { }
+
+                SpannableString outGap = new SpannableString("\n\n");
+                formattedText.append(outGap);
             }
 
             // Apply bold style to the "Public Key:" text with black color and size 14
@@ -2360,7 +2423,90 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
     // PKOC NFC Reader Flow
     // =========================================================================
 
+    /**
+     * PKOC NFC dispatch. When Validated Mode is enabled (PKOC Credential Suppliers
+     * screen), the reader runs the SE V2 flow (Profile Detection -> GET DATA CVC ->
+     * Validation -> INTERNAL AUTHENTICATE). If the tapped card does not advertise
+     * SE V2, the reader gracefully falls back to the SE V1 Standard Flow (§2.1) and
+     * the result screen indicates the fallback. When Validated Mode is off, the
+     * original SE V1 flow runs unchanged.
+     */
     private void runPkocNfcFlow(IsoDep isoDep)
+    {
+        Context ctx = requireContext();
+
+        if (PkocNfcReaderConfig.isValidatedMode(ctx))
+        {
+            try
+            {
+                // In demo mode the card's own issuer is auto-trusted by
+                // buildIssuerKeyStore(); in the field, suppliers are added via the
+                // "PKOC Credential Suppliers" screen.
+                NfcSeV2ReaderFlow.Result r = NfcSeV2ReaderFlow.run(
+                        isoDep::transceive,
+                        true,                                         // validatedMode
+                        PkocNfcReaderConfig.requireValidity(ctx),
+                        PkocNfcReaderConfig.buildIssuerKeyStore(ctx),
+                        PkocNfcReaderConfig.outputType(ctx),
+                        PkocNfcReaderConfig.idOctets(ctx),
+                        PkocNfcReaderConfig.extensionOid(ctx));
+
+                if (r.isSeV2)
+                {
+                    handlePkocSeV2Result(r);
+                    return;
+                }
+
+                // Card is not SE V2 (no INFO 02 00) -> graceful fallback to SE V1.
+                Log.i("NFC", "Card is not SE V2; falling back to SE V1 Standard Flow.");
+                runPkocSeV1Flow(isoDep,
+                        "Validated Mode requested — card is SE V1, fell back to Standard Flow");
+                return;
+            }
+            catch (java.io.IOException e)
+            {
+                Log.e(TAG, "PKOC SE V2 NFC IO error", e);
+                requireActivity().runOnUiThread(this::showInvalidKeyDialog);
+                return;
+            }
+        }
+
+        // Validated Mode off -> SE V1 Standard Flow (unchanged behaviour).
+        runPkocSeV1Flow(isoDep, null);
+    }
+
+    /** Render an SE V2 (Validated or Standard) result to the results display. */
+    private void handlePkocSeV2Result(NfcSeV2ReaderFlow.Result r)
+    {
+        requireActivity().runOnUiThread(() ->
+        {
+            setKeypadVisibility(View.GONE);
+            if (r.success && r.subjectPublicKey != null)
+            {
+                String pk = Hex.toHexString(r.subjectPublicKey).toUpperCase();
+                String status = r.validated
+                        ? "\u2713 VALIDATED MODE (SE V2 · issuer chain verified)"
+                        : "\u2713 SE V2 (Standard — no validation)";
+                String label = "PKOC NFC — SE V2\n" + status
+                        + (r.outputLabel != null ? "\n" + r.outputLabel : "");
+                Log.d("NFC", "PKOC SE V2 subject key: " + pk + " | " + r.outputLabel);
+                String outHex = (r.outputValue != null) ? Hex.toHexString(r.outputValue).toUpperCase() : null;
+                displayPublicKeyInfo(pk, label, r.outputLabel, outHex);
+            }
+            else
+            {
+                Log.e(TAG, "PKOC SE V2 not successful: " + r.error);
+                showInvalidKeyDialog();
+            }
+        });
+    }
+
+    /**
+     * SE V1 Standard Flow (the original PKOC NFC path). When {@code fallbackNote} is
+     * non-null it is shown on the result screen to indicate a fallback from
+     * Validated Mode.
+     */
+    private void runPkocSeV1Flow(IsoDep isoDep, @Nullable String fallbackNote)
     {
         try
         {
@@ -2385,7 +2531,9 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                         setKeypadVisibility(View.GONE);
                         String pk = Hex.toHexString(publicKey);
                         Log.d("NFC", "PKOC Public Key: " + pk);
-                        displayPublicKeyInfo(pk, "PKOC NFC — Normal Flow");
+                        String label = "PKOC NFC — Normal Flow (SE V1)"
+                                + (fallbackNote != null ? "\n(" + fallbackNote + ")" : "");
+                        displayPublicKeyInfo(pk, label);
                     });
                 }
                 else

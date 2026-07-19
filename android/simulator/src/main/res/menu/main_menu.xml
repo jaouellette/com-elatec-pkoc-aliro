@@ -31,6 +31,12 @@
         app:showAsAction="never" />
 
     <item
+        android:id="@+id/pkocNfcIssuerConfigFragment"
+        android:title="PKOC Credential Suppliers"
+        android:orderInCategory="210"
+        app:showAsAction="never" />
+
+    <item
         android:id="@+id/action_leaf_self_test"
         android:title="LEAF Self-Test"
         android:orderInCategory="350"

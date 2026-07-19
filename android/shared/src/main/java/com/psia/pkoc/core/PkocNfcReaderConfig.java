@@ -113,6 +113,33 @@ public final class PkocNfcReaderConfig
         prefs(ctx).edit().remove(READER_ISSUER_KEYS).apply();
     }
 
+    /** Retire a single configured supplier by IIR (leaves all others in place). */
+    public static void removeIssuerKey(Context ctx, String iir)
+    {
+        if (iir == null) return;
+        SharedPreferences p = prefs(ctx);
+        Set<String> current = p.getStringSet(READER_ISSUER_KEYS, new HashSet<>());
+        Set<String> kept = new HashSet<>();
+        for (String s : current)
+        {
+            int bar = s.indexOf('|');
+            String entryIir = (bar > 0) ? s.substring(0, bar) : s;
+            if (!entryIir.equals(iir)) kept.add(s);
+        }
+        p.edit().putStringSet(READER_ISSUER_KEYS, kept).apply();
+    }
+
+    /** The explicitly configured Issuer Keys (excludes the demo Card Issuer key). */
+    public static java.util.List<IssuerKey> listIssuerKeys(Context ctx)
+    {
+        java.util.List<IssuerKey> out = new java.util.ArrayList<>();
+        for (String s : prefs(ctx).getStringSet(READER_ISSUER_KEYS, new HashSet<>()))
+        {
+            IssuerKey k = IssuerKey.fromStorage(s);
+            if (k != null) out.add(k);
+        }
+        return out;
+    }
     /**
      * Build the Issuer Key store for the Validation process: the explicitly
      * configured keys, plus (in demo mode) the card's demo Card Issuer key so a

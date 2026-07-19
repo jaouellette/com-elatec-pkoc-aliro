@@ -1,0 +1,215 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/colorBackground"
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="24dp">
+
+        <!-- ================================================================= -->
+        <!-- Header -->
+        <!-- ================================================================= -->
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="PKOC NFC Credential Suppliers"
+            android:textSize="18sp"
+            android:textStyle="bold"
+            android:textColor="#A41D23"
+            android:layout_marginBottom="8dp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="In Validated Mode the reader trusts a PKOC-CVC only when its Issuer Identification Reference (IIR, tag 42) matches a configured supplier. Add each supplier's IIR and issuer public key here; several suppliers can be trusted at once, and a supplier is retired by removing its IIR."
+            android:textSize="13sp"
+            android:textColor="@color/colorTextSecondary"
+            android:layout_marginBottom="16dp" />
+
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:background="@color/colorTextSecondary"
+            android:layout_marginBottom="16dp" />
+
+        <!-- ================================================================= -->
+        <!-- Validated Mode toggles -->
+        <!-- ================================================================= -->
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Validated Mode"
+            android:textSize="15sp"
+            android:textStyle="bold"
+            android:textColor="#A41D23"
+            android:layout_marginBottom="4dp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="When enabled the reader validates the presented PKOC-CVC against the configured suppliers before authenticating, and does not fall back to Standard Mode if validation fails."
+            android:textSize="13sp"
+            android:textColor="@color/colorTextSecondary"
+            android:layout_marginBottom="8dp" />
+
+        <CheckBox
+            android:id="@+id/chkPkocValidatedMode"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Enable Validated Mode"
+            android:textSize="14sp"
+            android:layout_marginBottom="4dp" />
+
+        <CheckBox
+            android:id="@+id/chkPkocRequireValidity"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Enforce certificate validity dates"
+            android:textSize="14sp"
+            android:layout_marginBottom="24dp" />
+
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:background="@color/colorTextSecondary"
+            android:layout_marginBottom="16dp" />
+
+        <!-- ================================================================= -->
+        <!-- Add supplier -->
+        <!-- ================================================================= -->
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Add Supplier"
+            android:textSize="15sp"
+            android:textStyle="bold"
+            android:textColor="#A41D23"
+            android:layout_marginBottom="4dp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="IIR: 16 characters, A–Z and 0–9. Issuer key: 65-byte uncompressed EC P-256 point (04 ‖ X ‖ Y), 130 hex characters."
+            android:textSize="13sp"
+            android:textColor="@color/colorTextSecondary"
+            android:layout_marginBottom="12dp" />
+
+        <Button
+            android:id="@+id/btnPkocScanSupplier"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Scan Supplier QR"
+            android:backgroundTint="#1E7A4D"
+            android:textColor="@android:color/white"
+            android:textSize="13sp"
+            android:layout_marginBottom="12dp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="…or enter the supplier manually:"
+            android:textSize="13sp"
+            android:textColor="@color/colorTextSecondary"
+            android:layout_marginBottom="8dp" />
+
+        <EditText
+            android:id="@+id/editPkocIssuerIir"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="Issuer Identification Reference (IIR)"
+            android:inputType="textCapCharacters|textNoSuggestions"
+            android:maxLength="16"
+            android:fontFamily="monospace"
+            android:textSize="14sp"
+            android:layout_marginBottom="8dp" />
+
+        <EditText
+            android:id="@+id/editPkocIssuerPubHex"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="Issuer public key (04… hex)"
+            android:inputType="textNoSuggestions"
+            android:fontFamily="monospace"
+            android:textSize="12sp"
+            android:minLines="2"
+            android:gravity="top|start"
+            android:layout_marginBottom="12dp" />
+
+        <Button
+            android:id="@+id/btnPkocAddSupplier"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Add Supplier"
+            android:backgroundTint="#1E7A4D"
+            android:textColor="@android:color/white"
+            android:textSize="13sp"
+            android:layout_marginBottom="24dp" />
+
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:background="@color/colorTextSecondary"
+            android:layout_marginBottom="16dp" />
+
+        <!-- ================================================================= -->
+        <!-- Configured suppliers -->
+        <!-- ================================================================= -->
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Configured Suppliers"
+            android:textSize="15sp"
+            android:textStyle="bold"
+            android:textColor="#A41D23"
+            android:layout_marginBottom="8dp" />
+
+        <TextView
+            android:id="@+id/txtPkocSupplierEmpty"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="No suppliers configured. In demo mode the reader still trusts the card's own demo issuer automatically."
+            android:textSize="13sp"
+            android:textColor="@android:color/darker_gray"
+            android:background="#F5F5F5"
+            android:padding="12dp"
+            android:layout_marginBottom="12dp" />
+
+        <LinearLayout
+            android:id="@+id/pkocSupplierListContainer"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:layout_marginBottom="12dp" />
+
+        <Button
+            android:id="@+id/btnPkocClearSuppliers"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Clear All Suppliers"
+            android:backgroundTint="@android:color/holo_red_dark"
+            android:textColor="@android:color/white"
+            android:textSize="12sp"
+            android:enabled="false"
+            android:layout_marginBottom="16dp" />
+
+        <TextView
+            android:id="@+id/txtPkocIssuerConfigStatus"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text=""
+            android:textSize="13sp"
+            android:textStyle="bold"
+            android:layout_marginBottom="8dp" />
+
+    </LinearLayout>
+</ScrollView>
