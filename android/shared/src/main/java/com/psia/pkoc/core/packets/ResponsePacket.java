@@ -33,7 +33,7 @@ public class ResponsePacket implements TransactionPacket
     {
         return new byte[]
         {
-            BigInteger.valueOf(ReaderUnlockStatus.AccessGranted.ordinal()).byteValue()
+            BigInteger.valueOf(readerUnlockStatus.ordinal()).byteValue()
         };
     }
 

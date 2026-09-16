@@ -51,8 +51,13 @@ public final class AliroDiagnosticLog
     /** Whether to mirror entries to logcat in addition to the in-memory buffer. */
     private static volatile boolean mirrorToLogcat = true;
 
-    /** Minimum level retained. Entries below this are discarded entirely. */
-    private static volatile int minLevel = VERBOSE;
+    /**
+     * Minimum level retained. Entries below this are discarded entirely.
+     * Defaults to WARN in release builds, since many DEBUG-level entries
+     * throughout the app include raw secret material (session keys, HKDF
+     * salts, decrypted payloads). Debug builds keep full VERBOSE capture.
+     */
+    private static volatile int minLevel = BuildConfig.DEBUG ? VERBOSE : WARN;
 
     /** Optional change listener — UI registers here to refresh when entries arrive. */
     private static volatile Listener listener = null;

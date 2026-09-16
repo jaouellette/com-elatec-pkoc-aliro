@@ -3241,14 +3241,14 @@ public class AliroSelfTestEngine
             Class<?> verifierClass;
             try
             {
-                verifierClass = Class.forName("com.pkoc.readersimulator.AliroAccessDocumentVerifier");
+                verifierClass = Class.forName("com.psia.pkoc.core.AliroAccessDocumentVerifier");
             }
             catch (ClassNotFoundException cnf)
             {
-                // Try alternate package
+                // Try alternate (legacy) package
                 try
                 {
-                    verifierClass = Class.forName("com.psia.pkoc.AliroAccessDocumentVerifier");
+                    verifierClass = Class.forName("com.pkoc.readersimulator.AliroAccessDocumentVerifier");
                 }
                 catch (ClassNotFoundException cnf2)
                 {

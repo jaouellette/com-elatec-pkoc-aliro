@@ -1,4 +1,4 @@
-package com.pkoc.readersimulator;
+package com.psia.pkoc.core;
 
 import android.util.Log;
 

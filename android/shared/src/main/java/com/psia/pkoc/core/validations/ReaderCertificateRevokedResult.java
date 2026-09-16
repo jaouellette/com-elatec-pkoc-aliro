@@ -20,6 +20,7 @@ public class ReaderCertificateRevokedResult extends ValidationResult
     {
         cancelTransaction = true;
         isValid = false;
+        errorCode = BLE_ERROR_CODE;
         message = detail;
     }
 }

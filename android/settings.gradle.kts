@@ -26,3 +26,4 @@ include(":simulator")
 include(":wear")
 
 project(":shared").projectDir = file("shared")
+project(":wear").projectDir = file("WearOS")

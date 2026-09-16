@@ -88,9 +88,7 @@ public class NfcNormalFlowTransaction extends NormalFlowTransaction<NFC_Packet>
         switch (readerState)
         {
             case INITIAL:
-                byte[] protocolVersion = Hex.decode(SUPPORTED_PROTOCOL_VERSION);
-                byte[] expectedResponse = Arrays.concatenate(TLVProvider.GetNfcTLV(NFC_PacketType.ProtocolVersion, protocolVersion), SUCCESS_STATUS);
-                if (Arrays.areEqual(response, expectedResponse))
+                if (isAcceptedSelectResponse(response))
                 {
                     readerState = State.AWAITING_AUTHENTICATION;
                 }
@@ -131,6 +129,115 @@ public class NfcNormalFlowTransaction extends NormalFlowTransaction<NFC_Packet>
                 // Do nothing in SUCCESS or FAILED states
                 break;
         }
+    }
+
+    /**
+     * NFC Transport Profile 2.0.1 &sect;6.1: the SELECT response data <em>MUST contain</em> tag
+     * {@code 5C} carrying protocol version {@code 01 00}. The spec says "contain", not "equal",
+     * so additional or reordered TLVs are permitted and this parses rather than byte-compares.
+     *
+     * <p>A success status word with no response data identifies an EV Profile card
+     * (&sect;9.1) and is rejected here: this reader accepts the SE V1 / SE V2 card
+     * profiles only.</p>
+     */
+    static boolean isAcceptedSelectResponse(byte[] response)
+    {
+        if (response == null || response.length < 2)
+        {
+            return false;
+        }
+        if (response[response.length - 2] != SUCCESS_STATUS[0]
+                || response[response.length - 1] != SUCCESS_STATUS[1])
+        {
+            return false;
+        }
+
+        byte[] data = Arrays.copyOfRange(response, 0, response.length - 2);
+        if (data.length == 0)
+        {
+            return false; // EV Profile card (no 5C version TLV) - not accepted by this reader
+        }
+
+        byte[] expected = Hex.decode(SUPPORTED_PROTOCOL_VERSION);
+        byte[] version = findTlvValue(data, NFC_PacketType.ProtocolVersion.getType() & 0xFF);
+        return version != null && Arrays.areEqual(version, expected);
+    }
+
+    /**
+     * Scan top-level BER-TLV objects and return the value of the first one matching
+     * {@code wantTag}, ignoring any unrecognized objects. Supports one- and two-byte tags
+     * and short-form plus {@code 81} / {@code 82} long-form lengths.
+     */
+    private static byte[] findTlvValue(byte[] b, int wantTag)
+    {
+        int i = 0;
+        while (i < b.length)
+        {
+            int first = b[i] & 0xFF;
+            int tag;
+            int off;
+            if ((first & 0x1F) == 0x1F)
+            {
+                if (i + 1 >= b.length)
+                {
+                    return null;
+                }
+                tag = (first << 8) | (b[i + 1] & 0xFF);
+                off = i + 2;
+            }
+            else
+            {
+                tag = first;
+                off = i + 1;
+            }
+
+            if (off >= b.length)
+            {
+                return null;
+            }
+
+            int lenFirst = b[off] & 0xFF;
+            int len;
+            int valStart;
+            if (lenFirst < 0x80)
+            {
+                len = lenFirst;
+                valStart = off + 1;
+            }
+            else if (lenFirst == 0x81)
+            {
+                if (off + 1 >= b.length)
+                {
+                    return null;
+                }
+                len = b[off + 1] & 0xFF;
+                valStart = off + 2;
+            }
+            else if (lenFirst == 0x82)
+            {
+                if (off + 2 >= b.length)
+                {
+                    return null;
+                }
+                len = ((b[off + 1] & 0xFF) << 8) | (b[off + 2] & 0xFF);
+                valStart = off + 3;
+            }
+            else
+            {
+                return null;
+            }
+
+            if (valStart + len > b.length)
+            {
+                return null;
+            }
+            if (tag == wantTag)
+            {
+                return Arrays.copyOfRange(b, valStart, valStart + len);
+            }
+            i = valStart + len;
+        }
+        return null;
     }
 
     @Override

@@ -8,6 +8,7 @@ public class InvalidSignatureResult extends ValidationResult
     {
         cancelTransaction = true;
         isValid = false;
+        errorCode = 0x02; // Signature Verification Failed (§5.7)
         message = "Failed to validate signature with provided public key";
     }
 }

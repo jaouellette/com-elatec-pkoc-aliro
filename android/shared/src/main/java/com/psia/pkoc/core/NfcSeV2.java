@@ -144,15 +144,26 @@ public final class NfcSeV2
         return marker != null && Arrays.equals(marker, SE_V2_MARKER);
     }
 
-    /** Extract the {@code 7F21} CVC bytes from a GET DATA (PKOC-CVC) response (§8.1). */
+    /**
+     * Extract the {@code 7F21} CVC bytes from a GET DATA (PKOC-CVC) response (§8.1).
+     *
+     * <p>§8.1 requires the assembled response data to form <em>exactly one complete</em>
+     * {@code 7F21} object, so this validates the encoded length against the buffer and
+     * returns precisely that object (tag, length, and value). Returns {@code null} if the
+     * object is truncated, which indicates response chaining did not complete, and trims
+     * any trailing bytes rather than passing them to the certificate parser.</p>
+     */
     @Nullable
     public static byte[] extractCvc(byte[] resp)
     {
         byte[] data = stripStatusWord(resp);
-        // Return the whole 7F21 TLV (tag..value), which PkocCvc.parse accepts directly.
         int[] t = readTag(data, 0);
         if (t == null || t[0] != TAG_CVC_7F21) return null;
-        return data.clone();
+        int[] l = readLen(data, t[1]);
+        if (l == null) return null;
+        int end = l[1] + l[0];
+        if (end > data.length) return null;   // incomplete 7F21 object
+        return Arrays.copyOfRange(data, 0, end);
     }
 
     /** Extract the signature (tag {@code 9E} value) from an INTERNAL AUTHENTICATE response (§8.2). */

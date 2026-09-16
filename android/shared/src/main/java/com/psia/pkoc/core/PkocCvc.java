@@ -62,16 +62,16 @@ public final class PkocCvc
     public static final byte[] OID_EC_P256 = hex("2A8648CE3D030107");           // 1.2.840.10045.3.1.7
     public static final byte[] OID_RSA     = hex("2A864886F70D010101");         // 1.2.840.113549.1.1.1
 
-    // --- Extension credential OIDs (Core §5.7), PEN 59685 ---
-    public static final byte[] OID_EXT_KEYID     = hex("2B0601040183D2250701"); // .7.1
-    public static final byte[] OID_EXT_UUID      = hex("2B0601040183D2250801"); // .8.1
-    public static final byte[] OID_EXT_4BYTEUID  = hex("2B0601040183D2250802"); // .8.2
-    public static final byte[] OID_EXT_7BYTEUID  = hex("2B0601040183D2250803"); // .8.3
-    public static final byte[] OID_EXT_10BYTEUID = hex("2B0601040183D2250805"); // .8.5
-    public static final byte[] OID_EXT_BINARYID  = hex("2B0601040183D2250807"); // .8.7
-    public static final byte[] OID_EXT_CARDINFO  = hex("2B0601040183D2250808"); // .8.8
-    public static final byte[] OID_EXT_PKOC      = hex("2B0601040183D2250809"); // .8.9
-    public static final byte[] OID_EXT_CARDTYPE  = hex("2B0601040183D2250810"); // .8.16
+    // --- Extension credential OIDs (Core §5.7), PEN 65071 ---
+    public static final byte[] OID_EXT_KEYID     = hex("2B0601040183FC2F0701"); // .7.1
+    public static final byte[] OID_EXT_UUID      = hex("2B0601040183FC2F0801"); // .8.1
+    public static final byte[] OID_EXT_4BYTEUID  = hex("2B0601040183FC2F0802"); // .8.2
+    public static final byte[] OID_EXT_7BYTEUID  = hex("2B0601040183FC2F0803"); // .8.3
+    public static final byte[] OID_EXT_10BYTEUID = hex("2B0601040183FC2F0805"); // .8.5
+    public static final byte[] OID_EXT_BINARYID  = hex("2B0601040183FC2F0807"); // .8.7
+    public static final byte[] OID_EXT_CARDINFO  = hex("2B0601040183FC2F0808"); // .8.8
+    public static final byte[] OID_EXT_PKOC      = hex("2B0601040183FC2F0809"); // .8.9
+    public static final byte[] OID_EXT_CARDTYPE  = hex("2B0601040183FC2F0810"); // .8.16
 
     /** A parsed extension: PSIA OID (tag 06) + value (tag 53). */
     public static final class Extension

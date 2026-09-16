@@ -71,7 +71,7 @@ public class GrpcWebInterceptor implements Interceptor
             byte[] signature = CryptoProvider.GetSignedMessage(sigBase.getBytes());
             if (signature == null)
             {
-                return chain.proceed(original);
+                throw new IOException("Failed to sign request: CryptoProvider.GetSignedMessage returned null");
             }
 
             Request signed = original.newBuilder()
@@ -82,10 +82,15 @@ public class GrpcWebInterceptor implements Interceptor
 
             return chain.proceed(signed);
         }
+        catch (IOException e)
+        {
+            Log.e(TAG, "Failed to sign request", e);
+            throw e;
+        }
         catch (Exception e)
         {
-            Log.w(TAG, "Failed to sign request, proceeding unsigned", e);
-            return chain.proceed(original);
+            Log.e(TAG, "Failed to sign request", e);
+            throw new IOException("Failed to sign request", e);
         }
     }
 

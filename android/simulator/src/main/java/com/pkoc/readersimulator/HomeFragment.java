@@ -67,6 +67,7 @@ import androidx.core.content.ContextCompat;
 
 import com.psia.pkoc.core.BLE_Packet;
 import com.psia.pkoc.core.BLE_PacketType;
+import com.psia.pkoc.core.BleFragmenter;
 import com.psia.pkoc.core.Constants;
 import com.psia.pkoc.core.CryptoProvider;
 import com.psia.pkoc.core.PKOC_ConnectionType;
@@ -75,6 +76,7 @@ import com.psia.pkoc.core.ReaderUnlockStatus;
 import com.psia.pkoc.core.TLVProvider;
 import com.psia.pkoc.core.UuidConverters;
 import com.psia.pkoc.core.transactions.NfcNormalFlowTransaction;
+import com.psia.pkoc.core.AliroAccessDocumentVerifier;
 import com.psia.pkoc.core.AliroCryptoProvider;
 import com.psia.pkoc.core.AliroMailbox;
 import com.psia.pkoc.core.LeafVerifiedManager;
@@ -1402,6 +1404,37 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
             }
         }
 
+        @Override
+        public void onMtuChanged(BluetoothDevice device, int mtu)
+        {
+            FlowModel deviceModel = getDeviceCredentialModel(device);
+            if (deviceModel != null)
+            {
+                deviceModel.mtu = mtu;
+                Log.d(TAG, "MTU changed for " + device.getAddress() + ": " + mtu);
+            }
+        }
+
+        @SuppressLint("MissingPermission")
+        @Override
+        public void onNotificationSent(BluetoothDevice device, int status)
+        {
+            FlowModel deviceModel = getDeviceCredentialModel(device);
+            if (deviceModel == null)
+            {
+                return;
+            }
+
+            byte[] nextFragment = deviceModel.outgoingFragments.poll();
+            if (nextFragment == null)
+            {
+                deviceModel.notifyInProgress = false;
+                return;
+            }
+
+            sendNotifyFragment(device, nextFragment);
+        }
+
         public void InitiatePkocFlow(BluetoothDevice device)
         {
             Log.d(TAG, ">>> InitiatePkocFlow called for " + device.getAddress());
@@ -1438,11 +1471,19 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
 
                 byte[] compressedTransientPublicKey = CryptoProvider.getCompressedPublicKeyBytes(encodedPublicKey);
 
-//                byte[] version = new byte[]{(byte) 0x0C, (byte) 0x03, (short) 0x0000, (short) 0x0001};
-                // PKOC v3.1.1 Protocol Identifiers: spec version 0x01, vendor 0x0000, features 0x0001 (CCM)
+                byte[] certBytes = PkocBleReaderCredential.isEnabled(requireContext())
+                        ? PkocBleReaderCredential.getReaderCertificateBytes(requireContext())
+                        : null;
+                boolean certPresent = certBytes != null;
+
+                // PKOC BLE Transport Profile 2.0.1 §5.6: Protocol Identifiers (6 bytes):
+                // Major=0x03, Minor=0x01 ("3.1.x"), Vendor Sub-Version=0x0000,
+                // FeatureBits: bit0=AES-CCM support, bit1=Reader Certificate support.
+                int featureBits = 0x0001 | (certPresent ? 0x0002 : 0x0000);
                 byte[] version = new byte[]
                         {
-                                (byte) 0x01, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x01
+                                (byte) 0x03, (byte) 0x01, (byte) 0x00, (byte) 0x00,
+                                (byte) ((featureBits >> 8) & 0xFF), (byte) (featureBits & 0xFF)
                         };
                 Log.i(TAG, "Version: " + Arrays.toString(version));
                 byte[] readerId = UuidConverters.fromUuid(readerUUID);
@@ -1458,14 +1499,10 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                 // PKOC BLE v2.0.1 §7: present the Reader Certificate (TLV 0x10) BEFORE
                 // the SiteIdentifier so the device processes it before the base fields
                 // complete (its state machine transitions as soon as SiteIdentifier lands).
-                if (PkocBleReaderCredential.isEnabled(requireContext()))
+                if (certPresent)
                 {
-                    byte[] certBytes = PkocBleReaderCredential.getReaderCertificateBytes(requireContext());
-                    if (certBytes != null)
-                    {
-                        byte[] certTLV = TLVProvider.GetBleTLV(BLE_PacketType.ReaderCertificate, certBytes);
-                        toSend = org.bouncycastle.util.Arrays.concatenate(toSend, certTLV);
-                    }
+                    byte[] certTLV = TLVProvider.GetBleTLV(BLE_PacketType.ReaderCertificate, certBytes);
+                    toSend = org.bouncycastle.util.Arrays.concatenate(toSend, certTLV);
                 }
 
                 toSend = org.bouncycastle.util.Arrays.concatenate(toSend, siteTLV);
@@ -1577,6 +1614,22 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                     return;
                 }
 
+                // BLE Transport Profile 2.0.1 §5.5: reassemble application-layer
+                // fragments before parsing. Ack each intermediate fragment and wait
+                // for the rest until the final one arrives.
+                byte[] complete = deviceModel.incomingReassembler.onFragment(value);
+                if (complete == null)
+                {
+                    if (responseNeeded)
+                    {
+                        mBluetoothGattServer.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value);
+                    }
+                    // Not the final fragment yet — release the GATT operation queue so
+                    // the next fragment's write request can be processed immediately.
+                    onGattOperationCompleted();
+                    return;
+                }
+
                 // If the previous transaction completed (publicKey+signature set) and the
                 // credential app is sending again without disconnecting/re-subscribing,
                 // re-initiate the flow now so we send a fresh reader opening message first.
@@ -1594,7 +1647,7 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                 }
 
                 // Check if the data is encrypted
-                ArrayList<BLE_Packet> packetsFromMessage = TLVProvider.GetBleValues(value);
+                ArrayList<BLE_Packet> packetsFromMessage = TLVProvider.GetBleValues(complete);
                 if (deviceModel.connectionType == PKOC_ConnectionType.ECHDE_Full)
                 {
                     ArrayList<BLE_Packet> packetsFromEncryptedBlock = new ArrayList<>();
@@ -1944,47 +1997,71 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
 
             if (canConnect)
             {
-                BluetoothGattCharacteristic readCharacteristic = null;
-
-                // Try to get the characteristic from the primary service
-                BluetoothGattService primaryService = mBluetoothGattServer.getService(Constants.ServiceUUID);
-                if (primaryService != null)
+                FlowModel deviceModel = getDeviceCredentialModel(device);
+                if (deviceModel == null)
                 {
-                    readCharacteristic = primaryService.getCharacteristic(Constants.ReadUUID);
+                    Log.d(TAG, "writeToReadCharacteristic: no device model for " + device.getAddress());
+                    return;
                 }
 
-                // If not found, try to get the characteristic from the legacy service
-                if (readCharacteristic == null)
+                // BLE Transport Profile 2.0.1 §5.5: fragment to the negotiated MTU
+                // and let onNotificationSent() drain the queue one ack at a time.
+                // Do not cancel connection — credential app disconnects itself,
+                // and cancelConnection() prevents the device from reconnecting.
+                deviceModel.outgoingFragments.addAll(BleFragmenter.fragment(toWrite, deviceModel.mtu));
+
+                if (!deviceModel.notifyInProgress)
                 {
-                    BluetoothGattService legacyService = mBluetoothGattServer.getService(Constants.ServiceLegacyUUID);
-                    if (legacyService != null)
+                    byte[] firstFragment = deviceModel.outgoingFragments.poll();
+                    if (firstFragment != null)
                     {
-                        readCharacteristic = legacyService.getCharacteristic(Constants.ReadUUID);
+                        deviceModel.notifyInProgress = true;
+                        sendNotifyFragment(device, firstFragment);
                     }
                 }
+            }
+        }
 
-                if (readCharacteristic != null)
+        @SuppressLint("MissingPermission")
+        private void sendNotifyFragment(BluetoothDevice device, byte[] fragment)
+        {
+            BluetoothGattCharacteristic readCharacteristic = null;
+
+            // Try to get the characteristic from the primary service
+            BluetoothGattService primaryService = mBluetoothGattServer.getService(Constants.ServiceUUID);
+            if (primaryService != null)
+            {
+                readCharacteristic = primaryService.getCharacteristic(Constants.ReadUUID);
+            }
+
+            // If not found, try to get the characteristic from the legacy service
+            if (readCharacteristic == null)
+            {
+                BluetoothGattService legacyService = mBluetoothGattServer.getService(Constants.ServiceLegacyUUID);
+                if (legacyService != null)
                 {
-                    readCharacteristic.setValue(toWrite);
-
-                    boolean notified = mBluetoothGattServer.notifyCharacteristicChanged(device, readCharacteristic, false);
-
-                    Log.d(TAG, ">>> notifyCharacteristicChanged returned: " + notified + ", dataLen=" + toWrite.length);
-                    if (!notified)
-                    {
-                        Log.e(TAG, ">>> NOTIFICATION FAILED — device may not be subscribed or a notification is already pending");
-                    }
-                    //layoutPost("Notify characteristic changed", String.valueOf(notified));
-
-                    // Do not cancel connection — credential app disconnects itself,
-                    // and cancelConnection() prevents the device from reconnecting.
+                    readCharacteristic = legacyService.getCharacteristic(Constants.ReadUUID);
                 }
-                else
+            }
+
+            if (readCharacteristic != null)
+            {
+                readCharacteristic.setValue(fragment);
+
+                boolean notified = mBluetoothGattServer.notifyCharacteristicChanged(device, readCharacteristic, false);
+
+                Log.d(TAG, ">>> notifyCharacteristicChanged returned: " + notified + ", dataLen=" + fragment.length);
+                if (!notified)
                 {
-                    // Handle the case where neither characteristic is found
-                    // For example, log an error or notify the user
-                    Log.d(TAG, "Neither characteristic was found!");
+                    Log.e(TAG, ">>> NOTIFICATION FAILED — device may not be subscribed or a notification is already pending");
                 }
+                //layoutPost("Notify characteristic changed", String.valueOf(notified));
+            }
+            else
+            {
+                // Handle the case where neither characteristic is found
+                // For example, log an error or notify the user
+                Log.d(TAG, "Neither characteristic was found!");
             }
         }
 

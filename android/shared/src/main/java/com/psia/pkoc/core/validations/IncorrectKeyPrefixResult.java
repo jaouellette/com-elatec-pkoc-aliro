@@ -8,6 +8,7 @@ public class IncorrectKeyPrefixResult extends ValidationResult
     {
         cancelTransaction = true;
         isValid = false;
+        errorCode = 0x06; // Invalid TLV (§5.7)
         message = "A security key has been received with an invalid prefix.";
     }
 }

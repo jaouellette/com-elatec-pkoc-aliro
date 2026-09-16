@@ -10,6 +10,9 @@ public enum BLE_PacketType
     CompressedTransientPublicKey ((byte) 0x02),
     DigitalSignature ((byte) 0x03),
     Response ((byte) 0x04),
+    // PKOC BLE Transport Profile 2.0.1 §5.4/§5.7: sent by the detecting party
+    // before it closes the connection on a protocol/validation error.
+    Error ((byte) 0x06),
     UncompressedTransientPublicKey ((byte) 0x07),
     LastUpdateTime ((byte) 0x09),
     ProtocolVersion ((byte) 0x0C),

@@ -8,56 +8,64 @@ import com.psia.pkoc.core.validations.SuccessResult;
 
 public class ProtocolVersionPacket implements TransactionPacket
 {
-    private byte specificationVersion;
-    private short vendorVersion;
+    private byte majorVersion;
+    private byte minorVersion;
+    private short vendorSubVersion;
     private boolean ccmSupported = true;
-    private boolean gcmSupported = false;
+    private boolean readerCertificateSupported = false;
 
     public ProtocolVersionPacket(byte[] data)
     {
         if (data.length == 2)
         {
-            vendorVersion = (short)(((data[0] & 0xFF) << 8) | (data[1] & 0xFF));
+            vendorSubVersion = (short)(((data[0] & 0xFF) << 8) | (data[1] & 0xFF));
             return;
         }
 
-        if (data.length == 5)
+        if (data.length == 6)
         {
-            specificationVersion = data[0];
-            vendorVersion = (short) (((data[1] & 0xFF) << 8) | (data[2] & 0xFF));
+            majorVersion = data[0];
+            minorVersion = data[1];
+            vendorSubVersion = (short) (((data[2] & 0xFF) << 8) | (data[3] & 0xFF));
 
-            int featureBits = ((data[3] & 0xFF) << 8) | (data[4] & 0xFF);
+            int featureBits = ((data[4] & 0xFF) << 8) | (data[5] & 0xFF);
 
             ccmSupported = (featureBits & 0x0001) != 0;
-            gcmSupported = (featureBits & 0x0002) != 0;
+            readerCertificateSupported = (featureBits & 0x0002) != 0;
         }
     }
 
-    public ProtocolVersionPacket(byte _specificationVersion, short _vendorVersion, boolean _ccmSupported, boolean _gcmSupported)
+    public ProtocolVersionPacket(byte _majorVersion, byte _minorVersion, short _vendorSubVersion, boolean _ccmSupported, boolean _readerCertificateSupported)
     {
-        specificationVersion = _specificationVersion;
-        vendorVersion = _vendorVersion;
+        majorVersion = _majorVersion;
+        minorVersion = _minorVersion;
+        vendorSubVersion = _vendorSubVersion;
         ccmSupported = _ccmSupported;
-        gcmSupported = _gcmSupported;
+        readerCertificateSupported = _readerCertificateSupported;
     }
 
-    public byte getSpecificationVersion()
+    public byte getMajorVersion()
     {
-        return specificationVersion;
+        return majorVersion;
+    }
+
+    public byte getMinorVersion()
+    {
+        return minorVersion;
     }
 
     public short getVendorVersion()
     {
-        return vendorVersion;
+        return vendorSubVersion;
+    }
+
+    public boolean isReaderCertificateSupported()
+    {
+        return readerCertificateSupported;
     }
 
     public PKOC_EncryptionType getEncryptionType()
     {
-        if (gcmSupported)
-        {
-            return PKOC_EncryptionType.GCM;
-        }
-
         if (ccmSupported)
         {
             return PKOC_EncryptionType.CCM;
@@ -68,32 +76,33 @@ public class ProtocolVersionPacket implements TransactionPacket
 
     public byte[] encode()
     {
-        byte[] data = new byte[5];
+        byte[] data = new byte[6];
 
-        data[0] = specificationVersion;
+        data[0] = majorVersion;
+        data[1] = minorVersion;
 
-        data[1] = (byte)((vendorVersion >> 8) & 0xFF);
-        data[2] = (byte)(vendorVersion & 0xFF);
+        data[2] = (byte)((vendorSubVersion >> 8) & 0xFF);
+        data[3] = (byte)(vendorSubVersion & 0xFF);
 
         int featureBits = 0;
         if (ccmSupported)
         {
             featureBits |= 0x0001;
         }
-        if (gcmSupported)
+        if (readerCertificateSupported)
         {
             featureBits |= 0x0002;
         }
 
-        data[3] = (byte)(0);
-        data[4] = (byte)(featureBits & 0xFF);
+        data[4] = (byte)((featureBits >> 8) & 0xFF);
+        data[5] = (byte)(featureBits & 0xFF);
 
         return data;
     }
 
     public ValidationResult validate()
     {
-        var sizeMismatch = new SizeMismatchResult(encode().length, 2, 5);
+        var sizeMismatch = new SizeMismatchResult(encode().length, 2, 6);
         if (sizeMismatch.isValid == false)
         {
             return sizeMismatch;

@@ -14,6 +14,7 @@ public class SizeMismatchResult extends ValidationResult
 
         cancelTransaction = true;
         isValid = false;
+        errorCode = 0x06; // Invalid TLV (§5.7)
         message = "Size mismatch in parsing TLV";
     }
 
@@ -23,6 +24,7 @@ public class SizeMismatchResult extends ValidationResult
         {
             cancelTransaction = true;
             isValid = false;
+            errorCode = 0x06; // Invalid TLV (§5.7)
             message = "Size mismatch in parsing TLV";
         }
     }
@@ -33,6 +35,7 @@ public class SizeMismatchResult extends ValidationResult
         {
             cancelTransaction = true;
             isValid = false;
+            errorCode = 0x06; // Invalid TLV (§5.7)
             message = "Size mismatch in parsing TLV";
         }
     }

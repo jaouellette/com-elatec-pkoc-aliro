@@ -14,10 +14,13 @@ import android.os.Message;
 import android.util.Log;
 import android.widget.Toast;
 
+import com.psia.pkoc.core.BLE_PacketType;
+import com.psia.pkoc.core.BleFragmenter;
 import com.psia.pkoc.core.Constants;
 import com.psia.pkoc.core.PKOC_ConnectionType;
 import com.psia.pkoc.core.ReaderDto;
 import com.psia.pkoc.core.SiteDto;
+import com.psia.pkoc.core.TLVProvider;
 import com.psia.pkoc.core.interfaces.Transaction;
 import com.psia.pkoc.core.transactions.BleEcdheFlowTransaction;
 import com.psia.pkoc.core.transactions.BleNormalFlowTransaction;
@@ -26,6 +29,8 @@ import com.psia.pkoc.SiteModel;
 import com.psia.pkoc.ReaderModel;
 
 import java.util.ArrayList;
+import java.util.LinkedList;
+import java.util.Queue;
 
 
 /**
@@ -41,6 +46,13 @@ public class PKOC_BluetoothCallbackGatt extends BluetoothGattCallback
     BluetoothGattService requiredService;
     BluetoothGattCharacteristic writeCharacteristic;
     BluetoothGattCharacteristic readCharacteristic;
+
+    // BLE Transport Profile 2.0.1 §5.5: application-layer fragmentation state.
+    private int negotiatedMtu = 23;
+    private final BleFragmenter.Reassembler incomingReassembler = new BleFragmenter.Reassembler();
+    private final Queue<byte[]> outgoingFragments = new LinkedList<>();
+    private volatile boolean writeInProgress = false;
+    private volatile boolean disconnectAfterWrite = false;
 
     private BluetoothGattService tryGetService(BluetoothGatt gatt)
     {
@@ -161,6 +173,8 @@ public class PKOC_BluetoothCallbackGatt extends BluetoothGattCallback
     {
         super.onMtuChanged(gatt, mtu, status);
 
+        negotiatedMtu = (status == BluetoothGatt.GATT_SUCCESS) ? mtu : 23;
+
         bHandler.post(() -> characteristicRegistration(gatt));
     }
 
@@ -223,14 +237,19 @@ public class PKOC_BluetoothCallbackGatt extends BluetoothGattCallback
                 return;
             }
 
-            var validationResult = transaction.processNewData(value);
+            byte[] complete = incomingReassembler.onFragment(value);
+            if (complete == null)
+            {
+                return; // still reassembling
+            }
+
+            var validationResult = transaction.processNewData(complete);
             if(validationResult.isValid)
             {
                 var toWrite = transaction.toWrite();
                 if (toWrite != null)
                 {
-                    writeCharacteristic.setValue(toWrite);
-                    gatt.writeCharacteristic(writeCharacteristic);
+                    sendFragmented(gatt, toWrite, false);
                 }
                 else
                 {
@@ -241,8 +260,65 @@ public class PKOC_BluetoothCallbackGatt extends BluetoothGattCallback
             }
             else if (validationResult.cancelTransaction)
             {
-                gatt.disconnect();
+                byte[] errorTlv = TLVProvider.GetBleTLV(BLE_PacketType.Error, new byte[]{ validationResult.errorCode });
+                sendFragmented(gatt, errorTlv, true);
             }
         });
+    }
+
+    /**
+     * on Characteristic Write
+     * @param gatt Bluetooth GATT
+     * @param characteristic Characteristic
+     * @param status Status
+     */
+    @Override
+    public void onCharacteristicWrite(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic, int status)
+    {
+        super.onCharacteristicWrite(gatt, characteristic, status);
+
+        bHandler.post(() -> pumpNextWrite(gatt));
+    }
+
+    /**
+     * Fragment a payload (PKOC BLE Transport Profile 2.0.1 §5.5) and enqueue it for sending.
+     * @param gatt Bluetooth GATT
+     * @param payload full message to send
+     * @param disconnectAfter disconnect once every queued fragment has been written
+     */
+    private void sendFragmented(BluetoothGatt gatt, byte[] payload, boolean disconnectAfter)
+    {
+        outgoingFragments.addAll(BleFragmenter.fragment(payload, negotiatedMtu));
+        disconnectAfterWrite |= disconnectAfter;
+
+        if (!writeInProgress)
+        {
+            pumpNextWrite(gatt);
+        }
+    }
+
+    /**
+     * Send the next queued fragment, or disconnect if the queue is empty and a
+     * disconnect was requested once the write completed.
+     * @param gatt Bluetooth GATT
+     */
+    @SuppressLint("MissingPermission")
+    private void pumpNextWrite(BluetoothGatt gatt)
+    {
+        byte[] fragment = outgoingFragments.poll();
+        if (fragment == null)
+        {
+            writeInProgress = false;
+            if (disconnectAfterWrite)
+            {
+                disconnectAfterWrite = false;
+                gatt.disconnect();
+            }
+            return;
+        }
+
+        writeInProgress = true;
+        writeCharacteristic.setValue(fragment);
+        gatt.writeCharacteristic(writeCharacteristic);
     }
 }

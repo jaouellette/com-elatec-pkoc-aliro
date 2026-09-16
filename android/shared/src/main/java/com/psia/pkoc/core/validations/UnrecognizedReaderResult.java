@@ -8,6 +8,7 @@ public class UnrecognizedReaderResult extends ValidationResult
     {
         cancelTransaction = true;
         isValid = false;
+        errorCode = 0x04; // Unknown Site Issuer (§5.7)
         message = "The reader was not recognized.";
     }
 }
