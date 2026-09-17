@@ -84,6 +84,8 @@ import com.psia.pkoc.core.PkocBleReaderCredential;
 import com.psia.pkoc.core.PkocBlePreferences;
 import com.psia.pkoc.core.PkocNfcReaderConfig;
 import com.psia.pkoc.core.NfcSeV2ReaderFlow;
+import com.psia.pkoc.core.PkocCvc;
+import com.psia.pkoc.core.PkocCredentialDerivation;
 import java.security.KeyPair;
 import java.security.interfaces.ECPublicKey;
 
@@ -2111,7 +2113,7 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
 
     private void displayPublicKeyInfo(String publicKeyHex, String connectionTypeText)
     {
-        displayPublicKeyInfo(publicKeyHex, connectionTypeText, null, null);
+        displayPublicKeyInfo(publicKeyHex, connectionTypeText, null, null, null);
     }
 
     /**
@@ -2120,6 +2122,19 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
      */
     private void displayPublicKeyInfo(String publicKeyHex, String connectionTypeText,
                                       String outputLabel, String outputValueHex)
+    {
+        displayPublicKeyInfo(publicKeyHex, connectionTypeText, outputLabel, outputValueHex, null);
+    }
+
+    /**
+     * @param outputLabel     SE V2 Reader-to-PACS output label (or null)
+     * @param outputValueHex  SE V2 Reader-to-PACS output value, hex (or null)
+     * @param binaryIdHex     PKOC-CVC BinaryID extension value (OID .8.7), raw hex
+     *                        including the unused-bits octet, or null if the CVC
+     *                        carries no BinaryID extension
+     */
+    private void displayPublicKeyInfo(String publicKeyHex, String connectionTypeText,
+                                      String outputLabel, String outputValueHex, String binaryIdHex)
     {
         if (publicKeyHex.length() == 130)
         {
@@ -2267,6 +2282,45 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
 
                 SpannableString outGap = new SpannableString("\n\n");
                 formattedText.append(outGap);
+            }
+
+            // -----------------------------------------------------------------
+            // PKOC-CVC BinaryID extension (OID 1.3.6.1.4.1.65071.8.7) — the legacy
+            // card-number passthrough value, when the card's CVC carries one.
+            // Shown above the subject public key, same as the Reader -> PACS output.
+            // -----------------------------------------------------------------
+            if (binaryIdHex != null)
+            {
+                SpannableString binHdr = new SpannableString("\n\nBINARY ID\n");
+                binHdr.setSpan(new StyleSpan(Typeface.BOLD), 0, binHdr.length(), Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+                binHdr.setSpan(new ForegroundColorSpan(Color.parseColor("#1E7A4D")), 0, binHdr.length(), Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+                binHdr.setSpan(new AbsoluteSizeSpan(15, true), 0, binHdr.length(), Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+                formattedText.append(binHdr);
+
+                SpannableString binHexHdr = new SpannableString("Value (HEX):\n".toUpperCase());
+                binHexHdr.setSpan(new StyleSpan(Typeface.BOLD), 0, binHexHdr.length(), Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+                binHexHdr.setSpan(new ForegroundColorSpan(Color.BLACK), 0, binHexHdr.length(), Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+                binHexHdr.setSpan(new AbsoluteSizeSpan(13, true), 0, binHexHdr.length(), Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+                formattedText.append(binHexHdr);
+                formattedText.append(applyColorAndSize(binaryIdHex.toUpperCase(), binaryIdHex.length(),
+                        Color.parseColor("#9CC3C9"), Color.parseColor("BLACK"), true));
+
+                try
+                {
+                    byte[] binBytes = Hex.decode(binaryIdHex);
+                    String binDec = PkocCredentialDerivation.toDecimal(binBytes);
+                    SpannableString binDecHdr = new SpannableString("\n\nValue (Decimal):\n".toUpperCase());
+                    binDecHdr.setSpan(new StyleSpan(Typeface.BOLD), 0, binDecHdr.length(), Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+                    binDecHdr.setSpan(new ForegroundColorSpan(Color.BLACK), 0, binDecHdr.length(), Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+                    binDecHdr.setSpan(new AbsoluteSizeSpan(13, true), 0, binDecHdr.length(), Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+                    formattedText.append(binDecHdr);
+                    formattedText.append(applyColorAndSize(binDec, binDec.length(),
+                            Color.parseColor("#9CC3C9"), Color.parseColor("BLACK"), true));
+                }
+                catch (Exception ignored) { }
+
+                SpannableString binGap = new SpannableString("\n\n");
+                formattedText.append(binGap);
             }
 
             // Apply bold style to the "Public Key:" text with black color and size 14
@@ -2568,7 +2622,9 @@ public class HomeFragment extends Fragment implements NfcAdapter.ReaderCallback
                         + (r.outputLabel != null ? "\n" + r.outputLabel : "");
                 Log.d("NFC", "PKOC SE V2 subject key: " + pk + " | " + r.outputLabel);
                 String outHex = (r.outputValue != null) ? Hex.toHexString(r.outputValue).toUpperCase() : null;
-                displayPublicKeyInfo(pk, label, r.outputLabel, outHex);
+                byte[] binaryId = (r.cvc != null) ? r.cvc.getExtension(PkocCvc.OID_EXT_BINARYID) : null;
+                String binaryIdHex = (binaryId != null) ? Hex.toHexString(binaryId).toUpperCase() : null;
+                displayPublicKeyInfo(pk, label, r.outputLabel, outHex, binaryIdHex);
             }
             else
             {
